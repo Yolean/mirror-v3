@@ -20,7 +20,7 @@ This file is for the next agent (or human) extending mirror-v3. Read this first;
     └── mirror-v3.config.schema.json   golden file, gated in CI
 ```
 
-The runtime crates listed in the phase plan (`mirror-core`, `mirror-kafka`, `mirror-fs`, `mirror-s3`) are not in the workspace yet — Phase 0 stops at config.
+Phase 1 added `mirror-core` and `mirror-kafka`; `mirror-fs` and `mirror-s3` arrive in Phases 3/4.
 
 ## The phase plan
 
@@ -28,8 +28,8 @@ Each row is a separate change set / PR. Do not skip phases.
 
 | Phase | Scope | Done when |
 |---|---|---|
-| **0** | Workspace + config model + JSON Schema gate + CLI stub + Dockerfile | `cargo test --workspace` green, schema committed |
-| 1 | `mirror-core` (Source/Sink traits, loop) + `mirror-kafka` source+sink with end-offset gate | Parity behaviour vs legacy Java worker on a dev site |
+| 0 | Workspace + config model + JSON Schema gate + CLI stub + Dockerfile | `cargo test --workspace` green, schema committed |
+| **1** | `mirror-core` (Source/Sink traits, loop) + `mirror-kafka` source+sink with end-offset gate + `mirror-v3 run` supervisor | Builds + 17 tests green; loop invariants exhaustively unit-tested with mocks. **Parity on a dev site against real Kafka still requires Phase 2 e2e to verify.** |
 | 2 | Docker e2e harness + `kafka-native → redpanda` stack with Toxiproxy fault injection | Tests pass green and red |
 | 3 | `mirror-fs` sink + flush triggers + scan-validate on startup | E2e: crash-mid-flush recovery |
 | 4 | `mirror-s3` sink via `object_store`, `redpanda → versitygw` e2e | Concurrent writer race produces hard exit, never a silently-overlapping blob |

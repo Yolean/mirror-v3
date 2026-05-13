@@ -10,6 +10,10 @@
 # and commit the digest. Update both stages together.
 
 FROM docker.io/library/rust:1-bookworm AS builder
+# librdkafka is built from source by rdkafka-sys via cmake.
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends cmake g++ make pkg-config && \
+    rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 
 # Cache deps separately from sources for faster incremental builds.

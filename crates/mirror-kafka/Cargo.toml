@@ -1,0 +1,16 @@
+[package]
+name = "mirror-kafka"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Kafka source and sink implementations of mirror-core traits"
+
+[dependencies]
+mirror-core = { workspace = true }
+async-trait = { workspace = true }
+rdkafka = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["rt", "time", "macros"] }
+tracing = { workspace = true }

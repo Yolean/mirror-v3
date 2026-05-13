@@ -1,0 +1,16 @@
+[package]
+name = "mirror-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Core mirror loop, Source/Sink traits and the end-offset gate"
+
+[dependencies]
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "time", "test-util"] }

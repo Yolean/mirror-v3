@@ -2,6 +2,8 @@
 resolver = "2"
 members = [
     "crates/mirror-config",
+    "crates/mirror-core",
+    "crates/mirror-kafka",
     "crates/mirror-bin",
     "crates/xtask",
 ]
@@ -15,6 +17,8 @@ repository = "https://github.com/YoleanAgents/mirror-v3"
 
 [workspace.dependencies]
 mirror-config = { path = "crates/mirror-config" }
+mirror-core = { path = "crates/mirror-core" }
+mirror-kafka = { path = "crates/mirror-kafka" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -23,6 +27,11 @@ schemars = { version = "1", features = ["preserve_order"] }
 thiserror = "2"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "signal"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rdkafka = { version = "0.39", default-features = false, features = ["cmake-build", "tokio"] }
+async-trait = "0.1"
 
 [profile.release]
 lto = "thin"

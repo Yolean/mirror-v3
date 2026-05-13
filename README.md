@@ -2,8 +2,7 @@
 
 Exactly-once Kafka topic+partition mirroring to **Kafka**, **Filesystem**, or **S3**, in one deployment.
 
-> **Status:** Phase 0 — config model, JSON Schema generation, CLI skeleton.
-> The runtime (consume/produce loop, sinks) lands in Phase 1+. See [AGENTS.md](AGENTS.md) for the phase map.
+> **Status:** Phase 1 — Kafka source + Kafka sink with the end-offset gate; supervisor for parallel mirrors. Filesystem and S3 sinks land in Phases 3 and 4. See [AGENTS.md](AGENTS.md) for the phase map.
 
 ## What this gives you
 
@@ -17,6 +16,15 @@ Exactly-once Kafka topic+partition mirroring to **Kafka**, **Filesystem**, or **
 - Configurable **flush triggers** per blob destination: max time, max bytes, max offsets — whichever trips first.
 
 The single non-negotiable: **restart correctness derives from the destination**, not from a local checkpoint. On startup, the mirror inspects the destination, computes the next expected source offset, and seeks the source consumer there.
+
+## Running
+
+```sh
+mirror-v3 validate --config config.yaml   # parse-only
+mirror-v3 run --config config.yaml        # start the configured mirrors
+```
+
+`run` spawns one task per mirror, each pinned to one `(topic, partition)`. The whole process exits non-zero on the first task failure — the orchestrator (k8s) is expected to restart it. `RUST_LOG=mirror_v3=debug,mirror_core=debug` for verbose tracing.
 
 ## Configuration
 
