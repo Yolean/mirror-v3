@@ -85,6 +85,7 @@ docker run --rm -v "$PWD/examples:/cfg" mirror-v3:dev validate --config /cfg/kaf
 
 ## Operational invariants
 
-- One process owns at most one mirror per `(topic, partition)`. Run with `replicas: 1` and a `Recreate` strategy in Kubernetes.
-- Any unrecoverable error in any mirror exits the entire process. Restart correctness is the recovery mechanism; supervision belongs to the orchestrator.
-- For blob destinations, a `(from, to)` filename/key is the durable "offset" — atomic rename (FS) or single-shot `PutObject` (S3) makes it visible.
+- **One process owns at most one mirror per `(topic, partition)`.** Run with `replicas: 1` and `strategy.type: Recreate` in Kubernetes for every mirror-v3 deployment. This is non-negotiable — two writers will race on destination naming and trip the corrupt-chain detector on the next restart.
+- **VersityGW specifically:** `If-None-Match: *` is silently ignored (v1.4.1, POSIX backend, verified in e2e), so the deployment guarantee is the *only* atomicity layer for the cross-process race. AWS S3 honors `If-None-Match: *` and gives API-level atomicity on top of the deployment guarantee.
+- **Any unrecoverable error in any mirror exits the entire process.** Restart correctness is the recovery mechanism; supervision belongs to the orchestrator.
+- **For blob destinations, a `(from, to)` filename/key is the durable "offset"** — atomic rename (FS) or single-shot `PutObject` (S3) makes it visible. The destination listing is the source of truth on startup.

@@ -2,6 +2,14 @@
 #
 # Two mirrors of distinct partitions, archived to the local
 # filesystem with per-mirror flush triggers.
+#
+# !! Deployment requirement !!
+# "Parallel" here means N mirrors run inside a SINGLE process. The
+# deployment must still be single-replica — two pods writing to the
+# same destination directory would race on filename renames and
+# trip the scan-validate on the next restart. Deploy with:
+#   spec.replicas: 1
+#   spec.strategy.type: Recreate
 
 destination:
   type: filesystem

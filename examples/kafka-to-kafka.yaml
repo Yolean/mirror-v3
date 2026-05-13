@@ -2,6 +2,11 @@
 #
 # Parity example: one mirror, Kafka source -> Kafka destination,
 # matching the behaviour of the legacy Java worker.
+#
+# !! Deployment requirement !!
+# Single-writer per (topic, partition). Deploy with:
+#   spec.replicas: 1
+#   spec.strategy.type: Recreate
 
 destination:
   type: kafka

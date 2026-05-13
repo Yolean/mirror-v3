@@ -2,6 +2,16 @@
 #
 # S3 destination against an in-cluster VersityGW gateway. The same
 # config shape applies to real AWS S3 (drop `endpoint`).
+#
+# !! Deployment requirement !!
+# The destination MUST have exactly one writer per (topic, partition)
+# at any moment. For VersityGW specifically, `If-None-Match: *` is a
+# no-op (verified in e2e), so the atomicity backstop is the
+# deployment guarantee plus scan-validate on startup. Deploy with:
+#   spec.replicas: 1
+#   spec.strategy.type: Recreate
+# Anything else risks two writers producing overlapping blob ranges
+# and tripping the corrupt-chain detector on the next restart.
 
 destination:
   type: s3
