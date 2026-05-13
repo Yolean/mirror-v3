@@ -106,22 +106,62 @@ async fn run(path: PathBuf) -> Result<()> {
         "starting mirror-v3"
     );
 
+    // One shutdown channel, cloned per mirror. Listening for Ctrl-C
+    // here means SIGINT triggers graceful flush; in containers,
+    // SIGTERM will arrive on the same path because tokio's
+    // ctrl_c handler is the platform's INT handler — for full SIGTERM
+    // support a unix-signals branch can be added next.
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let signal_tx = shutdown_tx.clone();
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            tracing::info!("received SIGINT; requesting graceful shutdown");
+            let _ = signal_tx.send(true);
+        }
+    });
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        if let Ok(mut sigterm) = signal(SignalKind::terminate()) {
+            let term_tx = shutdown_tx.clone();
+            tokio::spawn(async move {
+                if sigterm.recv().await.is_some() {
+                    tracing::info!("received SIGTERM; requesting graceful shutdown");
+                    let _ = term_tx.send(true);
+                }
+            });
+        }
+    }
+
     let mut handles = Vec::with_capacity(cfg.mirrors.len());
     for mirror in &cfg.mirrors {
-        let handle = spawn_mirror(mirror.clone(), cfg.destination.clone())?;
+        let handle = spawn_mirror(mirror.clone(), cfg.destination.clone(), shutdown_rx.clone())?;
         handles.push((mirror.name.clone(), handle));
     }
 
-    // Wait for the first task to terminate. Any termination — error or
-    // (impossible) "Ok" — collapses the whole process.
+    // Wait for the first task to terminate. Any termination collapses
+    // the whole process. Successful (graceful) termination is Ok(())
+    // so the process exits zero on shutdown.
     let (which, result) = wait_first(handles).await;
-    tracing::error!(mirror = %which, "mirror task terminated; exiting process");
+    if result.is_ok() {
+        tracing::info!(mirror = %which, "mirror task terminated gracefully");
+    } else {
+        tracing::error!(mirror = %which, "mirror task errored; exiting process");
+    }
     result
+}
+
+async fn shutdown_signal(mut rx: tokio::sync::watch::Receiver<bool>) {
+    if *rx.borrow() {
+        return;
+    }
+    let _ = rx.changed().await;
 }
 
 fn spawn_mirror(
     mirror: Mirror,
     destination: Destination,
+    shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> Result<tokio::task::JoinHandle<Result<()>>> {
     let source_cfg = KafkaSourceConfig::new(
         mirror.source.bootstrap_servers.clone(),
@@ -153,8 +193,8 @@ fn spawn_mirror(
                 .with_context(|| format!("opening sink for mirror {name}"))?;
             Ok(tokio::spawn(async move {
                 tracing::info!(mirror = %name, "loop start");
-                match run_mirror(source, sink).await {
-                    Ok(never) => match never {},
+                match run_mirror(source, sink, shutdown_signal(shutdown_rx)).await {
+                    Ok(()) => Ok(()),
                     Err(e) => Err(anyhow::anyhow!("mirror {name}: {e}")),
                 }
             }))
@@ -174,8 +214,8 @@ fn spawn_mirror(
                 .with_context(|| format!("opening sink for mirror {name}"))?;
             Ok(tokio::spawn(async move {
                 tracing::info!(mirror = %name, "loop start");
-                match run_mirror(source, sink).await {
-                    Ok(never) => match never {},
+                match run_mirror(source, sink, shutdown_signal(shutdown_rx)).await {
+                    Ok(()) => Ok(()),
                     Err(e) => Err(anyhow::anyhow!("mirror {name}: {e}")),
                 }
             }))
@@ -210,8 +250,8 @@ fn spawn_mirror(
                     Ok(s) => s,
                     Err(e) => return Err(anyhow::anyhow!("mirror {name} open S3 sink: {e}")),
                 };
-                match run_mirror(source, sink).await {
-                    Ok(never) => match never {},
+                match run_mirror(source, sink, shutdown_signal(shutdown_rx)).await {
+                    Ok(()) => Ok(()),
                     Err(e) => Err(anyhow::anyhow!("mirror {name}: {e}")),
                 }
             }))

@@ -167,6 +167,10 @@ impl Sink for S3Sink {
         }
         Ok(())
     }
+
+    async fn flush(&mut self) -> Result<(), SinkError> {
+        self.flush_now().await
+    }
 }
 
 fn record_byte_size(record: &Record) -> u64 {

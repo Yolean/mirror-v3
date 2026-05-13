@@ -14,13 +14,41 @@ use mirror_s3::{S3Sink, S3SinkConfig};
 use object_store::ObjectStore;
 
 pub struct MirrorHandle {
-    handle: tokio::task::JoinHandle<Result<std::convert::Infallible, MirrorError>>,
+    handle: tokio::task::JoinHandle<Result<(), MirrorError>>,
+    shutdown: tokio::sync::watch::Sender<bool>,
 }
 
 impl MirrorHandle {
+    /// Hard-cancel the mirror task (no graceful flush).
     pub fn abort(self) {
         self.handle.abort();
     }
+
+    /// Request graceful shutdown (flush sink, return Ok) and wait
+    /// for the task to finish. Used by tests that need to assert on
+    /// the post-flush state of the destination.
+    pub async fn shutdown(self) -> Result<()> {
+        let _ = self.shutdown.send(true);
+        match self.handle.await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(anyhow::anyhow!("mirror loop: {e}")),
+            Err(e) => Err(anyhow::anyhow!("task join: {e}")),
+        }
+    }
+}
+
+fn shutdown_pair() -> (
+    tokio::sync::watch::Sender<bool>,
+    impl std::future::Future<Output = ()> + Send + 'static,
+) {
+    let (tx, mut rx) = tokio::sync::watch::channel(false);
+    let fut = async move {
+        if *rx.borrow() {
+            return;
+        }
+        let _ = rx.changed().await;
+    };
+    (tx, fut)
 }
 
 pub struct MirrorSpec {
@@ -48,8 +76,9 @@ pub fn spawn_kafka_to_kafka(spec: MirrorSpec) -> Result<MirrorHandle> {
     let source = KafkaSource::open(src_cfg).context("open KafkaSource")?;
     let sink = KafkaSink::open(snk_cfg).context("open KafkaSink")?;
 
-    let handle = tokio::spawn(async move { run_mirror(source, sink).await });
-    Ok(MirrorHandle { handle })
+    let (shutdown, signal) = shutdown_pair();
+    let handle = tokio::spawn(async move { run_mirror(source, sink, signal).await });
+    Ok(MirrorHandle { handle, shutdown })
 }
 
 pub struct FsMirrorSpec {
@@ -81,8 +110,9 @@ pub fn spawn_kafka_to_filesystem(spec: FsMirrorSpec) -> Result<MirrorHandle> {
         flush: spec.flush,
     };
     let sink = FilesystemSink::open(sink_cfg).context("open FilesystemSink")?;
-    let handle = tokio::spawn(async move { run_mirror(source, sink).await });
-    Ok(MirrorHandle { handle })
+    let (shutdown, signal) = shutdown_pair();
+    let handle = tokio::spawn(async move { run_mirror(source, sink, signal).await });
+    Ok(MirrorHandle { handle, shutdown })
 }
 
 pub struct S3MirrorSpec {
@@ -116,6 +146,7 @@ pub async fn spawn_kafka_to_s3(spec: S3MirrorSpec) -> Result<MirrorHandle> {
         flush: spec.flush,
     };
     let sink = S3Sink::open(sink_cfg).await.context("open S3Sink")?;
-    let handle = tokio::spawn(async move { run_mirror(source, sink).await });
-    Ok(MirrorHandle { handle })
+    let (shutdown, signal) = shutdown_pair();
+    let handle = tokio::spawn(async move { run_mirror(source, sink, signal).await });
+    Ok(MirrorHandle { handle, shutdown })
 }

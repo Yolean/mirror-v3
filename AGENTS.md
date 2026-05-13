@@ -20,7 +20,7 @@ This file is for the next agent (or human) extending mirror-v3. Read this first;
     └── mirror-v3.config.schema.json   golden file, gated in CI
 ```
 
-Phase 1 added `mirror-core` and `mirror-kafka`. Phase 2 added the `mirror-e2e` crate at `e2e/` with `testcontainers`-driven Docker stacks and the `Provisioner`/`ProvisionedStack` trait seam for plugging in new test infra. Phase 3 added `mirror-fs` (atomic-rename filesystem sink, `<from>-<to>.ndjson` naming, scan-validate on startup). Phase 4 added `mirror-s3` (same wire format as `mirror-fs`, `object_store`-backed, `PutMode::Create` + scan-validate two-layer atomicity).
+Phase 1 added `mirror-core` and `mirror-kafka`. Phase 2 added the `mirror-e2e` crate at `e2e/` with `testcontainers`-driven Docker stacks and the `Provisioner`/`ProvisionedStack` trait seam for plugging in new test infra. Phase 3 added `mirror-fs` (atomic-rename filesystem sink, `<from>-<to>.ndjson` naming, scan-validate on startup). Phase 4 added `mirror-s3` (same wire format as `mirror-fs`, `object_store`-backed, `PutMode::Create` + scan-validate two-layer atomicity). Phase 5 generalised `run_mirror` to accept a shutdown future, added `Sink::flush` (default no-op; FS/S3 implementations call their `flush_now`), and wired SIGINT/SIGTERM in `mirror-v3 run`.
 
 ## The phase plan
 
@@ -32,8 +32,10 @@ Each row is a separate change set / PR. Do not skip phases.
 | 1 | `mirror-core` (Source/Sink traits, loop) + `mirror-kafka` source+sink with end-offset gate + `mirror-v3 run` supervisor | Builds + 17 tests green; loop invariants exhaustively unit-tested with mocks |
 | 2 | Docker e2e harness (`mirror-e2e` crate) + `kafka-native → redpanda` happy-path test | First real Kafka e2e green: 100 records, byte-identical, offsets preserved |
 | 3 | `mirror-fs` sink + flush triggers + scan-validate on startup + e2e | FS sink unit-tested (corrupt-chain, restart, crashed .tmp, flush triggers); kafka→fs e2e green |
-| **4** | `mirror-s3` sink via `object_store` + VersityGW e2e + conditional-PUT spike | S3 sink unit-tested against InMemory (incl. `PutMode::Create` enforcement); kafka→VersityGW e2e green; spike answer recorded |
+| 4 | `mirror-s3` sink via `object_store` + VersityGW e2e + conditional-PUT spike | S3 sink unit-tested against InMemory (incl. `PutMode::Create` enforcement); kafka→VersityGW e2e green; spike answer recorded |
+| **5** | Multi-mirror in one process + graceful shutdown + e2e | Loop accepts a shutdown future; `Sink::flush` is wired to `flush_now` on FS/S3; SIGINT/SIGTERM trigger a graceful exit; parallel-mirrors e2e green |
 | **2b** (deferred) | Toxiproxy fault injection in the Docker stack | A fault test demonstrates the mirror's crash-and-recover-from-destination behaviour |
+| 6 (handoff) | Cutover: replace the Java worker image in `checkit/mirror-v3` | Done by the operator, not this repo |
 | 4 | `mirror-s3` sink via `object_store`, `redpanda → versitygw` e2e | Concurrent writer race produces hard exit, never a silently-overlapping blob |
 | 5 | Supervisor for N mirrors in one process; per-mirror metrics | Two mirrors run side-by-side under fault injection |
 | 6 | Cutover: replace the Java worker image in checkit/mirror-v3 | Dev site running Rust binary; Java module archived |

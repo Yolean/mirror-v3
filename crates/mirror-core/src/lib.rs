@@ -63,6 +63,13 @@ pub trait Sink: Send {
     /// MUST fail if the destination is not at that offset at the
     /// moment of write.
     async fn write(&mut self, record: Record) -> Result<(), SinkError>;
+
+    /// Flush any buffered state so it's durable. Called on graceful
+    /// shutdown. Default is a no-op for sinks that don't buffer
+    /// (e.g. Kafka, where every write is durable on return).
+    async fn flush(&mut self) -> Result<(), SinkError> {
+        Ok(())
+    }
 }
 
 #[derive(Debug, Error)]
@@ -97,40 +104,53 @@ pub enum MirrorError {
     DestinationDrift { expected: u64, actual: u64 },
 }
 
-/// Drive the mirror loop until something fails.
-///
-/// This function never returns `Ok`; it loops forever or errors. The
-/// caller is responsible for crashing the process on error.
-pub async fn run_mirror<S: Source, K: Sink>(
-    mut source: S,
-    mut sink: K,
-) -> Result<std::convert::Infallible, MirrorError> {
+/// Drive the mirror loop until `shutdown` resolves or an error is
+/// returned. On graceful shutdown, the loop calls `sink.flush()` so
+/// buffered batches (FS, S3) become durable. Use
+/// `std::future::pending::<()>()` for a "run forever" caller (tests).
+pub async fn run_mirror<S, K, F>(mut source: S, mut sink: K, shutdown: F) -> Result<(), MirrorError>
+where
+    S: Source,
+    K: Sink,
+    F: std::future::Future<Output = ()> + Send,
+{
     let start = sink.next_expected_offset().await?;
     tracing::info!(start_offset = start, "starting mirror");
     source.seek(start).await?;
     let mut expected = start;
 
+    tokio::pin!(shutdown);
     loop {
-        match source.poll_one().await? {
-            Some(record) => {
-                if record.source_offset != expected {
-                    return Err(MirrorError::SourceOffsetMismatch {
-                        expected,
-                        actual: record.source_offset,
-                    });
-                }
-                sink.write(record).await?;
-                expected = expected
-                    .checked_add(1)
-                    .expect("source offset overflowed u64");
+        tokio::select! {
+            biased;
+            _ = &mut shutdown => {
+                tracing::info!("shutdown requested; flushing sink");
+                sink.flush().await?;
+                return Ok(());
             }
-            None => {
-                let current = sink.next_expected_offset().await?;
-                if current != expected {
-                    return Err(MirrorError::DestinationDrift {
-                        expected,
-                        actual: current,
-                    });
+            poll_result = source.poll_one() => {
+                match poll_result? {
+                    Some(record) => {
+                        if record.source_offset != expected {
+                            return Err(MirrorError::SourceOffsetMismatch {
+                                expected,
+                                actual: record.source_offset,
+                            });
+                        }
+                        sink.write(record).await?;
+                        expected = expected
+                            .checked_add(1)
+                            .expect("source offset overflowed u64");
+                    }
+                    None => {
+                        let current = sink.next_expected_offset().await?;
+                        if current != expected {
+                            return Err(MirrorError::DestinationDrift {
+                                expected,
+                                actual: current,
+                            });
+                        }
+                    }
                 }
             }
         }

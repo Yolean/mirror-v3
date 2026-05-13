@@ -11,6 +11,7 @@ description = "Core mirror loop, Source/Sink traits and the end-offset gate"
 async-trait = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+tokio = { workspace = true, features = ["macros"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "time", "test-util"] }

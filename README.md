@@ -2,7 +2,7 @@
 
 Exactly-once Kafka topic+partition mirroring to **Kafka**, **Filesystem**, or **S3**, in one deployment.
 
-> **Status:** Phase 4 — Kafka source + Kafka/Filesystem/S3 sinks; supervisor for parallel mirrors. Fault-injection tests are next (Phase 2b). See [AGENTS.md](AGENTS.md) for the phase map.
+> **Status:** Phase 5 — Kafka source + Kafka/Filesystem/S3 sinks; supervisor for parallel mirrors with graceful SIGINT/SIGTERM shutdown that flushes buffered records. Fault-injection tests deferred to Phase 2b; cutover to `checkit/mirror-v3` is a handoff step. See [AGENTS.md](AGENTS.md) for the phase map.
 
 ## What this gives you
 
@@ -24,7 +24,7 @@ mirror-v3 validate --config config.yaml   # parse-only
 mirror-v3 run --config config.yaml        # start the configured mirrors
 ```
 
-`run` spawns one task per mirror, each pinned to one `(topic, partition)`. The whole process exits non-zero on the first task failure — the orchestrator (k8s) is expected to restart it. `RUST_LOG=mirror_v3=debug,mirror_core=debug` for verbose tracing.
+`run` spawns one task per mirror, each pinned to one `(topic, partition)`. SIGINT/SIGTERM trigger a graceful shutdown that flushes any buffered records on Filesystem and S3 sinks before exiting zero. Any task failure collapses the whole process with a non-zero exit — the orchestrator (k8s) is expected to restart it. `RUST_LOG=mirror_v3=debug,mirror_core=debug` for verbose tracing.
 
 ## Configuration
 
