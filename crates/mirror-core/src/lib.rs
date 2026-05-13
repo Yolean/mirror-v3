@@ -20,6 +20,35 @@ use thiserror::Error;
 
 pub mod mock;
 
+/// Per-mirror Prometheus labels. `topic` and `partition` together
+/// uniquely identify the data stream and join cleanly with broker-
+/// side exporters (kafka_exporter, etc.) — the mirror's operator-
+/// chosen `name` is *not* a metric label, it lives in `tracing`
+/// logs only.
+#[derive(Debug, Clone)]
+pub struct MetricLabels {
+    pub topic: String,
+    pub partition: u32,
+}
+
+tokio::task_local! {
+    /// Set by the supervisor (mirror-bin) inside the spawn closure so
+    /// every metric emitted from this mirror's loop and sink is
+    /// automatically labeled with `topic` and `partition`. If unset
+    /// (e.g. inside `cargo test` outside the supervisor), the labels
+    /// fall back to `unknown` / `0` via [`current_labels`].
+    pub static MIRROR_LABELS: MetricLabels;
+}
+
+/// Resolve the current mirror's labels from the task-local as
+/// `(topic, partition_as_string)`, falling back to
+/// `("unknown", "0")` when no scope is set.
+pub fn current_labels() -> (String, String) {
+    MIRROR_LABELS
+        .try_with(|l| (l.topic.clone(), l.partition.to_string()))
+        .unwrap_or_else(|_| ("unknown".into(), "0".into()))
+}
+
 /// A record in transit. `source_offset` is the partition offset on the
 /// *source* topic; the loop and the sink both gate on this value.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -158,6 +187,29 @@ where
     source.seek(start).await?;
     let mut expected = start;
     let mut last_heartbeat_offset = expected;
+    // Initial /metrics state for this mirror:
+    //   - `_offset_verified` carries the destination's startup
+    //     position so an idle mirror is visible to Prometheus.
+    //   - `_offset_inflight_retry` is the current attempt index
+    //     (1-based) for the in-flight write, gauge, resets to 0 on
+    //     success. > 0 = the destination is having problems. Today
+    //     we don't add a retry layer at the sink boundary so the
+    //     visible value is always 0; the slot is reserved so
+    //     dashboards can be pre-built. A future retry layer should
+    //     `set(n)` before each attempt and `set(0)` on success.
+    let (topic, partition) = current_labels();
+    metrics::gauge!(
+        "mirror_v3_destination_offset_verified",
+        "topic" => topic.clone(),
+        "partition" => partition.clone(),
+    )
+    .set(expected as f64);
+    metrics::gauge!(
+        "mirror_v3_destination_offset_inflight_retry",
+        "topic" => topic.clone(),
+        "partition" => partition.clone(),
+    )
+    .set(0.0);
 
     tokio::pin!(shutdown);
     let mut heartbeat = if heartbeat_interval.is_zero() {
@@ -203,6 +255,21 @@ where
                         expected = expected
                             .checked_add(1)
                             .expect("source offset overflowed u64");
+                        // Successful write -> reset the retry gauge
+                        // back to 0 (idempotent when no retry layer
+                        // is wired up yet, but it's the contract).
+                        metrics::gauge!(
+                            "mirror_v3_destination_offset_inflight_retry",
+                            "topic" => topic.clone(),
+                            "partition" => partition.clone(),
+                        )
+                        .set(0.0);
+                        metrics::counter!(
+                            "mirror_v3_destination_records_total",
+                            "topic" => topic.clone(),
+                            "partition" => partition.clone(),
+                        )
+                        .increment(1);
                     }
                     None => {
                         let current = sink.next_expected_offset().await?;

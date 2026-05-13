@@ -4,7 +4,7 @@ use std::process::ExitCode;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use mirror_config::{Destination, Mirror};
-use mirror_core::run_mirror;
+use mirror_core::{run_mirror, MetricLabels, MIRROR_LABELS};
 use mirror_fs::{FilesystemSink, FilesystemSinkConfig};
 use mirror_kafka::{KafkaSink, KafkaSinkConfig, KafkaSource, KafkaSourceConfig};
 use mirror_s3::{S3Sink, S3SinkConfig};
@@ -317,6 +317,7 @@ async fn run(path: PathBuf) -> Result<()> {
         destination = destination_type(&cfg.destination),
         "starting mirror-v3"
     );
+    install_metrics_exporter();
 
     // One shutdown channel, cloned per mirror. Listening for Ctrl-C
     // here means SIGINT triggers graceful flush; in containers,
@@ -370,6 +371,30 @@ async fn shutdown_signal(mut rx: tokio::sync::watch::Receiver<bool>) {
     let _ = rx.changed().await;
 }
 
+/// Install the Prometheus exporter on `0.0.0.0:<port>`. Port defaults
+/// to 9090; override with `MIRROR_V3_METRICS_PORT` (set to `0` to
+/// disable). A failure to bind logs at warn level and is non-fatal —
+/// the operator's observability story degrades, but the mirror keeps
+/// running.
+fn install_metrics_exporter() {
+    let port = std::env::var("MIRROR_V3_METRICS_PORT")
+        .ok()
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or(9090);
+    if port == 0 {
+        tracing::info!("metrics exporter disabled (MIRROR_V3_METRICS_PORT=0)");
+        return;
+    }
+    let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
+    match metrics_exporter_prometheus::PrometheusBuilder::new()
+        .with_http_listener(addr)
+        .install()
+    {
+        Ok(()) => tracing::info!(%addr, "metrics exporter listening on /metrics"),
+        Err(e) => tracing::warn!(error = %e, %addr, "metrics exporter failed; continuing"),
+    }
+}
+
 fn spawn_mirror(
     mirror: Mirror,
     destination: Destination,
@@ -389,6 +414,10 @@ fn spawn_mirror(
         .with_context(|| format!("opening source for mirror {}", mirror.name))?;
 
     let name = mirror.name.clone();
+    let labels = MetricLabels {
+        topic: mirror.topic.clone(),
+        partition: mirror.partition,
+    };
     let destination_name = mirror
         .destination_name_override
         .clone()
@@ -405,7 +434,13 @@ fn spawn_mirror(
                 .with_context(|| format!("opening sink for mirror {name}"))?;
             Ok(tokio::spawn(async move {
                 tracing::info!(mirror = %name, "loop start");
-                match run_mirror(source, sink, shutdown_signal(shutdown_rx)).await {
+                let result = MIRROR_LABELS
+                    .scope(
+                        labels,
+                        run_mirror(source, sink, shutdown_signal(shutdown_rx)),
+                    )
+                    .await;
+                match result {
                     Ok(()) => Ok(()),
                     Err(e) => Err(anyhow::anyhow!("mirror {name}: {e}")),
                 }
@@ -426,7 +461,13 @@ fn spawn_mirror(
                 .with_context(|| format!("opening sink for mirror {name}"))?;
             Ok(tokio::spawn(async move {
                 tracing::info!(mirror = %name, "loop start");
-                match run_mirror(source, sink, shutdown_signal(shutdown_rx)).await {
+                let result = MIRROR_LABELS
+                    .scope(
+                        labels,
+                        run_mirror(source, sink, shutdown_signal(shutdown_rx)),
+                    )
+                    .await;
+                match result {
                     Ok(()) => Ok(()),
                     Err(e) => Err(anyhow::anyhow!("mirror {name}: {e}")),
                 }
@@ -458,11 +499,17 @@ fn spawn_mirror(
             };
             Ok(tokio::spawn(async move {
                 tracing::info!(mirror = %name, "loop start");
-                let sink = match S3Sink::open(sink_cfg).await {
-                    Ok(s) => s,
-                    Err(e) => return Err(anyhow::anyhow!("mirror {name} open S3 sink: {e}")),
-                };
-                match run_mirror(source, sink, shutdown_signal(shutdown_rx)).await {
+                let result = MIRROR_LABELS
+                    .scope(labels, async move {
+                        let sink = S3Sink::open(sink_cfg).await.map_err(|e| {
+                            mirror_core::MirrorError::Sink(mirror_core::SinkError::Transport(
+                                format!("open S3 sink: {e}"),
+                            ))
+                        })?;
+                        run_mirror(source, sink, shutdown_signal(shutdown_rx)).await
+                    })
+                    .await;
+                match result {
                     Ok(()) => Ok(()),
                     Err(e) => Err(anyhow::anyhow!("mirror {name}: {e}")),
                 }

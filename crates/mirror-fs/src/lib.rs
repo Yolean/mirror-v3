@@ -177,6 +177,33 @@ impl FilesystemSink {
             .map(|t| t.elapsed().as_millis() as u64)
             .unwrap_or(0);
         self.last_flush_at = Some(Instant::now());
+
+        let (topic, partition) = mirror_core::current_labels();
+        metrics::gauge!(
+            "mirror_v3_destination_offset_verified",
+            "topic" => topic.clone(),
+            "partition" => partition.clone(),
+        )
+        .set(self.durable_position as f64);
+        metrics::gauge!(
+            "mirror_v3_destination_last_flush_timestamp_seconds",
+            "topic" => topic.clone(),
+            "partition" => partition.clone(),
+        )
+        .set(unix_now_seconds() as f64);
+        metrics::counter!(
+            "mirror_v3_destination_bytes_total",
+            "topic" => topic.clone(),
+            "partition" => partition.clone(),
+        )
+        .increment(bytes);
+        metrics::counter!(
+            "mirror_v3_destination_flushes_total",
+            "topic" => topic,
+            "partition" => partition,
+        )
+        .increment(1);
+
         tracing::info!(
             path = %final_path.display(),
             from,
@@ -229,6 +256,13 @@ impl Sink for FilesystemSink {
     async fn flush(&mut self) -> Result<(), SinkError> {
         self.flush_now().await
     }
+}
+
+fn unix_now_seconds() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 fn record_byte_size(record: &Record) -> u64 {

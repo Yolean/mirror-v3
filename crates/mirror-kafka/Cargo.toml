@@ -14,3 +14,4 @@ rdkafka = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["rt", "time", "macros"] }
 tracing = { workspace = true }
+metrics = { workspace = true }

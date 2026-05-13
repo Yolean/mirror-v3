@@ -280,6 +280,18 @@ impl Sink for KafkaSink {
                 delivery.offset, record.source_offset
             )));
         }
+        // acks=all means the message is replicated and committed on
+        // the destination by the time `send()` returns. The next
+        // source offset the destination will accept is
+        // `delivery.offset + 1`, which equals the destination's high
+        // watermark — i.e. the verified-durable boundary.
+        let (topic, partition) = mirror_core::current_labels();
+        metrics::gauge!(
+            "mirror_v3_destination_offset_verified",
+            "topic" => topic,
+            "partition" => partition,
+        )
+        .set((delivery.offset as u64 + 1) as f64);
         Ok(())
     }
 }
