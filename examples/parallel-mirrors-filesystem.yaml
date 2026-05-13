@@ -1,0 +1,24 @@
+# yaml-language-server: $schema=../schemas/mirror-v3.config.schema.json
+#
+# Two mirrors of distinct partitions, archived to the local
+# filesystem with per-mirror flush triggers.
+
+destination:
+  type: filesystem
+  root: /var/lib/mirror-v3
+  flush:
+    max-time-ms: 5000       # at most 5s of buffering
+    max-bytes: 1048576      # or 1 MiB
+    max-offsets: 1000       # or 1000 source offsets
+
+mirrors:
+  - name: operations-p0
+    source:
+      bootstrap-servers: kafka-source:9092
+    topic: operations-v1
+    partition: 0
+  - name: operations-p1
+    source:
+      bootstrap-servers: kafka-source:9092
+    topic: operations-v1
+    partition: 1

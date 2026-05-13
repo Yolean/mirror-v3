@@ -1,0 +1,17 @@
+[package]
+name = "mirror-bin"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "mirror-v3 binary (Phase 0 stub: validates a YAML config and exits)"
+
+[[bin]]
+name = "mirror-v3"
+path = "src/main.rs"
+
+[dependencies]
+mirror-config = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }

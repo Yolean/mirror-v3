@@ -1,0 +1,15 @@
+# yaml-language-server: $schema=../schemas/mirror-v3.config.schema.json
+#
+# Parity example: one mirror, Kafka source -> Kafka destination,
+# matching the behaviour of the legacy Java worker.
+
+destination:
+  type: kafka
+  bootstrap-servers: redpanda.kafka-v3.svc.cluster.local:9092
+
+mirrors:
+  - name: operations
+    source:
+      bootstrap-servers: kafka-v2-read-bootstrap:9092
+    topic: operations-v1
+    partition: 0

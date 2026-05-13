@@ -1,0 +1,197 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Config",
+  "type": "object",
+  "properties": {
+    "destination": {
+      "description": "Shared destination configuration. A mirror may override the\ndestination *name* (the path/prefix segment) but not the type\nor transport.",
+      "$ref": "#/$defs/Destination"
+    },
+    "mirrors": {
+      "description": "One mirror per (source topic, partition). Every mirror runs\nin its own task; failures terminate the whole process.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/Mirror"
+      }
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "destination",
+    "mirrors"
+  ],
+  "$defs": {
+    "Destination": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "bootstrap-servers": {
+              "description": "`bootstrap.servers` for the destination cluster.",
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "kafka"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "bootstrap-servers"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "root": {
+              "description": "Absolute path to the destination root directory.",
+              "type": "string"
+            },
+            "flush": {
+              "$ref": "#/$defs/FlushTriggers"
+            },
+            "type": {
+              "type": "string",
+              "const": "filesystem"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "root",
+            "flush"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "endpoint": {
+              "description": "S3 endpoint URL. Required for non-AWS S3 (e.g. VersityGW); omit\nfor AWS regional endpoints.",
+              "type": [
+                "string",
+                "null"
+              ],
+              "default": null
+            },
+            "region": {
+              "type": "string"
+            },
+            "bucket": {
+              "type": "string"
+            },
+            "prefix": {
+              "description": "Key prefix prepended to all written object keys.",
+              "type": [
+                "string",
+                "null"
+              ],
+              "default": null
+            },
+            "flush": {
+              "$ref": "#/$defs/FlushTriggers"
+            },
+            "type": {
+              "type": "string",
+              "const": "s3"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "region",
+            "bucket",
+            "flush"
+          ]
+        }
+      ]
+    },
+    "FlushTriggers": {
+      "description": "Flush triggers for blob-style destinations (Filesystem, S3). All\nthree must be set; any one tripping causes a flush. Set a value to\na very large number to effectively disable that trigger.",
+      "type": "object",
+      "properties": {
+        "max-time-ms": {
+          "description": "Maximum time, in milliseconds, between flushes.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "max-bytes": {
+          "description": "Maximum buffered bytes before a flush.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "max-offsets": {
+          "description": "Maximum buffered source offsets before a flush.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "max-time-ms",
+        "max-bytes",
+        "max-offsets"
+      ]
+    },
+    "Mirror": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "description": "Human-readable identifier; appears in logs, metrics and in the\ndestination naming when `destination_name_override` is unset.",
+          "type": "string"
+        },
+        "source": {
+          "$ref": "#/$defs/KafkaSource"
+        },
+        "topic": {
+          "description": "Source Kafka topic name.",
+          "type": "string"
+        },
+        "partition": {
+          "description": "Source Kafka partition. Required, no default.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "destination-name-override": {
+          "description": "Override the destination naming for this mirror. For\nFilesystem/S3 this replaces the leading path/prefix segment;\nfor Kafka it overrides the destination topic name.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "source",
+        "topic",
+        "partition"
+      ]
+    },
+    "KafkaSource": {
+      "type": "object",
+      "properties": {
+        "bootstrap-servers": {
+          "type": "string"
+        },
+        "group-id": {
+          "description": "Optional consumer group id used for monitoring/back-pressure\nonly. Restart correctness derives from the destination, never\nfrom committed group offsets.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "bootstrap-servers"
+      ]
+    }
+  }
+}

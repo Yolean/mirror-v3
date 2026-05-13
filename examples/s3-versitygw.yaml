@@ -1,0 +1,23 @@
+# yaml-language-server: $schema=../schemas/mirror-v3.config.schema.json
+#
+# S3 destination against an in-cluster VersityGW gateway. The same
+# config shape applies to real AWS S3 (drop `endpoint`).
+
+destination:
+  type: s3
+  endpoint: http://versitygw.storage.svc.cluster.local:7070
+  region: us-east-1
+  bucket: mirror-v3
+  prefix: archive/
+  flush:
+    max-time-ms: 60000      # at most 60s of buffering
+    max-bytes: 16777216     # or 16 MiB
+    max-offsets: 10000      # or 10k source offsets
+
+mirrors:
+  - name: operations
+    source:
+      bootstrap-servers: kafka-source:9092
+    topic: operations-v1
+    partition: 0
+    destination-name-override: operations-archive

@@ -1,0 +1,35 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/mirror-config",
+    "crates/mirror-bin",
+    "crates/xtask",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "Apache-2.0"
+repository = "https://github.com/YoleanAgents/mirror-v3"
+
+[workspace.dependencies]
+mirror-config = { path = "crates/mirror-config" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+schemars = { version = "1", features = ["preserve_order"] }
+thiserror = "2"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+
+[profile.release-debug]
+inherits = "release"
+strip = "none"
+debug = true
