@@ -3,6 +3,12 @@ name: ci
 # publish phases, image push gated on the full e2e suite passing
 # first. (No upstream-image cron job — there's nothing for this repo
 # to mirror in the registry sense.)
+#
+# Third-party actions are pinned to a 40-char commit SHA with the
+# released version captured in a trailing comment, so supply-chain
+# tampering on a moving tag can't silently change what we run. To
+# update: bump the comment to the new release, replace the SHA with
+# whatever that tag currently resolves to.
 
 on:
   push:
@@ -15,19 +21,25 @@ env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-Dwarnings"
   SOURCE_DATE_EPOCH: '0'
+  # librdkafka 2.12.1 (via rdkafka-sys 4.10) unconditionally compiles
+  # in libcurl (OIDC) regardless of the `-DWITH_CURL=0` cmake flag,
+  # and wants libssl / libsasl2 / libzstd / liblz4 for the rest of
+  # its features. We install them in every job that builds the
+  # workspace.
+  LIBRDKAFKA_BUILD_DEPS: cmake g++ make pkg-config libcurl4-openssl-dev libssl-dev libsasl2-dev libzstd-dev liblz4-dev
 
 jobs:
   test:
     name: unit + lint
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
     - name: install build deps for librdkafka
-      run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake g++ make pkg-config
-    - uses: dtolnay/rust-toolchain@stable
+      run: sudo apt-get update && sudo apt-get install -y --no-install-recommends $LIBRDKAFKA_BUILD_DEPS
+    - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable as of 2026-03-27
       with:
         components: rustfmt, clippy
-    - uses: Swatinem/rust-cache@v2
+    - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
     - run: cargo fmt --all -- --check
     - run: cargo clippy --workspace --all-targets --locked -- -Dwarnings
     - name: unit + integration tests (no docker)
@@ -39,16 +51,17 @@ jobs:
     name: e2e (docker)
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
     - name: install build deps for librdkafka
-      run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake g++ make pkg-config
-    - uses: dtolnay/rust-toolchain@stable
-    - uses: Swatinem/rust-cache@v2
+      run: sudo apt-get update && sudo apt-get install -y --no-install-recommends $LIBRDKAFKA_BUILD_DEPS
+    - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable as of 2026-03-27
+    - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
     - name: prepull e2e images
       run: |
         docker pull quay.io/ogunalp/kafka-native:latest &
         docker pull docker.io/redpandadata/redpanda:latest &
         docker pull docker.io/versity/versitygw:latest &
+        docker pull ghcr.io/shopify/toxiproxy:2.12.0 &
         wait
     - name: cargo test mirror-e2e
       run: cargo test -p mirror-e2e --locked -- --test-threads=1
@@ -61,18 +74,18 @@ jobs:
       packages: write
       contents: read
     steps:
-    - uses: actions/checkout@v4
-    - uses: docker/setup-qemu-action@v3
-    - uses: docker/setup-buildx-action@v3
+    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+    - uses: docker/setup-qemu-action@ce360397dd3f832beb865e1373c09c0e9f86d70a  # v4.0.0
+    - uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd  # v4.0.0
     - name: login to ghcr.io
       if: github.event_name != 'pull_request'
-      uses: docker/login-action@v3
+      uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121  # v4.1.0
       with:
         registry: ghcr.io
         username: ${{ github.repository_owner }}
         password: ${{ secrets.GITHUB_TOKEN }}
     - id: meta
-      uses: docker/metadata-action@v5
+      uses: docker/metadata-action@030e881283bb7a6894de51c315a6bfe6a94e05cf  # v6.0.0
       with:
         images: ghcr.io/yolean/mirror-v3
         # Tag rules:
@@ -86,7 +99,7 @@ jobs:
           type=ref,event=pr
           type=sha,prefix=sha-
     - name: build (and push on non-PR)
-      uses: docker/build-push-action@v6
+      uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f  # v7.1.0
       with:
         context: .
         platforms: linux/amd64,linux/arm64

@@ -10,9 +10,15 @@
 # and commit the digest. Update both stages together.
 
 FROM docker.io/library/rust:1-bookworm AS builder
-# librdkafka is built from source by rdkafka-sys via cmake.
+# librdkafka 2.12+ unconditionally pulls in libcurl (OIDC support);
+# libssl/libsasl2/libzstd/liblz4 give us full feature support. cmake
+# drives the build, g++/make do the compiling, pkg-config is for
+# library discovery. Keep this list aligned with .github/workflows/ci.yaml's
+# LIBRDKAFKA_BUILD_DEPS so local and CI builds match.
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends cmake g++ make pkg-config && \
+    apt-get install -y --no-install-recommends \
+        cmake g++ make pkg-config \
+        libcurl4-openssl-dev libssl-dev libsasl2-dev libzstd-dev liblz4-dev && \
     rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 
