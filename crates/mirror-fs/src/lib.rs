@@ -72,6 +72,9 @@ pub struct FilesystemSink {
     buffer: Vec<Record>,
     buffer_bytes: u64,
     buffer_started: Option<Instant>,
+    /// When the most recent flush completed; used to log "ms since
+    /// last flush" so operators can see flush cadence.
+    last_flush_at: Option<Instant>,
 }
 
 impl FilesystemSink {
@@ -89,6 +92,7 @@ impl FilesystemSink {
             buffer: Vec::new(),
             buffer_bytes: 0,
             buffer_started: None,
+            last_flush_at: None,
         })
     }
 
@@ -116,8 +120,11 @@ impl FilesystemSink {
 
     async fn flush_locked(&mut self) -> Result<(), SinkError> {
         debug_assert!(!self.buffer.is_empty());
+        let flush_started = Instant::now();
         let from = self.durable_position;
         let to = self.durable_position + self.buffer.len() as u64 - 1;
+        let count = self.buffer.len();
+        let bytes = self.buffer_bytes;
         let final_name = naming::batch_filename(from, to, FILE_EXT);
         let final_path = self.dir.join(&final_name);
         let tmp_path = self
@@ -164,7 +171,22 @@ impl FilesystemSink {
         self.buffer.clear();
         self.buffer_bytes = 0;
         self.buffer_started = None;
-        tracing::debug!(from, to, "flushed batch");
+        let elapsed_ms = flush_started.elapsed().as_millis() as u64;
+        let interval_ms = self
+            .last_flush_at
+            .map(|t| t.elapsed().as_millis() as u64)
+            .unwrap_or(0);
+        self.last_flush_at = Some(Instant::now());
+        tracing::info!(
+            path = %final_path.display(),
+            from,
+            to,
+            count,
+            bytes,
+            elapsed_ms,
+            interval_ms,
+            "flushed batch"
+        );
         Ok(())
     }
 }

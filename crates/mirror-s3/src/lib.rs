@@ -55,6 +55,7 @@ pub struct S3Sink {
     buffer: Vec<Record>,
     buffer_bytes: u64,
     buffer_started: Option<Instant>,
+    last_flush_at: Option<Instant>,
 }
 
 impl S3Sink {
@@ -70,6 +71,7 @@ impl S3Sink {
             buffer: Vec::new(),
             buffer_bytes: 0,
             buffer_started: None,
+            last_flush_at: None,
         })
     }
 
@@ -94,8 +96,11 @@ impl S3Sink {
 
     async fn flush_locked(&mut self) -> Result<(), SinkError> {
         debug_assert!(!self.buffer.is_empty());
+        let flush_started = Instant::now();
         let from = self.durable_position;
         let to = self.durable_position + self.buffer.len() as u64 - 1;
+        let count = self.buffer.len();
+        let buffered_bytes = self.buffer_bytes;
         let name = naming::batch_filename(from, to, FILE_EXT);
         let path = child_of(&self.partition_prefix, &name);
 
@@ -104,6 +109,7 @@ impl S3Sink {
             encode_line(record, &mut bytes)
                 .map_err(|e| SinkError::Transport(format!("encode: {e}")))?;
         }
+        let encoded_bytes = bytes.len() as u64;
 
         let opts = PutOptions {
             mode: PutMode::Create,
@@ -129,7 +135,23 @@ impl S3Sink {
         self.buffer.clear();
         self.buffer_bytes = 0;
         self.buffer_started = None;
-        tracing::debug!(from, to, %path, "flushed batch");
+        let elapsed_ms = flush_started.elapsed().as_millis() as u64;
+        let interval_ms = self
+            .last_flush_at
+            .map(|t| t.elapsed().as_millis() as u64)
+            .unwrap_or(0);
+        self.last_flush_at = Some(Instant::now());
+        tracing::info!(
+            %path,
+            from,
+            to,
+            count,
+            buffered_bytes,
+            encoded_bytes,
+            elapsed_ms,
+            interval_ms,
+            "flushed batch"
+        );
         Ok(())
     }
 }

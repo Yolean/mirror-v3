@@ -24,7 +24,17 @@ mirror-v3 validate --config config.yaml   # parse-only
 mirror-v3 run --config config.yaml        # start the configured mirrors
 ```
 
-`run` spawns one task per mirror, each pinned to one `(topic, partition)`. SIGINT/SIGTERM trigger a graceful shutdown that flushes any buffered records on Filesystem and S3 sinks before exiting zero. Any task failure collapses the whole process with a non-zero exit — the orchestrator (k8s) is expected to restart it. `RUST_LOG=mirror_v3=debug,mirror_core=debug` for verbose tracing.
+`run` spawns one task per mirror, each pinned to one `(topic, partition)`. SIGINT/SIGTERM trigger a graceful shutdown that flushes any buffered records on Filesystem and S3 sinks before exiting zero. Any task failure collapses the whole process with a non-zero exit — the orchestrator (k8s) is expected to restart it.
+
+## Observability
+
+The default INFO-level log stream is operator-oriented:
+
+- One line per mirror at startup with the resolved destination type and source seek.
+- A **heartbeat** line every 30 s with `expected_offset` and `progressed` (records since the last heartbeat). Confirms liveness even when the source is idle. Override the interval with `MIRROR_V3_HEARTBEAT_SECS=<seconds>`; set to `0` to disable.
+- One line per **flush** for Filesystem and S3 sinks: `path`, `from`, `to`, `count`, `bytes`, `elapsed_ms` (how long this flush took), `interval_ms` (since the previous flush). Kafka sinks don't buffer so they have no flush line — the heartbeat carries the "still alive, here's the offset" signal.
+
+`RUST_LOG=info` is the default; `RUST_LOG=mirror_core=debug,mirror_fs=debug` adds verbose internals.
 
 ## Configuration
 

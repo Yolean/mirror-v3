@@ -104,11 +104,50 @@ pub enum MirrorError {
     DestinationDrift { expected: u64, actual: u64 },
 }
 
+/// How often the loop emits an INFO-level "heartbeat" log line. This
+/// is the operator's `kubectl logs` heartbeat — without it, a quiet
+/// mirror (no source traffic, or buffered records that haven't
+/// tripped a flush trigger yet) looks indistinguishable from a stuck
+/// one. Override via the `MIRROR_V3_HEARTBEAT_SECS` env var; set to
+/// `0` to disable.
+pub const DEFAULT_HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Read the heartbeat interval from `MIRROR_V3_HEARTBEAT_SECS`,
+/// falling back to [`DEFAULT_HEARTBEAT_INTERVAL`]. A value of `0`
+/// disables heartbeats.
+pub fn heartbeat_interval_from_env() -> std::time::Duration {
+    match std::env::var("MIRROR_V3_HEARTBEAT_SECS").ok().as_deref() {
+        Some(s) => match s.parse::<u64>() {
+            Ok(secs) => std::time::Duration::from_secs(secs),
+            Err(_) => DEFAULT_HEARTBEAT_INTERVAL,
+        },
+        None => DEFAULT_HEARTBEAT_INTERVAL,
+    }
+}
+
 /// Drive the mirror loop until `shutdown` resolves or an error is
 /// returned. On graceful shutdown, the loop calls `sink.flush()` so
 /// buffered batches (FS, S3) become durable. Use
 /// `std::future::pending::<()>()` for a "run forever" caller (tests).
-pub async fn run_mirror<S, K, F>(mut source: S, mut sink: K, shutdown: F) -> Result<(), MirrorError>
+///
+/// Heartbeat interval is read from the environment; pass a fixed
+/// interval via [`run_mirror_with_heartbeat`] if you need explicit
+/// control (e.g. tests that want to disable heartbeats).
+pub async fn run_mirror<S, K, F>(source: S, sink: K, shutdown: F) -> Result<(), MirrorError>
+where
+    S: Source,
+    K: Sink,
+    F: std::future::Future<Output = ()> + Send,
+{
+    run_mirror_with_heartbeat(source, sink, shutdown, heartbeat_interval_from_env()).await
+}
+
+pub async fn run_mirror_with_heartbeat<S, K, F>(
+    mut source: S,
+    mut sink: K,
+    shutdown: F,
+    heartbeat_interval: std::time::Duration,
+) -> Result<(), MirrorError>
 where
     S: Source,
     K: Sink,
@@ -118,8 +157,17 @@ where
     tracing::info!(start_offset = start, "starting mirror");
     source.seek(start).await?;
     let mut expected = start;
+    let mut last_heartbeat_offset = expected;
 
     tokio::pin!(shutdown);
+    let mut heartbeat = if heartbeat_interval.is_zero() {
+        None
+    } else {
+        let mut iv = tokio::time::interval(heartbeat_interval);
+        iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        Some(iv)
+    };
+
     loop {
         tokio::select! {
             biased;
@@ -127,6 +175,20 @@ where
                 tracing::info!("shutdown requested; flushing sink");
                 sink.flush().await?;
                 return Ok(());
+            }
+            _ = async {
+                match heartbeat.as_mut() {
+                    Some(iv) => { iv.tick().await; }
+                    None => std::future::pending::<()>().await,
+                }
+            } => {
+                let progressed = expected - last_heartbeat_offset;
+                tracing::info!(
+                    expected_offset = expected,
+                    progressed,
+                    "heartbeat"
+                );
+                last_heartbeat_offset = expected;
             }
             poll_result = source.poll_one() => {
                 match poll_result? {
