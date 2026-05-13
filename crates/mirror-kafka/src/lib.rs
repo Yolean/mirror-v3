@@ -64,9 +64,11 @@ impl KafkaSource {
             .set("group.id", &cfg.group_id)
             .set("enable.auto.commit", "false")
             .set("auto.offset.reset", "earliest")
-            // We assign manually and the loop drives one record at a
-            // time; keep librdkafka's fetcher conservative to match.
-            .set("max.poll.records", "1")
+            // Note: the Java worker used `max.poll.records=1` for
+            // single-record progression; that property is Java-client
+            // only, not librdkafka. The loop in mirror-core already
+            // takes one record at a time via `recv()` so we don't
+            // need a fetcher-side cap to preserve the invariant.
             .create()
             .map_err(|e| KafkaError::Init(e.to_string()))?;
         Ok(Self {

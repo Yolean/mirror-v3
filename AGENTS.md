@@ -20,7 +20,7 @@ This file is for the next agent (or human) extending mirror-v3. Read this first;
     └── mirror-v3.config.schema.json   golden file, gated in CI
 ```
 
-Phase 1 added `mirror-core` and `mirror-kafka`; `mirror-fs` and `mirror-s3` arrive in Phases 3/4.
+Phase 1 added `mirror-core` and `mirror-kafka`. Phase 2 added the `mirror-e2e` crate at `e2e/` with `testcontainers`-driven Docker stacks and the `Provisioner`/`ProvisionedStack` trait seam for plugging in new test infra. `mirror-fs` and `mirror-s3` arrive in Phases 3/4.
 
 ## The phase plan
 
@@ -29,8 +29,8 @@ Each row is a separate change set / PR. Do not skip phases.
 | Phase | Scope | Done when |
 |---|---|---|
 | 0 | Workspace + config model + JSON Schema gate + CLI stub + Dockerfile | `cargo test --workspace` green, schema committed |
-| **1** | `mirror-core` (Source/Sink traits, loop) + `mirror-kafka` source+sink with end-offset gate + `mirror-v3 run` supervisor | Builds + 17 tests green; loop invariants exhaustively unit-tested with mocks. **Parity on a dev site against real Kafka still requires Phase 2 e2e to verify.** |
-| 2 | Docker e2e harness + `kafka-native → redpanda` stack with Toxiproxy fault injection | Tests pass green and red |
+| 1 | `mirror-core` (Source/Sink traits, loop) + `mirror-kafka` source+sink with end-offset gate + `mirror-v3 run` supervisor | Builds + 17 tests green; loop invariants exhaustively unit-tested with mocks |
+| **2** | Docker e2e harness (`mirror-e2e` crate) + `kafka-native → redpanda` happy-path test. Toxiproxy follow-up next | First real Kafka e2e green: 100 records, byte-identical, offsets preserved |
 | 3 | `mirror-fs` sink + flush triggers + scan-validate on startup | E2e: crash-mid-flush recovery |
 | 4 | `mirror-s3` sink via `object_store`, `redpanda → versitygw` e2e | Concurrent writer race produces hard exit, never a silently-overlapping blob |
 | 5 | Supervisor for N mirrors in one process; per-mirror metrics | Two mirrors run side-by-side under fault injection |
@@ -58,10 +58,14 @@ Every change should land with a failing test first, then the fix. Three layers:
 Run locally:
 
 ```sh
-cargo test --workspace
-cargo run -p xtask -- check-schema   # fails if structs changed without regen
+# Fast loop (no Docker, ~seconds):
+cargo test --workspace --exclude mirror-e2e
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --locked -- -Dwarnings
+cargo run -p xtask -- check-schema   # fails if structs changed without regen
+
+# Full e2e (requires Docker; pulls broker images on first run):
+cargo test -p mirror-e2e
 ```
 
 CI in `.github/workflows/ci.yml` runs all of the above on every PR.

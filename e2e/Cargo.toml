@@ -1,0 +1,23 @@
+[package]
+name = "mirror-e2e"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "End-to-end test harness for mirror-v3"
+
+[dependencies]
+mirror-core = { workspace = true }
+mirror-kafka = { workspace = true }
+async-trait = { workspace = true }
+anyhow = { workspace = true }
+testcontainers = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "sync"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+rdkafka = { workspace = true }
+portpicker = { workspace = true }
+
+[dev-dependencies]

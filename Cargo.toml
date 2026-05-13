@@ -6,6 +6,7 @@ members = [
     "crates/mirror-kafka",
     "crates/mirror-bin",
     "crates/xtask",
+    "e2e",
 ]
 
 [workspace.package]
@@ -32,6 +33,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rdkafka = { version = "0.39", default-features = false, features = ["cmake-build", "tokio"] }
 async-trait = "0.1"
+testcontainers = "0.27"
+portpicker = "0.1"
 
 [profile.release]
 lto = "thin"
