@@ -35,6 +35,20 @@ impl MirrorHandle {
             Err(e) => Err(anyhow::anyhow!("task join: {e}")),
         }
     }
+
+    /// Await the task without requesting shutdown. Used by adversarial
+    /// tests that expect the mirror to terminate on its own because
+    /// of an error (e.g. destination drift detection). Returns
+    /// `Ok(())` only if the mirror exits gracefully — a non-cancelled
+    /// `Err` is propagated and a cancellation is reported.
+    pub async fn wait_for_termination(self) -> Result<()> {
+        match self.handle.await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(anyhow::anyhow!("mirror loop: {e}")),
+            Err(e) if e.is_cancelled() => Err(anyhow::anyhow!("task cancelled")),
+            Err(e) => Err(anyhow::anyhow!("task join: {e}")),
+        }
+    }
 }
 
 fn shutdown_pair() -> (
