@@ -1,0 +1,25 @@
+[package]
+name = "mirror-s3"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "S3-compatible sink for mirror-v3, via object_store"
+
+[dependencies]
+mirror-core = { workspace = true }
+mirror-fs = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+object_store = { workspace = true }
+futures = { workspace = true }
+bytes = { workspace = true }
+uuid = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros", "time"] }

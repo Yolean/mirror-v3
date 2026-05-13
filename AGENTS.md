@@ -20,7 +20,7 @@ This file is for the next agent (or human) extending mirror-v3. Read this first;
     └── mirror-v3.config.schema.json   golden file, gated in CI
 ```
 
-Phase 1 added `mirror-core` and `mirror-kafka`. Phase 2 added the `mirror-e2e` crate at `e2e/` with `testcontainers`-driven Docker stacks and the `Provisioner`/`ProvisionedStack` trait seam for plugging in new test infra. Phase 3 added `mirror-fs` (atomic-rename filesystem sink, `<from>-<to>.ndjson` naming, scan-validate on startup). `mirror-s3` arrives in Phase 4.
+Phase 1 added `mirror-core` and `mirror-kafka`. Phase 2 added the `mirror-e2e` crate at `e2e/` with `testcontainers`-driven Docker stacks and the `Provisioner`/`ProvisionedStack` trait seam for plugging in new test infra. Phase 3 added `mirror-fs` (atomic-rename filesystem sink, `<from>-<to>.ndjson` naming, scan-validate on startup). Phase 4 added `mirror-s3` (same wire format as `mirror-fs`, `object_store`-backed, `PutMode::Create` + scan-validate two-layer atomicity).
 
 ## The phase plan
 
@@ -31,7 +31,8 @@ Each row is a separate change set / PR. Do not skip phases.
 | 0 | Workspace + config model + JSON Schema gate + CLI stub + Dockerfile | `cargo test --workspace` green, schema committed |
 | 1 | `mirror-core` (Source/Sink traits, loop) + `mirror-kafka` source+sink with end-offset gate + `mirror-v3 run` supervisor | Builds + 17 tests green; loop invariants exhaustively unit-tested with mocks |
 | 2 | Docker e2e harness (`mirror-e2e` crate) + `kafka-native → redpanda` happy-path test | First real Kafka e2e green: 100 records, byte-identical, offsets preserved |
-| **3** | `mirror-fs` sink + flush triggers + scan-validate on startup + e2e | FS sink unit-tested (corrupt-chain, restart, crashed .tmp, flush triggers); kafka→fs e2e green |
+| 3 | `mirror-fs` sink + flush triggers + scan-validate on startup + e2e | FS sink unit-tested (corrupt-chain, restart, crashed .tmp, flush triggers); kafka→fs e2e green |
+| **4** | `mirror-s3` sink via `object_store` + VersityGW e2e + conditional-PUT spike | S3 sink unit-tested against InMemory (incl. `PutMode::Create` enforcement); kafka→VersityGW e2e green; spike answer recorded |
 | **2b** (deferred) | Toxiproxy fault injection in the Docker stack | A fault test demonstrates the mirror's crash-and-recover-from-destination behaviour |
 | 4 | `mirror-s3` sink via `object_store`, `redpanda → versitygw` e2e | Concurrent writer race produces hard exit, never a silently-overlapping blob |
 | 5 | Supervisor for N mirrors in one process; per-mirror metrics | Two mirrors run side-by-side under fault injection |
@@ -98,5 +99,5 @@ The image runs as `nonroot`. The binary needs no extra capabilities.
 
 ## Open questions to resolve at their phase
 
-- **Phase 4:** Does VersityGW (POSIX backend) honor `If-None-Match: *`? Spike a single PUT against `versity/versitygw:latest` before locking the S3 sink.
+- **Phase 4 (resolved):** Does VersityGW (POSIX backend) honor `If-None-Match: *`? **No.** `e2e/tests/kafka_to_versitygw.rs::versitygw_conditional_put_spike` confirms VersityGW v1.4.1 silently overwrites the second PUT — `PutMode::Create` is a no-op there. AWS S3 honors it (Aug 2024 feature). **Consequence:** when the destination is VersityGW, the *only* protection against the two-writer overlap race is the deployment guarantee (k8s `Recreate`, single replica) plus scan-validate on startup. The S3 sink still issues `PutMode::Create` because the cost is the same and AWS-style backends DO get API-level atomicity from it.
 - **Phase 6:** Cutover plan for checkit/mirror-v3 — env-var shim so `mirror-v3-worker-deployment.yaml` doesn't need to change in lockstep.

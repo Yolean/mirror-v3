@@ -30,6 +30,22 @@ use tokio::io::AsyncWriteExt;
 
 pub mod naming;
 
+/// Encode one record as a single ndjson line, appending into `out`.
+/// Shared by mirror-fs and mirror-s3 so a single decoder can read
+/// either.
+pub fn encode_line(record: &Record, out: &mut Vec<u8>) -> Result<(), serde_json::Error> {
+    let pr = PersistedRecord::from(record);
+    serde_json::to_writer(&mut *out, &pr)?;
+    out.push(b'\n');
+    Ok(())
+}
+
+/// Decode one ndjson line back to a [`Record`].
+pub fn decode_line(bytes: &[u8]) -> Result<Record, serde_json::Error> {
+    let pr: PersistedRecord = serde_json::from_slice(bytes)?;
+    Ok(pr.into_record())
+}
+
 pub const FILE_EXT: &str = "ndjson";
 
 #[derive(Debug, Clone)]
@@ -113,16 +129,14 @@ impl FilesystemSink {
             let mut file = tokio::fs::File::create(&tmp_path)
                 .await
                 .map_err(|e| SinkError::Transport(format!("create tmp: {e}")))?;
+            let mut buf = Vec::with_capacity(self.buffer_bytes as usize + 64 * self.buffer.len());
             for record in &self.buffer {
-                let line = serde_json::to_string(&PersistedRecord::from(record))
+                encode_line(record, &mut buf)
                     .map_err(|e| SinkError::Transport(format!("encode: {e}")))?;
-                file.write_all(line.as_bytes())
-                    .await
-                    .map_err(|e| SinkError::Transport(format!("write: {e}")))?;
-                file.write_all(b"\n")
-                    .await
-                    .map_err(|e| SinkError::Transport(format!("write: {e}")))?;
             }
+            file.write_all(&buf)
+                .await
+                .map_err(|e| SinkError::Transport(format!("write: {e}")))?;
             file.sync_all()
                 .await
                 .map_err(|e| SinkError::Transport(format!("fsync: {e}")))?;

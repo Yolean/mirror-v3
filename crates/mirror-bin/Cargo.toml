@@ -16,6 +16,8 @@ mirror-config = { workspace = true }
 mirror-core = { workspace = true }
 mirror-kafka = { workspace = true }
 mirror-fs = { workspace = true }
+mirror-s3 = { workspace = true }
+object_store = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
 tokio = { workspace = true }

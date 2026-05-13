@@ -12,6 +12,7 @@ description = "End-to-end test harness for mirror-v3"
 mirror-core = { workspace = true }
 mirror-kafka = { workspace = true }
 mirror-fs = { workspace = true }
+mirror-s3 = { workspace = true }
 async-trait = { workspace = true }
 anyhow = { workspace = true }
 testcontainers = { workspace = true }
@@ -21,3 +22,6 @@ tracing-subscriber = { workspace = true }
 rdkafka = { workspace = true }
 portpicker = { workspace = true }
 tempfile = { workspace = true }
+object_store = { workspace = true }
+futures = { workspace = true }
+bytes = { workspace = true }

@@ -4,11 +4,14 @@
 use std::time::Duration;
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use mirror_core::{run_mirror, MirrorError};
 use mirror_fs::{FilesystemSink, FilesystemSinkConfig};
 use mirror_kafka::{KafkaSink, KafkaSinkConfig, KafkaSource, KafkaSourceConfig};
+use mirror_s3::{S3Sink, S3SinkConfig};
+use object_store::ObjectStore;
 
 pub struct MirrorHandle {
     handle: tokio::task::JoinHandle<Result<std::convert::Infallible, MirrorError>>,
@@ -78,6 +81,41 @@ pub fn spawn_kafka_to_filesystem(spec: FsMirrorSpec) -> Result<MirrorHandle> {
         flush: spec.flush,
     };
     let sink = FilesystemSink::open(sink_cfg).context("open FilesystemSink")?;
+    let handle = tokio::spawn(async move { run_mirror(source, sink).await });
+    Ok(MirrorHandle { handle })
+}
+
+pub struct S3MirrorSpec {
+    pub source_bootstrap: String,
+    pub source_topic: String,
+    pub partition: i32,
+    pub group_id: String,
+    pub store: Arc<dyn ObjectStore>,
+    pub prefix: Option<object_store::path::Path>,
+    pub destination_name: String,
+    pub flush: mirror_s3::FlushTriggers,
+}
+
+pub async fn spawn_kafka_to_s3(spec: S3MirrorSpec) -> Result<MirrorHandle> {
+    let src_cfg = {
+        let mut c = KafkaSourceConfig::new(
+            spec.source_bootstrap,
+            spec.group_id,
+            spec.source_topic,
+            spec.partition,
+        );
+        c.poll_timeout = Duration::from_millis(500);
+        c
+    };
+    let source = KafkaSource::open(src_cfg).context("open KafkaSource")?;
+    let sink_cfg = S3SinkConfig {
+        store: spec.store,
+        prefix: spec.prefix,
+        destination_name: spec.destination_name,
+        partition: spec.partition as u32,
+        flush: spec.flush,
+    };
+    let sink = S3Sink::open(sink_cfg).await.context("open S3Sink")?;
     let handle = tokio::spawn(async move { run_mirror(source, sink).await });
     Ok(MirrorHandle { handle })
 }
