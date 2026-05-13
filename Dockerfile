@@ -23,8 +23,14 @@ RUN apt-get update && \
 WORKDIR /src
 
 # Cache deps separately from sources for faster incremental builds.
+# Note: the workspace's `[workspace.members]` includes `e2e/` even
+# though we only build the `mirror-v3` bin from `crates/mirror-bin`,
+# so cargo needs to read every member's Cargo.toml during resolve.
+# Copying the e2e tree (a few KB) is the simplest fix and doesn't
+# affect the runtime stage.
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY crates ./crates
+COPY e2e ./e2e
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
     cargo build --release --bin mirror-v3 --locked && \
