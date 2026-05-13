@@ -20,9 +20,15 @@ The single non-negotiable: **restart correctness derives from the destination**,
 ## Running
 
 ```sh
-mirror-v3 validate --config config.yaml   # parse-only
-mirror-v3 run --config config.yaml        # start the configured mirrors
+mirror-v3 validate --config config.yaml             # parse-only
+mirror-v3 run --config config.yaml                  # start the configured mirrors
+mirror-v3 status --config config.yaml               # one-shot health check, table format
+mirror-v3 status --config config.yaml --format json # same, machine-readable
 ```
+
+`status` queries the source Kafka high watermark and the destination's `next-expected-offset` for every mirror in the config and prints the lag. Exits non-zero if any mirror failed to query (unreachable broker, corrupt destination chain, etc.). Useful as a `kubectl exec` health probe before/during/after an appliance backup, without having to ssh to the node.
+
+All logs go to **stderr** (heartbeat, flush lines, errors). `stdout` is reserved for command-driven output (`status --format json`, the `validate` success line). Standard `1>` / `2>` redirects work as expected.
 
 `run` spawns one task per mirror, each pinned to one `(topic, partition)`. SIGINT/SIGTERM trigger a graceful shutdown that flushes any buffered records on Filesystem and S3 sinks before exiting zero. Any task failure collapses the whole process with a non-zero exit — the orchestrator (k8s) is expected to restart it.
 

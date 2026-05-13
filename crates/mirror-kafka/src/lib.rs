@@ -24,6 +24,29 @@ use rdkafka::TopicPartitionList;
 const DEFAULT_POLL_TIMEOUT: Duration = Duration::from_secs(2);
 const DEFAULT_WATERMARK_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Fetch the high watermark for `(topic, partition)` against
+/// `bootstrap`. One-shot; intended for the `status` subcommand and
+/// other introspection callers. Sync call — wrap in spawn_blocking
+/// for async contexts.
+pub fn fetch_high_watermark(
+    bootstrap: &str,
+    topic: &str,
+    partition: i32,
+    timeout: Duration,
+) -> Result<i64, KafkaError> {
+    use rdkafka::consumer::Consumer;
+    let consumer: BaseConsumer = ClientConfig::new()
+        .set("bootstrap.servers", bootstrap)
+        .set("group.id", "mirror-v3-status-noop")
+        .set("enable.auto.commit", "false")
+        .create()
+        .map_err(|e| KafkaError::Init(e.to_string()))?;
+    let (_low, high) = consumer
+        .fetch_watermarks(topic, partition, Timeout::After(timeout))
+        .map_err(|e| KafkaError::Init(format!("fetch_watermarks: {e}")))?;
+    Ok(high)
+}
+
 #[derive(Debug, Clone)]
 pub struct KafkaSourceConfig {
     pub bootstrap_servers: String,

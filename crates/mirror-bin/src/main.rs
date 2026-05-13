@@ -34,6 +34,24 @@ enum Cmd {
         #[arg(short, long)]
         config: PathBuf,
     },
+    /// One-shot health check: per mirror, print the source high
+    /// watermark, the destination's next-expected-offset, and the
+    /// lag (source high - destination next). Exits non-zero if any
+    /// mirror failed to query.
+    Status {
+        #[arg(short, long)]
+        config: PathBuf,
+        /// Output format. `table` is the default kubectl-friendly
+        /// aligned text; `json` is machine-readable.
+        #[arg(long, default_value = "table")]
+        format: StatusFormat,
+    },
+}
+
+#[derive(Copy, Clone, clap::ValueEnum)]
+enum StatusFormat {
+    Table,
+    Json,
 }
 
 fn main() -> ExitCode {
@@ -47,6 +65,31 @@ fn main() -> ExitCode {
                 ExitCode::from(1)
             }
         },
+        Cmd::Status { config, format } => {
+            let rt = match tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(err) => {
+                    eprintln!("error: tokio init: {err}");
+                    return ExitCode::from(1);
+                }
+            };
+            match rt.block_on(run_status(config, format)) {
+                Ok(any_errors) => {
+                    if any_errors {
+                        ExitCode::from(1)
+                    } else {
+                        ExitCode::SUCCESS
+                    }
+                }
+                Err(err) => {
+                    eprintln!("error: {err:?}");
+                    ExitCode::from(1)
+                }
+            }
+        }
         Cmd::Run { config } => {
             let rt = match tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
@@ -71,9 +114,14 @@ fn main() -> ExitCode {
 
 fn init_tracing() {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    // tracing_subscriber::fmt() defaults to stdout. Force stderr so
+    // stdout stays available for structured output (e.g. `status
+    // --format json`) and standard `1>` / `2>` redirects do the
+    // expected thing.
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(true)
+        .with_writer(std::io::stderr)
         .try_init();
 }
 
@@ -93,6 +141,170 @@ fn destination_type(d: &Destination) -> &'static str {
         Destination::Kafka(_) => "kafka",
         Destination::Filesystem(_) => "filesystem",
         Destination::S3(_) => "s3",
+    }
+}
+
+#[derive(Debug, serde::Serialize)]
+struct StatusRow {
+    name: String,
+    source_high: Option<i64>,
+    dest_next: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+impl StatusRow {
+    fn lag(&self) -> Option<i64> {
+        match (self.source_high, self.dest_next) {
+            (Some(h), Some(n)) => Some(h.saturating_sub(n as i64).max(0)),
+            _ => None,
+        }
+    }
+}
+
+async fn run_status(path: PathBuf, format: StatusFormat) -> Result<bool> {
+    let cfg = mirror_config::load_from_path(&path)
+        .with_context(|| format!("loading {}", path.display()))?;
+    let mut rows = Vec::with_capacity(cfg.mirrors.len());
+    for mirror in &cfg.mirrors {
+        rows.push(compute_status_row(mirror, &cfg.destination).await);
+    }
+    let any_errors = rows.iter().any(|r| r.error.is_some());
+    match format {
+        StatusFormat::Table => print_status_table(&rows),
+        StatusFormat::Json => println!("{}", serde_json::to_string_pretty(&rows)?),
+    }
+    Ok(any_errors)
+}
+
+async fn compute_status_row(mirror: &Mirror, destination: &Destination) -> StatusRow {
+    let mut row = StatusRow {
+        name: mirror.name.clone(),
+        source_high: None,
+        dest_next: None,
+        error: None,
+    };
+    let bootstrap = mirror.source.bootstrap_servers.clone();
+    let topic = mirror.topic.clone();
+    let partition = mirror.partition as i32;
+    let source_result = tokio::task::spawn_blocking(move || {
+        mirror_kafka::fetch_high_watermark(
+            &bootstrap,
+            &topic,
+            partition,
+            std::time::Duration::from_secs(5),
+        )
+    })
+    .await;
+    match source_result {
+        Ok(Ok(high)) => row.source_high = Some(high),
+        Ok(Err(e)) => {
+            row.error = Some(format!("source watermark: {e}"));
+            return row;
+        }
+        Err(e) => {
+            row.error = Some(format!("source watermark task: {e}"));
+            return row;
+        }
+    }
+    match query_destination_next(mirror, destination).await {
+        Ok(next) => row.dest_next = Some(next),
+        Err(e) => row.error = Some(format!("destination: {e}")),
+    }
+    row
+}
+
+async fn query_destination_next(mirror: &Mirror, destination: &Destination) -> Result<u64> {
+    use mirror_core::Sink;
+    let destination_name = mirror
+        .destination_name_override
+        .clone()
+        .unwrap_or_else(|| mirror.topic.clone());
+    match destination {
+        Destination::Kafka(k) => {
+            let cfg = KafkaSinkConfig::new(
+                k.bootstrap_servers.clone(),
+                destination_name,
+                mirror.partition as i32,
+            );
+            let mut sink = KafkaSink::open(cfg).map_err(|e| anyhow::anyhow!("{e}"))?;
+            sink.next_expected_offset()
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))
+        }
+        Destination::Filesystem(fs) => {
+            // Flush triggers don't matter for a read-only query — they
+            // only fire on write — but the constructor requires them.
+            let cfg = FilesystemSinkConfig {
+                root: fs.root.clone(),
+                destination_name,
+                partition: mirror.partition,
+                flush: mirror_fs::FlushTriggers {
+                    max_time: std::time::Duration::from_millis(fs.flush.max_time_ms),
+                    max_bytes: fs.flush.max_bytes,
+                    max_offsets: fs.flush.max_offsets,
+                },
+            };
+            let mut sink = FilesystemSink::open(cfg).map_err(|e| anyhow::anyhow!("{e}"))?;
+            sink.next_expected_offset()
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))
+        }
+        Destination::S3(s3) => {
+            let mut builder = object_store::aws::AmazonS3Builder::from_env()
+                .with_region(&s3.region)
+                .with_bucket_name(&s3.bucket);
+            if let Some(endpoint) = &s3.endpoint {
+                builder = builder.with_endpoint(endpoint);
+                if endpoint.starts_with("http://") {
+                    builder = builder.with_allow_http(true);
+                }
+            }
+            let store = builder.build().context("building S3 store")?;
+            let cfg = S3SinkConfig {
+                store: Arc::new(store),
+                prefix: s3.prefix.as_deref().map(object_store::path::Path::from),
+                destination_name,
+                partition: mirror.partition,
+                flush: mirror_s3::FlushTriggers {
+                    max_time: std::time::Duration::from_millis(s3.flush.max_time_ms),
+                    max_bytes: s3.flush.max_bytes,
+                    max_offsets: s3.flush.max_offsets,
+                },
+            };
+            let mut sink = S3Sink::open(cfg)
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            sink.next_expected_offset()
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))
+        }
+    }
+}
+
+fn print_status_table(rows: &[StatusRow]) {
+    let name_width = rows.iter().map(|r| r.name.len()).max().unwrap_or(6).max(6);
+    println!(
+        "{:<width$}  {:>14}  {:>14}  {:>10}",
+        "MIRROR",
+        "SOURCE-HIGH",
+        "DEST-NEXT",
+        "LAG",
+        width = name_width
+    );
+    for r in rows {
+        if let Some(e) = &r.error {
+            println!("{:<width$}  error: {}", r.name, e, width = name_width);
+            continue;
+        }
+        println!(
+            "{:<width$}  {:>14}  {:>14}  {:>10}",
+            r.name,
+            r.source_high.map(|v| v.to_string()).unwrap_or_default(),
+            r.dest_next.map(|v| v.to_string()).unwrap_or_default(),
+            r.lag().map(|v| v.to_string()).unwrap_or_default(),
+            width = name_width
+        );
     }
 }
 
