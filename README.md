@@ -2,7 +2,7 @@
 
 Exactly-once Kafka topic+partition mirroring to **Kafka**, **Filesystem**, or **S3**, in one deployment.
 
-> **Status:** Phase 1 — Kafka source + Kafka sink with the end-offset gate; supervisor for parallel mirrors. Filesystem and S3 sinks land in Phases 3 and 4. See [AGENTS.md](AGENTS.md) for the phase map.
+> **Status:** Phase 3 — Kafka source + Kafka/Filesystem sinks; supervisor for parallel mirrors. S3 sink lands in Phase 4. See [AGENTS.md](AGENTS.md) for the phase map.
 
 ## What this gives you
 

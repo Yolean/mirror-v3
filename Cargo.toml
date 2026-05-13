@@ -4,6 +4,7 @@ members = [
     "crates/mirror-config",
     "crates/mirror-core",
     "crates/mirror-kafka",
+    "crates/mirror-fs",
     "crates/mirror-bin",
     "crates/xtask",
     "e2e",
@@ -20,6 +21,7 @@ repository = "https://github.com/YoleanAgents/mirror-v3"
 mirror-config = { path = "crates/mirror-config" }
 mirror-core = { path = "crates/mirror-core" }
 mirror-kafka = { path = "crates/mirror-kafka" }
+mirror-fs = { path = "crates/mirror-fs" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -35,6 +37,9 @@ rdkafka = { version = "0.39", default-features = false, features = ["cmake-build
 async-trait = "0.1"
 testcontainers = "0.27"
 portpicker = "0.1"
+base64 = "0.22"
+tempfile = "3"
+uuid = { version = "1", features = ["v4"] }
 
 [profile.release]
 lto = "thin"

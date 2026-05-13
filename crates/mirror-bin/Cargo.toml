@@ -15,6 +15,7 @@ path = "src/main.rs"
 mirror-config = { workspace = true }
 mirror-core = { workspace = true }
 mirror-kafka = { workspace = true }
+mirror-fs = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
 tokio = { workspace = true }

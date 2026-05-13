@@ -20,7 +20,7 @@ This file is for the next agent (or human) extending mirror-v3. Read this first;
     └── mirror-v3.config.schema.json   golden file, gated in CI
 ```
 
-Phase 1 added `mirror-core` and `mirror-kafka`. Phase 2 added the `mirror-e2e` crate at `e2e/` with `testcontainers`-driven Docker stacks and the `Provisioner`/`ProvisionedStack` trait seam for plugging in new test infra. `mirror-fs` and `mirror-s3` arrive in Phases 3/4.
+Phase 1 added `mirror-core` and `mirror-kafka`. Phase 2 added the `mirror-e2e` crate at `e2e/` with `testcontainers`-driven Docker stacks and the `Provisioner`/`ProvisionedStack` trait seam for plugging in new test infra. Phase 3 added `mirror-fs` (atomic-rename filesystem sink, `<from>-<to>.ndjson` naming, scan-validate on startup). `mirror-s3` arrives in Phase 4.
 
 ## The phase plan
 
@@ -30,8 +30,9 @@ Each row is a separate change set / PR. Do not skip phases.
 |---|---|---|
 | 0 | Workspace + config model + JSON Schema gate + CLI stub + Dockerfile | `cargo test --workspace` green, schema committed |
 | 1 | `mirror-core` (Source/Sink traits, loop) + `mirror-kafka` source+sink with end-offset gate + `mirror-v3 run` supervisor | Builds + 17 tests green; loop invariants exhaustively unit-tested with mocks |
-| **2** | Docker e2e harness (`mirror-e2e` crate) + `kafka-native → redpanda` happy-path test. Toxiproxy follow-up next | First real Kafka e2e green: 100 records, byte-identical, offsets preserved |
-| 3 | `mirror-fs` sink + flush triggers + scan-validate on startup | E2e: crash-mid-flush recovery |
+| 2 | Docker e2e harness (`mirror-e2e` crate) + `kafka-native → redpanda` happy-path test | First real Kafka e2e green: 100 records, byte-identical, offsets preserved |
+| **3** | `mirror-fs` sink + flush triggers + scan-validate on startup + e2e | FS sink unit-tested (corrupt-chain, restart, crashed .tmp, flush triggers); kafka→fs e2e green |
+| **2b** (deferred) | Toxiproxy fault injection in the Docker stack | A fault test demonstrates the mirror's crash-and-recover-from-destination behaviour |
 | 4 | `mirror-s3` sink via `object_store`, `redpanda → versitygw` e2e | Concurrent writer race produces hard exit, never a silently-overlapping blob |
 | 5 | Supervisor for N mirrors in one process; per-mirror metrics | Two mirrors run side-by-side under fault injection |
 | 6 | Cutover: replace the Java worker image in checkit/mirror-v3 | Dev site running Rust binary; Java module archived |

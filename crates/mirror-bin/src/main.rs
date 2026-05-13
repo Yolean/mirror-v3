@@ -5,6 +5,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use mirror_config::{Destination, Mirror};
 use mirror_core::run_mirror;
+use mirror_fs::{FilesystemSink, FilesystemSinkConfig};
 use mirror_kafka::{KafkaSink, KafkaSinkConfig, KafkaSource, KafkaSourceConfig};
 use tracing_subscriber::EnvFilter;
 
@@ -120,16 +121,6 @@ fn spawn_mirror(
     mirror: Mirror,
     destination: Destination,
 ) -> Result<tokio::task::JoinHandle<Result<()>>> {
-    let dest = match destination {
-        Destination::Kafka(k) => k,
-        Destination::Filesystem(_) => anyhow::bail!("filesystem destination lands in Phase 3"),
-        Destination::S3(_) => anyhow::bail!("s3 destination lands in Phase 4"),
-    };
-    let dest_topic = mirror
-        .destination_name_override
-        .clone()
-        .unwrap_or_else(|| mirror.topic.clone());
-
     let source_cfg = KafkaSourceConfig::new(
         mirror.source.bootstrap_servers.clone(),
         mirror
@@ -140,23 +131,55 @@ fn spawn_mirror(
         mirror.topic.clone(),
         mirror.partition as i32,
     );
-    let sink_cfg =
-        KafkaSinkConfig::new(dest.bootstrap_servers, dest_topic, mirror.partition as i32);
-
     let source = KafkaSource::open(source_cfg)
         .with_context(|| format!("opening source for mirror {}", mirror.name))?;
-    let sink = KafkaSink::open(sink_cfg)
-        .with_context(|| format!("opening sink for mirror {}", mirror.name))?;
 
     let name = mirror.name.clone();
-    Ok(tokio::spawn(async move {
-        tracing::info!(mirror = %name, "loop start");
-        let result = run_mirror(source, sink).await;
-        match result {
-            Ok(never) => match never {},
-            Err(e) => Err(anyhow::anyhow!("mirror {name}: {e}")),
+    let destination_name = mirror
+        .destination_name_override
+        .clone()
+        .unwrap_or_else(|| mirror.topic.clone());
+
+    match destination {
+        Destination::Kafka(k) => {
+            let sink_cfg = KafkaSinkConfig::new(
+                k.bootstrap_servers,
+                destination_name,
+                mirror.partition as i32,
+            );
+            let sink = KafkaSink::open(sink_cfg)
+                .with_context(|| format!("opening sink for mirror {name}"))?;
+            Ok(tokio::spawn(async move {
+                tracing::info!(mirror = %name, "loop start");
+                match run_mirror(source, sink).await {
+                    Ok(never) => match never {},
+                    Err(e) => Err(anyhow::anyhow!("mirror {name}: {e}")),
+                }
+            }))
         }
-    }))
+        Destination::Filesystem(fs) => {
+            let sink_cfg = FilesystemSinkConfig {
+                root: fs.root,
+                destination_name,
+                partition: mirror.partition,
+                flush: mirror_fs::FlushTriggers {
+                    max_time: std::time::Duration::from_millis(fs.flush.max_time_ms),
+                    max_bytes: fs.flush.max_bytes,
+                    max_offsets: fs.flush.max_offsets,
+                },
+            };
+            let sink = FilesystemSink::open(sink_cfg)
+                .with_context(|| format!("opening sink for mirror {name}"))?;
+            Ok(tokio::spawn(async move {
+                tracing::info!(mirror = %name, "loop start");
+                match run_mirror(source, sink).await {
+                    Ok(never) => match never {},
+                    Err(e) => Err(anyhow::anyhow!("mirror {name}: {e}")),
+                }
+            }))
+        }
+        Destination::S3(_) => anyhow::bail!("s3 destination lands in Phase 4"),
+    }
 }
 
 async fn wait_first(
