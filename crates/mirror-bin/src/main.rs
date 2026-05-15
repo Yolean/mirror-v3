@@ -165,6 +165,13 @@ fn compression_to_envelope(
     }
 }
 
+fn timestamp_mode_to_kafka(m: mirror_config::TimestampMode) -> mirror_kafka::TimestampMode {
+    match m {
+        mirror_config::TimestampMode::Source => mirror_kafka::TimestampMode::Source,
+        mirror_config::TimestampMode::Destination => mirror_kafka::TimestampMode::Destination,
+    }
+}
+
 #[derive(Debug, serde::Serialize)]
 struct StatusRow {
     name: String,
@@ -450,11 +457,12 @@ fn spawn_mirror(
 
     match destination {
         Destination::Kafka(k) => {
-            let sink_cfg = KafkaSinkConfig::new(
+            let mut sink_cfg = KafkaSinkConfig::new(
                 k.bootstrap_servers,
                 destination_name,
                 mirror.partition as i32,
             );
+            sink_cfg.timestamp_mode = timestamp_mode_to_kafka(k.timestamp_mode);
             let sink = KafkaSink::open(sink_cfg)
                 .with_context(|| format!("opening sink for mirror {name}"))?;
             Ok(tokio::spawn(async move {

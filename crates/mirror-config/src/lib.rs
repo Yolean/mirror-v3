@@ -36,6 +36,27 @@ pub enum Destination {
 pub struct KafkaDestination {
     /// `bootstrap.servers` for the destination cluster.
     pub bootstrap_servers: String,
+    /// Which timestamp lands on the destination record. Defaults to
+    /// `source` — preserves the source's `timestamp_ms` exactly. Set
+    /// to `destination` to have the destination broker stamp the
+    /// record on receipt (CreateTime = producer send-time, or
+    /// LogAppendTime if the destination topic is configured that
+    /// way).
+    #[serde(default)]
+    pub timestamp_mode: TimestampMode,
+}
+
+/// Per-Kafka-destination timestamp behaviour.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum TimestampMode {
+    /// Pass `record.timestamp_ms` to the producer. Destination
+    /// stores it as CreateTime.
+    #[default]
+    Source,
+    /// Do not pass an explicit timestamp; the destination broker
+    /// stamps the record itself.
+    Destination,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]

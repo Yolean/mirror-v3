@@ -30,6 +30,11 @@
               "description": "`bootstrap.servers` for the destination cluster.",
               "type": "string"
             },
+            "timestamp-mode": {
+              "description": "Which timestamp lands on the destination record. Defaults to\n`source` — preserves the source's `timestamp_ms` exactly. Set\nto `destination` to have the destination broker stamp the\nrecord on receipt (CreateTime = producer send-time, or\nLogAppendTime if the destination topic is configured that\nway).",
+              "$ref": "#/$defs/TimestampMode",
+              "default": "source"
+            },
             "type": {
               "type": "string",
               "const": "kafka"
@@ -123,6 +128,21 @@
             "bucket",
             "flush"
           ]
+        }
+      ]
+    },
+    "TimestampMode": {
+      "description": "Per-Kafka-destination timestamp behaviour.",
+      "oneOf": [
+        {
+          "description": "Pass `record.timestamp_ms` to the producer. Destination\nstores it as CreateTime.",
+          "type": "string",
+          "const": "source"
+        },
+        {
+          "description": "Do not pass an explicit timestamp; the destination broker\nstamps the record itself.",
+          "type": "string",
+          "const": "destination"
         }
       ]
     },

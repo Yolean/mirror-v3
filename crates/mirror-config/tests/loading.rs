@@ -1,6 +1,6 @@
 use mirror_config::{
     load_from_str, Config, Destination, DestinationFormat, FilesystemDestination, FlushTriggers,
-    KafkaDestination, KafkaSource, Mirror, ParquetCompression, S3Destination,
+    KafkaDestination, KafkaSource, Mirror, ParquetCompression, S3Destination, TimestampMode,
 };
 use std::path::PathBuf;
 
@@ -24,6 +24,7 @@ fn parses_minimal_kafka_config() {
         Config {
             destination: Destination::Kafka(KafkaDestination {
                 bootstrap_servers: "redpanda:9092".into(),
+                timestamp_mode: TimestampMode::default(),
             }),
             mirrors: vec![Mirror {
                 name: "operations".into(),

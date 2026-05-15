@@ -177,6 +177,20 @@ pub struct KafkaSinkConfig {
     pub topic: String,
     pub partition: i32,
     pub watermark_timeout: Duration,
+    pub timestamp_mode: TimestampMode,
+}
+
+/// Which timestamp the destination record ends up with.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum TimestampMode {
+    /// Pass `record.timestamp_ms` to `FutureRecord::timestamp(...)`.
+    /// Destination stores it as CreateTime.
+    #[default]
+    Source,
+    /// Don't call `.timestamp(...)`; destination broker stamps on
+    /// receipt (CreateTime = send-time, or LogAppendTime if the
+    /// destination topic is configured that way).
+    Destination,
 }
 
 impl KafkaSinkConfig {
@@ -190,6 +204,7 @@ impl KafkaSinkConfig {
             topic: topic.into(),
             partition,
             watermark_timeout: DEFAULT_WATERMARK_TIMEOUT,
+            timestamp_mode: TimestampMode::Source,
         }
     }
 }
@@ -200,6 +215,7 @@ pub struct KafkaSink {
     topic: String,
     partition: i32,
     watermark_timeout: Duration,
+    timestamp_mode: TimestampMode,
 }
 
 impl KafkaSink {
@@ -225,6 +241,7 @@ impl KafkaSink {
             topic: cfg.topic,
             partition: cfg.partition,
             watermark_timeout: cfg.watermark_timeout,
+            timestamp_mode: cfg.timestamp_mode,
         })
     }
 
@@ -269,8 +286,14 @@ impl Sink for KafkaSink {
         if let Some(v) = value {
             fr = fr.payload(v);
         }
-        if let Some(ts) = record.timestamp_ms {
-            fr = fr.timestamp(ts);
+        // Timestamp policy: Source preserves the source's timestamp_ms
+        // by passing it to FutureRecord (destination stores it as
+        // CreateTime). Destination omits the call so the broker stamps
+        // it on receipt.
+        if self.timestamp_mode == TimestampMode::Source {
+            if let Some(ts) = record.timestamp_ms {
+                fr = fr.timestamp(ts);
+            }
         }
         let owned_headers = build_headers(&record.headers);
         if !record.headers.is_empty() {
