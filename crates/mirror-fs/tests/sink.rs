@@ -2,15 +2,18 @@
 
 use std::time::Duration;
 
-use mirror_core::{Record, Sink};
+use mirror_core::{Record, Sink, TimestampType};
 use mirror_fs::{read_all_records, FilesystemSink, FilesystemSinkConfig, FlushTriggers};
 
 fn rec(offset: u64) -> Record {
     Record {
+        topic: "fs-test".into(),
+        partition: 0,
         source_offset: offset,
+        timestamp_ms: Some(1_700_000_000_000 + offset as i64),
+        timestamp_type: TimestampType::CreateTime,
         key: Some(format!("k{offset}").into_bytes()),
         value: Some(format!("v{offset}").into_bytes()),
-        timestamp_ms: Some(1_700_000_000_000 + offset as i64),
         headers: vec![],
     }
 }

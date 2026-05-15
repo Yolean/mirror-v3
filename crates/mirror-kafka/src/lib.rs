@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use mirror_core::{Header, Record, Sink, SinkError, Source, SourceError};
+use mirror_core::{Header, Record, Sink, SinkError, Source, SourceError, TimestampType};
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{BaseConsumer, Consumer, StreamConsumer};
 use rdkafka::message::{Header as RdHeader, Headers, Message, OwnedHeaders};
@@ -153,11 +153,20 @@ fn borrowed_to_record(msg: &rdkafka::message::BorrowedMessage<'_>) -> Record {
                 .collect()
         })
         .unwrap_or_default();
+    let ts = msg.timestamp();
+    let (timestamp_ms, timestamp_type) = match ts {
+        rdkafka::Timestamp::CreateTime(ms) => (Some(ms), TimestampType::CreateTime),
+        rdkafka::Timestamp::LogAppendTime(ms) => (Some(ms), TimestampType::LogAppendTime),
+        rdkafka::Timestamp::NotAvailable => (None, TimestampType::NotAvailable),
+    };
     Record {
+        topic: msg.topic().to_string(),
+        partition: msg.partition(),
         source_offset: msg.offset() as u64,
+        timestamp_ms,
+        timestamp_type,
         key: msg.key().map(|k| k.to_vec()),
         value: msg.payload().map(|v| v.to_vec()),
-        timestamp_ms: msg.timestamp().to_millis(),
         headers,
     }
 }

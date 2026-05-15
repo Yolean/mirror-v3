@@ -49,15 +49,50 @@ pub fn current_labels() -> (String, String) {
         .unwrap_or_else(|_| ("unknown".into(), "0".into()))
 }
 
-/// A record in transit. `source_offset` is the partition offset on the
-/// *source* topic; the loop and the sink both gate on this value.
+/// A record in transit. `source_offset` is the partition offset on
+/// the *source* topic; the loop and the sink both gate on this value.
+/// `topic` and `partition` are the source's identity and propagate
+/// through to FS/S3 envelopes so each record is self-describing.
+/// `timestamp_type` mirrors librdkafka's distinction so a future
+/// replay tool can tell whether the broker assigned the timestamp
+/// (LogAppendTime) or the producer did (CreateTime).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Record {
+    pub topic: String,
+    pub partition: i32,
     pub source_offset: u64,
+    pub timestamp_ms: Option<i64>,
+    pub timestamp_type: TimestampType,
     pub key: Option<Vec<u8>>,
     pub value: Option<Vec<u8>>,
-    pub timestamp_ms: Option<i64>,
     pub headers: Vec<Header>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimestampType {
+    CreateTime,
+    LogAppendTime,
+    NotAvailable,
+}
+
+impl TimestampType {
+    /// Canonical string used in the wire envelope (NDJSON / Parquet).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TimestampType::CreateTime => "create_time",
+            TimestampType::LogAppendTime => "log_append_time",
+            TimestampType::NotAvailable => "not_available",
+        }
+    }
+
+    pub fn from_wire(s: &str) -> Option<Self> {
+        match s {
+            "create_time" => Some(TimestampType::CreateTime),
+            "log_append_time" => Some(TimestampType::LogAppendTime),
+            "not_available" => Some(TimestampType::NotAvailable),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt;
-use mirror_core::{Record, Sink};
+use mirror_core::{Record, Sink, TimestampType};
 use mirror_s3::{FlushTriggers, S3Sink, S3SinkConfig};
 use object_store::memory::InMemory;
 use object_store::path::Path;
@@ -12,10 +12,13 @@ use object_store::ObjectStore;
 
 fn rec(offset: u64) -> Record {
     Record {
+        topic: "s3-test".into(),
+        partition: 0,
         source_offset: offset,
+        timestamp_ms: Some(1_700_000_000_000 + offset as i64),
+        timestamp_type: TimestampType::CreateTime,
         key: Some(format!("k{offset}").into_bytes()),
         value: Some(format!("v{offset}").into_bytes()),
-        timestamp_ms: Some(1_700_000_000_000 + offset as i64),
         headers: vec![],
     }
 }

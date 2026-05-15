@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use mirror_core::{Header, Record, Sink, SinkError};
+use mirror_core::{Header, Record, Sink, SinkError, TimestampType};
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
 
@@ -326,9 +326,12 @@ fn scan_validate(dir: &Path) -> Result<u64, FsError> {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct PersistedRecord {
-    source_offset: u64,
+    topic: String,
+    partition: i32,
+    offset: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     timestamp_ms: Option<i64>,
+    timestamp_type: String,
     #[serde(skip_serializing_if = "Option::is_none", with = "opt_base64")]
     key: Option<Vec<u8>>,
     #[serde(skip_serializing_if = "Option::is_none", with = "opt_base64")]
@@ -347,8 +350,11 @@ struct PersistedHeader {
 impl From<&Record> for PersistedRecord {
     fn from(r: &Record) -> Self {
         PersistedRecord {
-            source_offset: r.source_offset,
+            topic: r.topic.clone(),
+            partition: r.partition,
+            offset: r.source_offset,
             timestamp_ms: r.timestamp_ms,
+            timestamp_type: r.timestamp_type.as_str().to_string(),
             key: r.key.clone(),
             value: r.value.clone(),
             headers: r
@@ -366,10 +372,14 @@ impl From<&Record> for PersistedRecord {
 impl PersistedRecord {
     pub fn into_record(self) -> Record {
         Record {
-            source_offset: self.source_offset,
+            topic: self.topic,
+            partition: self.partition,
+            source_offset: self.offset,
+            timestamp_ms: self.timestamp_ms,
+            timestamp_type: TimestampType::from_wire(&self.timestamp_type)
+                .unwrap_or(TimestampType::NotAvailable),
             key: self.key,
             value: self.value,
-            timestamp_ms: self.timestamp_ms,
             headers: self
                 .headers
                 .into_iter()

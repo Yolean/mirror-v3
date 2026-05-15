@@ -7,7 +7,7 @@
 use async_trait::async_trait;
 use std::collections::VecDeque;
 
-use crate::{Record, Sink, SinkError, Source, SourceError};
+use crate::{Record, Sink, SinkError, Source, SourceError, TimestampType};
 
 /// Scriptable [`Source`] that returns canned events. Records seek
 /// calls and poll results so tests can assert on them.
@@ -132,13 +132,16 @@ impl Sink for MockSink {
     }
 }
 
-/// Convenience constructor.
+/// Convenience constructor for tests.
 pub fn rec(offset: u64) -> Record {
     Record {
+        topic: "mock".into(),
+        partition: 0,
         source_offset: offset,
+        timestamp_ms: Some(1_700_000_000_000 + offset as i64),
+        timestamp_type: TimestampType::CreateTime,
         key: Some(format!("k{offset}").into_bytes()),
         value: Some(format!("v{offset}").into_bytes()),
-        timestamp_ms: Some(1_700_000_000_000 + offset as i64),
         headers: vec![],
     }
 }
