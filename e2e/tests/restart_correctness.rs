@@ -31,6 +31,8 @@ fn spec(source: &str, root: &std::path::Path, group: &str, max_offsets: u64) -> 
         group_id: group.into(),
         root: root.to_path_buf(),
         destination_name: "ops".into(),
+        format: mirror_envelope::Format::Ndjson,
+        compression: mirror_envelope::ParquetCompression::Zstd1,
         flush: FlushTriggers {
             max_time: Duration::from_secs(3600),
             max_bytes: u64::MAX,
@@ -76,7 +78,7 @@ async fn aborted_mirror_resumes_from_destination_with_no_gaps_or_duplicates() {
     m1.abort();
 
     // Verify the destination is at offset 20, with no leftovers.
-    let mid = read_all_records(&dir).expect("mid read");
+    let mid = read_all_records(&dir, mirror_envelope::Format::Ndjson).expect("mid read");
     assert_eq!(mid.len(), 20, "exactly 20 records durable mid-test");
     for (i, rec) in mid.iter().enumerate() {
         assert_eq!(rec.source_offset, i as u64);
@@ -109,7 +111,8 @@ async fn aborted_mirror_resumes_from_destination_with_no_gaps_or_duplicates() {
     // Final assertion: 35 records, contiguous offsets 0..34, content
     // byte-identical to the union of fixtures_a and fixtures_b. No
     // duplicates, no gaps.
-    let final_records = read_all_records(&dir).expect("final read");
+    let final_records =
+        read_all_records(&dir, mirror_envelope::Format::Ndjson).expect("final read");
     assert_eq!(final_records.len(), 35, "35 records total");
     for (i, rec) in final_records.iter().enumerate() {
         assert_eq!(rec.source_offset, i as u64, "offset at index {i}");

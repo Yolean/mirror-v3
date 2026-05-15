@@ -48,6 +48,16 @@
               "description": "Absolute path to the destination root directory.",
               "type": "string"
             },
+            "format": {
+              "description": "Envelope format for written files. Defaults to `parquet`.",
+              "$ref": "#/$defs/DestinationFormat",
+              "default": "parquet"
+            },
+            "compression": {
+              "description": "Parquet compression. Only meaningful when `format = parquet`.\nDefaults to `zstd-1`.",
+              "$ref": "#/$defs/ParquetCompression",
+              "default": "zstd-1"
+            },
             "flush": {
               "$ref": "#/$defs/FlushTriggers"
             },
@@ -88,6 +98,16 @@
               ],
               "default": null
             },
+            "format": {
+              "description": "Envelope format for written objects. Defaults to `parquet`.",
+              "$ref": "#/$defs/DestinationFormat",
+              "default": "parquet"
+            },
+            "compression": {
+              "description": "Parquet compression. Only meaningful when `format = parquet`.\nDefaults to `zstd-1`.",
+              "$ref": "#/$defs/ParquetCompression",
+              "default": "zstd-1"
+            },
             "flush": {
               "$ref": "#/$defs/FlushTriggers"
             },
@@ -103,6 +123,51 @@
             "bucket",
             "flush"
           ]
+        }
+      ]
+    },
+    "DestinationFormat": {
+      "description": "Envelope format for Filesystem and S3 destinations.",
+      "oneOf": [
+        {
+          "description": "Apache Parquet. Columnar, embedded schema, compressed.\nStandard data-lake format — readable by DuckDB / Athena /\nSpark out of the box.",
+          "type": "string",
+          "const": "parquet"
+        },
+        {
+          "description": "Newline-delimited JSON, one record per line, base64-encoded\nbinary fields. Operator-friendly for `jq` debugging; larger\non disk than Parquet.",
+          "type": "string",
+          "const": "ndjson"
+        }
+      ]
+    },
+    "ParquetCompression": {
+      "description": "Parquet compression codec. Only meaningful when [`DestinationFormat::Parquet`].",
+      "oneOf": [
+        {
+          "description": "Zstd level 1: strong compression, fast decode. Default.",
+          "type": "string",
+          "const": "zstd-1"
+        },
+        {
+          "description": "Zstd level 3: smaller files, slower encode.",
+          "type": "string",
+          "const": "zstd-3"
+        },
+        {
+          "description": "Snappy: fast, larger files than zstd.",
+          "type": "string",
+          "const": "snappy"
+        },
+        {
+          "description": "LZ4: fast, larger files than zstd.",
+          "type": "string",
+          "const": "lz4"
+        },
+        {
+          "description": "No compression. Debug-friendly; not recommended in production.",
+          "type": "string",
+          "const": "uncompressed"
         }
       ]
     },

@@ -43,6 +43,13 @@ pub struct KafkaDestination {
 pub struct FilesystemDestination {
     /// Absolute path to the destination root directory.
     pub root: PathBuf,
+    /// Envelope format for written files. Defaults to `parquet`.
+    #[serde(default)]
+    pub format: DestinationFormat,
+    /// Parquet compression. Only meaningful when `format = parquet`.
+    /// Defaults to `zstd-1`.
+    #[serde(default)]
+    pub compression: ParquetCompression,
     pub flush: FlushTriggers,
 }
 
@@ -58,7 +65,50 @@ pub struct S3Destination {
     /// Key prefix prepended to all written object keys.
     #[serde(default)]
     pub prefix: Option<String>,
+    /// Envelope format for written objects. Defaults to `parquet`.
+    #[serde(default)]
+    pub format: DestinationFormat,
+    /// Parquet compression. Only meaningful when `format = parquet`.
+    /// Defaults to `zstd-1`.
+    #[serde(default)]
+    pub compression: ParquetCompression,
     pub flush: FlushTriggers,
+}
+
+/// Envelope format for Filesystem and S3 destinations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum DestinationFormat {
+    /// Apache Parquet. Columnar, embedded schema, compressed.
+    /// Standard data-lake format — readable by DuckDB / Athena /
+    /// Spark out of the box.
+    #[default]
+    Parquet,
+    /// Newline-delimited JSON, one record per line, base64-encoded
+    /// binary fields. Operator-friendly for `jq` debugging; larger
+    /// on disk than Parquet.
+    Ndjson,
+}
+
+/// Parquet compression codec. Only meaningful when [`DestinationFormat::Parquet`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
+pub enum ParquetCompression {
+    /// Zstd level 1: strong compression, fast decode. Default.
+    #[default]
+    #[serde(rename = "zstd-1")]
+    Zstd1,
+    /// Zstd level 3: smaller files, slower encode.
+    #[serde(rename = "zstd-3")]
+    Zstd3,
+    /// Snappy: fast, larger files than zstd.
+    #[serde(rename = "snappy")]
+    Snappy,
+    /// LZ4: fast, larger files than zstd.
+    #[serde(rename = "lz4")]
+    Lz4,
+    /// No compression. Debug-friendly; not recommended in production.
+    #[serde(rename = "uncompressed")]
+    Uncompressed,
 }
 
 /// Flush triggers for blob-style destinations (Filesystem, S3). All

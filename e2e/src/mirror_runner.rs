@@ -102,7 +102,36 @@ pub struct FsMirrorSpec {
     pub group_id: String,
     pub root: PathBuf,
     pub destination_name: String,
+    pub format: mirror_envelope::Format,
+    pub compression: mirror_envelope::ParquetCompression,
     pub flush: mirror_fs::FlushTriggers,
+}
+
+impl FsMirrorSpec {
+    /// Convenience: ndjson with default compression. Mirrors the
+    /// shape existing tests want, so they don't have to spell the
+    /// envelope fields out every time.
+    pub fn ndjson(
+        source_bootstrap: String,
+        source_topic: String,
+        partition: i32,
+        group_id: String,
+        root: PathBuf,
+        destination_name: String,
+        flush: mirror_fs::FlushTriggers,
+    ) -> Self {
+        Self {
+            source_bootstrap,
+            source_topic,
+            partition,
+            group_id,
+            root,
+            destination_name,
+            format: mirror_envelope::Format::Ndjson,
+            compression: mirror_envelope::ParquetCompression::Zstd1,
+            flush,
+        }
+    }
 }
 
 pub fn spawn_kafka_to_filesystem(spec: FsMirrorSpec) -> Result<MirrorHandle> {
@@ -121,6 +150,8 @@ pub fn spawn_kafka_to_filesystem(spec: FsMirrorSpec) -> Result<MirrorHandle> {
         root: spec.root,
         destination_name: spec.destination_name,
         partition: spec.partition as u32,
+        format: spec.format,
+        compression: spec.compression,
         flush: spec.flush,
     };
     let sink = FilesystemSink::open(sink_cfg).context("open FilesystemSink")?;
@@ -137,6 +168,8 @@ pub struct S3MirrorSpec {
     pub store: Arc<dyn ObjectStore>,
     pub prefix: Option<object_store::path::Path>,
     pub destination_name: String,
+    pub format: mirror_envelope::Format,
+    pub compression: mirror_envelope::ParquetCompression,
     pub flush: mirror_s3::FlushTriggers,
 }
 
@@ -157,6 +190,8 @@ pub async fn spawn_kafka_to_s3(spec: S3MirrorSpec) -> Result<MirrorHandle> {
         prefix: spec.prefix,
         destination_name: spec.destination_name,
         partition: spec.partition as u32,
+        format: spec.format,
+        compression: spec.compression,
         flush: spec.flush,
     };
     let sink = S3Sink::open(sink_cfg).await.context("open S3Sink")?;

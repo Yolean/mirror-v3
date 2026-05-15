@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use mirror_core::{Record, Sink, TimestampType};
+use mirror_envelope::{Format, ParquetCompression};
 use mirror_s3::{FlushTriggers, S3Sink, S3SinkConfig};
 use object_store::memory::InMemory;
 use object_store::path::Path;
@@ -24,11 +25,15 @@ fn rec(offset: u64) -> Record {
 }
 
 fn cfg(store: Arc<dyn ObjectStore>, max_offsets: u64) -> S3SinkConfig {
+    // Tests use ndjson for ergonomic byte-level assertions; the
+    // parquet path is covered by mirror-envelope round-trip tests.
     S3SinkConfig {
         store,
         prefix: Some(Path::from("archive")),
         destination_name: "ops".into(),
         partition: 0,
+        format: Format::Ndjson,
+        compression: ParquetCompression::Zstd1,
         flush: FlushTriggers {
             max_time: Duration::from_secs(3600),
             max_bytes: u64::MAX,
@@ -135,6 +140,8 @@ async fn put_mode_create_rejects_overwrite() {
         prefix: Some(Path::from("archive")),
         destination_name: "ops".into(),
         partition: 0,
+        format: Format::Ndjson,
+        compression: ParquetCompression::Zstd1,
         flush: FlushTriggers {
             max_time: Duration::from_secs(3600),
             max_bytes: u64::MAX,

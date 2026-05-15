@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/mirror-config",
     "crates/mirror-core",
+    "crates/mirror-envelope",
     "crates/mirror-kafka",
     "crates/mirror-fs",
     "crates/mirror-s3",
@@ -21,6 +22,7 @@ repository = "https://github.com/YoleanAgents/mirror-v3"
 [workspace.dependencies]
 mirror-config = { path = "crates/mirror-config" }
 mirror-core = { path = "crates/mirror-core" }
+mirror-envelope = { path = "crates/mirror-envelope" }
 mirror-kafka = { path = "crates/mirror-kafka" }
 mirror-fs = { path = "crates/mirror-fs" }
 mirror-s3 = { path = "crates/mirror-s3" }
@@ -47,6 +49,8 @@ futures = "0.3"
 bytes = "1"
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.17", default-features = false, features = ["http-listener"] }
+arrow = "55"
+parquet = { version = "55", default-features = false, features = ["arrow", "zstd", "snap", "lz4"] }
 
 [profile.release]
 lto = "thin"

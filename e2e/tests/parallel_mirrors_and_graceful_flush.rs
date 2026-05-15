@@ -66,6 +66,8 @@ async fn two_mirrors_run_in_parallel_and_flush_on_shutdown() {
         group_id: "mirror-e2e-parallel-0".into(),
         root: root.path().to_path_buf(),
         destination_name: "ops".into(),
+        format: mirror_envelope::Format::Ndjson,
+        compression: mirror_envelope::ParquetCompression::Zstd1,
         flush,
     })
     .expect("spawn m0");
@@ -76,6 +78,8 @@ async fn two_mirrors_run_in_parallel_and_flush_on_shutdown() {
         group_id: "mirror-e2e-parallel-1".into(),
         root: root.path().to_path_buf(),
         destination_name: "ops".into(),
+        format: mirror_envelope::Format::Ndjson,
+        compression: mirror_envelope::ParquetCompression::Zstd1,
         flush,
     })
     .expect("spawn m1");
@@ -107,7 +111,7 @@ async fn two_mirrors_run_in_parallel_and_flush_on_shutdown() {
     m0.shutdown().await.expect("m0 shutdown");
     m1.shutdown().await.expect("m1 shutdown");
 
-    let recs_p0 = read_all_records(&p0_dir).expect("read p0");
+    let recs_p0 = read_all_records(&p0_dir, mirror_envelope::Format::Ndjson).expect("read p0");
     assert_eq!(recs_p0.len(), 7, "p0 records");
     for (i, rec) in recs_p0.iter().enumerate() {
         assert_eq!(rec.source_offset, i as u64);
@@ -115,7 +119,7 @@ async fn two_mirrors_run_in_parallel_and_flush_on_shutdown() {
         assert_eq!(rec.value.as_deref(), Some(format!("p0v{i}").as_bytes()));
     }
 
-    let recs_p1 = read_all_records(&p1_dir).expect("read p1");
+    let recs_p1 = read_all_records(&p1_dir, mirror_envelope::Format::Ndjson).expect("read p1");
     assert_eq!(recs_p1.len(), 3, "p1 records");
     for (i, rec) in recs_p1.iter().enumerate() {
         assert_eq!(rec.source_offset, i as u64);

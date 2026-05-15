@@ -35,6 +35,8 @@ fn spec(source: &str, root: &std::path::Path, group: &str, flush: FlushTriggers)
         group_id: group.into(),
         root: root.to_path_buf(),
         destination_name: "ops".into(),
+        format: mirror_envelope::Format::Ndjson,
+        compression: mirror_envelope::ParquetCompression::Zstd1,
         flush,
     }
 }
@@ -179,6 +181,8 @@ async fn two_writers_with_different_flush_triggers_are_caught() {
         root: root.path().to_path_buf(),
         destination_name: "ops".into(),
         partition: 0,
+        format: mirror_envelope::Format::Ndjson,
+        compression: mirror_envelope::ParquetCompression::Zstd1,
         flush: flush_every(10),
     });
 

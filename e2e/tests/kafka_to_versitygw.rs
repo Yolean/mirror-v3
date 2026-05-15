@@ -16,7 +16,7 @@ use mirror_e2e::docker::{KafkaNativeToVersityGWStack, VERSITYGW_ACCESS_KEY, VERS
 use mirror_e2e::kafka_helpers::{create_topic, produce_records};
 use mirror_e2e::mirror_runner::{spawn_kafka_to_s3, S3MirrorSpec};
 use mirror_e2e::ProvisionedStack;
-use mirror_fs::decode_line;
+use mirror_envelope::Format;
 use mirror_s3::{FlushTriggers, S3Sink, S3SinkConfig};
 use object_store::aws::AmazonS3Builder;
 use object_store::path::Path;
@@ -79,6 +79,8 @@ async fn mirrors_to_versitygw_with_offset_named_objects() {
         store: Arc::clone(&s3),
         prefix: Some(Path::from("archive")),
         destination_name: "ops".into(),
+        format: mirror_envelope::Format::Ndjson,
+        compression: mirror_envelope::ParquetCompression::Zstd1,
         flush,
     })
     .await
@@ -118,12 +120,7 @@ async fn mirrors_to_versitygw_with_offset_named_objects() {
         let path = Path::from(format!("archive/ops/0/{name}"));
         let result = s3.get(&path).await.expect("get");
         let bytes = result.bytes().await.expect("bytes");
-        for line in bytes.split(|b| *b == b'\n') {
-            if line.is_empty() {
-                continue;
-            }
-            records.push(decode_line(line).expect("decode"));
-        }
+        records.extend(mirror_envelope::decode_batch(Format::Ndjson, &bytes).expect("decode"));
     }
     assert_eq!(records.len(), N);
     for (i, rec) in records.iter().enumerate() {
@@ -138,6 +135,8 @@ async fn mirrors_to_versitygw_with_offset_named_objects() {
         prefix: Some(Path::from("archive")),
         destination_name: "ops".into(),
         partition: 0,
+        format: mirror_envelope::Format::Ndjson,
+        compression: mirror_envelope::ParquetCompression::Zstd1,
         flush,
     })
     .await

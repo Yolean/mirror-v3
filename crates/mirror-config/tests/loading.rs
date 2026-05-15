@@ -1,6 +1,6 @@
 use mirror_config::{
-    load_from_str, Config, Destination, FilesystemDestination, FlushTriggers, KafkaDestination,
-    KafkaSource, Mirror, S3Destination,
+    load_from_str, Config, Destination, DestinationFormat, FilesystemDestination, FlushTriggers,
+    KafkaDestination, KafkaSource, Mirror, ParquetCompression, S3Destination,
 };
 use std::path::PathBuf;
 
@@ -81,6 +81,8 @@ mirrors:
         cfg.destination,
         Destination::Filesystem(FilesystemDestination {
             root: PathBuf::from("/var/mirror-v3"),
+            format: DestinationFormat::default(),
+            compression: ParquetCompression::default(),
             flush: FlushTriggers {
                 max_time_ms: 5000,
                 max_bytes: 1_048_576,
@@ -118,6 +120,8 @@ mirrors:
             region: "us-east-1".into(),
             bucket: "mirror-v3".into(),
             prefix: Some("archive/".into()),
+            format: DestinationFormat::default(),
+            compression: ParquetCompression::default(),
             flush: FlushTriggers {
                 max_time_ms: 60_000,
                 max_bytes: 16_777_216,

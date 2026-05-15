@@ -11,6 +11,7 @@ description = "End-to-end test harness for mirror-v3"
 [dependencies]
 mirror-core = { workspace = true }
 mirror-kafka = { workspace = true }
+mirror-envelope = { workspace = true }
 mirror-fs = { workspace = true }
 mirror-s3 = { workspace = true }
 async-trait = { workspace = true }

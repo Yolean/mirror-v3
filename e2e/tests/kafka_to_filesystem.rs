@@ -59,6 +59,8 @@ async fn mirrors_to_filesystem_with_offset_named_files() {
         group_id: "mirror-e2e-fs".into(),
         root: root.path().to_path_buf(),
         destination_name: "ops".into(),
+        format: mirror_envelope::Format::Ndjson,
+        compression: mirror_envelope::ParquetCompression::Zstd1,
         flush,
     })
     .expect("spawn mirror");
@@ -67,7 +69,7 @@ async fn mirrors_to_filesystem_with_offset_named_files() {
     let dir = root.path().join("ops").join("0");
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
     loop {
-        let records = read_all_records(&dir).unwrap_or_default();
+        let records = read_all_records(&dir, mirror_envelope::Format::Ndjson).unwrap_or_default();
         if records.len() >= N {
             break;
         }
@@ -97,7 +99,7 @@ async fn mirrors_to_filesystem_with_offset_named_files() {
     assert_eq!(filenames, expected_names, "filenames");
 
     // Assert: byte-identical key/value at each offset.
-    let records = read_all_records(&dir).expect("read all");
+    let records = read_all_records(&dir, mirror_envelope::Format::Ndjson).expect("read all");
     assert_eq!(records.len(), N);
     for (i, rec) in records.iter().enumerate() {
         assert_eq!(rec.source_offset, i as u64, "offset at {i}");
@@ -120,6 +122,8 @@ async fn mirrors_to_filesystem_with_offset_named_files() {
         root: root.path().to_path_buf(),
         destination_name: "ops".into(),
         partition: 0,
+        format: mirror_envelope::Format::Ndjson,
+        compression: mirror_envelope::ParquetCompression::Zstd1,
         flush,
     })
     .expect("reopen");

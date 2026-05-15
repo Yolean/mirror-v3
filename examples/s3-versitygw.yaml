@@ -19,10 +19,14 @@ destination:
   region: us-east-1
   bucket: mirror-v3
   prefix: archive/
+  # format defaults to `parquet`; switch to `ndjson` for jq-friendly dumps
+  # format: ndjson
+  # compression defaults to `zstd-1`.
+  # compression: zstd-1
   flush:
-    max-time-ms: 60000      # at most 60s of buffering
-    max-bytes: 16777216     # or 16 MiB
-    max-offsets: 10000      # or 10k source offsets
+    max-time-ms: 60000         # at most 60s of buffering
+    max-bytes: 67108864        # or 64 MiB — parquet files want some heft to amortize the footer
+    max-offsets: 10000         # or 10k source offsets
 
 mirrors:
   - name: operations

@@ -144,6 +144,27 @@ fn destination_type(d: &Destination) -> &'static str {
     }
 }
 
+fn format_to_envelope(f: mirror_config::DestinationFormat) -> mirror_envelope::Format {
+    match f {
+        mirror_config::DestinationFormat::Parquet => mirror_envelope::Format::Parquet,
+        mirror_config::DestinationFormat::Ndjson => mirror_envelope::Format::Ndjson,
+    }
+}
+
+fn compression_to_envelope(
+    c: mirror_config::ParquetCompression,
+) -> mirror_envelope::ParquetCompression {
+    use mirror_config::ParquetCompression as Cfg;
+    use mirror_envelope::ParquetCompression as E;
+    match c {
+        Cfg::Zstd1 => E::Zstd1,
+        Cfg::Zstd3 => E::Zstd3,
+        Cfg::Snappy => E::Snappy,
+        Cfg::Lz4 => E::Lz4,
+        Cfg::Uncompressed => E::Uncompressed,
+    }
+}
+
 #[derive(Debug, serde::Serialize)]
 struct StatusRow {
     name: String,
@@ -239,6 +260,8 @@ async fn query_destination_next(mirror: &Mirror, destination: &Destination) -> R
                 root: fs.root.clone(),
                 destination_name,
                 partition: mirror.partition,
+                format: format_to_envelope(fs.format),
+                compression: compression_to_envelope(fs.compression),
                 flush: mirror_fs::FlushTriggers {
                     max_time: std::time::Duration::from_millis(fs.flush.max_time_ms),
                     max_bytes: fs.flush.max_bytes,
@@ -266,6 +289,8 @@ async fn query_destination_next(mirror: &Mirror, destination: &Destination) -> R
                 prefix: s3.prefix.as_deref().map(object_store::path::Path::from),
                 destination_name,
                 partition: mirror.partition,
+                format: format_to_envelope(s3.format),
+                compression: compression_to_envelope(s3.compression),
                 flush: mirror_s3::FlushTriggers {
                     max_time: std::time::Duration::from_millis(s3.flush.max_time_ms),
                     max_bytes: s3.flush.max_bytes,
@@ -451,6 +476,8 @@ fn spawn_mirror(
                 root: fs.root,
                 destination_name,
                 partition: mirror.partition,
+                format: format_to_envelope(fs.format),
+                compression: compression_to_envelope(fs.compression),
                 flush: mirror_fs::FlushTriggers {
                     max_time: std::time::Duration::from_millis(fs.flush.max_time_ms),
                     max_bytes: fs.flush.max_bytes,
@@ -491,6 +518,8 @@ fn spawn_mirror(
                 prefix: s3.prefix.as_deref().map(object_store::path::Path::from),
                 destination_name,
                 partition: mirror.partition,
+                format: format_to_envelope(s3.format),
+                compression: compression_to_envelope(s3.compression),
                 flush: mirror_s3::FlushTriggers {
                     max_time: std::time::Duration::from_millis(s3.flush.max_time_ms),
                     max_bytes: s3.flush.max_bytes,

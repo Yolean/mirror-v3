@@ -14,10 +14,14 @@
 destination:
   type: filesystem
   root: /var/lib/mirror-v3
+  # format defaults to `parquet`; uncomment for the ndjson debug format
+  # format: ndjson
+  # compression defaults to `zstd-1`. Other options: zstd-3, snappy, lz4, uncompressed.
+  # compression: zstd-1
   flush:
-    max-time-ms: 5000       # at most 5s of buffering
-    max-bytes: 1048576      # or 1 MiB
-    max-offsets: 1000       # or 1000 source offsets
+    max-time-ms: 5000          # at most 5s of buffering
+    max-bytes: 67108864        # or 64 MiB — parquet files want some heft to amortize the footer
+    max-offsets: 10000         # or 10k source offsets
 
 mirrors:
   - name: operations-p0

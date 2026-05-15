@@ -1,0 +1,20 @@
+[package]
+name = "mirror-envelope"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Record envelope encoding for mirror-v3 destinations (NDJSON, Parquet)"
+
+[dependencies]
+mirror-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+base64 = { workspace = true }
+arrow = { workspace = true }
+parquet = { workspace = true }
+bytes = { workspace = true }
+
+[dev-dependencies]

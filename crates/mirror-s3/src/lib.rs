@@ -22,14 +22,10 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::StreamExt;
 use mirror_core::{Record, Sink, SinkError};
-use mirror_fs::{encode_line, naming};
+use mirror_envelope::{Format, ParquetCompression};
+use mirror_fs::naming;
 use object_store::path::Path;
 use object_store::{ObjectStore, PutMode, PutOptions, PutPayload};
-
-// `serde` and `serde_json` are referenced indirectly via mirror_fs::encode_line;
-// declare-only imports here would be dead, so they're omitted.
-
-pub const FILE_EXT: &str = "ndjson";
 
 #[derive(Debug, Clone, Copy)]
 pub struct FlushTriggers {
@@ -44,12 +40,16 @@ pub struct S3SinkConfig {
     pub prefix: Option<Path>,
     pub destination_name: String,
     pub partition: u32,
+    pub format: Format,
+    pub compression: ParquetCompression,
     pub flush: FlushTriggers,
 }
 
 pub struct S3Sink {
     store: Arc<dyn ObjectStore>,
     partition_prefix: Path,
+    format: Format,
+    compression: ParquetCompression,
     flush: FlushTriggers,
     durable_position: u64,
     buffer: Vec<Record>,
@@ -62,10 +62,13 @@ impl S3Sink {
     pub async fn open(cfg: S3SinkConfig) -> Result<Self, S3Error> {
         let partition_prefix =
             build_prefix(cfg.prefix.as_ref(), &cfg.destination_name, cfg.partition);
-        let durable_position = scan_validate(cfg.store.as_ref(), &partition_prefix).await?;
+        let durable_position =
+            scan_validate(cfg.store.as_ref(), &partition_prefix, cfg.format).await?;
         Ok(Self {
             store: cfg.store,
             partition_prefix,
+            format: cfg.format,
+            compression: cfg.compression,
             flush: cfg.flush,
             durable_position,
             buffer: Vec::new(),
@@ -101,14 +104,11 @@ impl S3Sink {
         let to = self.durable_position + self.buffer.len() as u64 - 1;
         let count = self.buffer.len();
         let buffered_bytes = self.buffer_bytes;
-        let name = naming::batch_filename(from, to, FILE_EXT);
+        let name = naming::batch_filename(from, to, self.format.extension());
         let path = child_of(&self.partition_prefix, &name);
 
-        let mut bytes = Vec::with_capacity(self.buffer_bytes as usize + 64 * self.buffer.len());
-        for record in &self.buffer {
-            encode_line(record, &mut bytes)
-                .map_err(|e| SinkError::Transport(format!("encode: {e}")))?;
-        }
+        let bytes = mirror_envelope::encode_batch(self.format, self.compression, &self.buffer)
+            .map_err(|e| SinkError::Transport(format!("encode: {e}")))?;
         let encoded_bytes = bytes.len() as u64;
 
         let opts = PutOptions {
@@ -190,7 +190,7 @@ impl S3Sink {
 #[async_trait]
 impl Sink for S3Sink {
     async fn next_expected_offset(&mut self) -> Result<u64, SinkError> {
-        let on_remote = scan_validate(self.store.as_ref(), &self.partition_prefix)
+        let on_remote = scan_validate(self.store.as_ref(), &self.partition_prefix, self.format)
             .await
             .map_err(|e| SinkError::Transport(e.to_string()))?;
         if on_remote != self.durable_position {
@@ -249,7 +249,17 @@ fn child_of(prefix: &Path, name: &str) -> Path {
     Path::from_iter(parts)
 }
 
-async fn scan_validate(store: &dyn ObjectStore, prefix: &Path) -> Result<u64, S3Error> {
+fn file_extension(name: &str) -> Option<&str> {
+    let dot = name.rfind('.')?;
+    Some(&name[dot + 1..])
+}
+
+async fn scan_validate(
+    store: &dyn ObjectStore,
+    prefix: &Path,
+    format: Format,
+) -> Result<u64, S3Error> {
+    let expected_ext = format.extension();
     let mut entries: Vec<(u64, u64)> = Vec::new();
     let mut stream = store.list(Some(prefix));
     while let Some(meta) = stream.next().await {
@@ -262,7 +272,15 @@ async fn scan_validate(store: &dyn ObjectStore, prefix: &Path) -> Result<u64, S3
         if name.is_empty() || name.contains(".tmp.") {
             continue;
         }
-        if let Some((from, to)) = naming::parse_filename(&name, FILE_EXT) {
+        if let Some(other_ext) = file_extension(&name) {
+            if other_ext != expected_ext && naming::parse_filename(&name, other_ext).is_some() {
+                return Err(S3Error::CorruptChain(format!(
+                    "{name}: extension '{other_ext}' does not match configured format \
+                     '{expected_ext}'"
+                )));
+            }
+        }
+        if let Some((from, to)) = naming::parse_filename(&name, expected_ext) {
             if to < from {
                 return Err(S3Error::CorruptChain(format!("{name}: to < from")));
             }

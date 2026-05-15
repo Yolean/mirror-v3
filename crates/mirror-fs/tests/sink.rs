@@ -3,7 +3,11 @@
 use std::time::Duration;
 
 use mirror_core::{Record, Sink, TimestampType};
+use mirror_envelope::{Format, ParquetCompression};
 use mirror_fs::{read_all_records, FilesystemSink, FilesystemSinkConfig, FlushTriggers};
+
+// mirror_envelope must be reachable from the test as a path; brought
+// in via mirror-fs's re-export below.
 
 fn rec(offset: u64) -> Record {
     Record {
@@ -19,10 +23,15 @@ fn rec(offset: u64) -> Record {
 }
 
 fn cfg(root: &std::path::Path, max_offsets: u64) -> FilesystemSinkConfig {
+    // Existing sink tests target the ndjson envelope. The parquet
+    // path is covered by mirror-envelope's round-trip tests and by
+    // the upcoming e2e suite.
     FilesystemSinkConfig {
         root: root.to_path_buf(),
         destination_name: "ops".into(),
         partition: 0,
+        format: Format::Ndjson,
+        compression: ParquetCompression::Zstd1,
         flush: FlushTriggers {
             max_time: Duration::from_secs(3600),
             max_bytes: u64::MAX,
@@ -59,7 +68,11 @@ async fn write_buffers_then_flushes_on_count_trigger() {
     // Third record trips the count trigger.
     sink.write(rec(2)).await.unwrap();
     assert_eq!(sink.next_expected_offset().await.unwrap(), 3);
-    let records = read_all_records(&tmp.path().join("ops").join("0")).unwrap();
+    let records = read_all_records(
+        &tmp.path().join("ops").join("0"),
+        mirror_envelope::Format::Ndjson,
+    )
+    .unwrap();
     assert_eq!(records.len(), 3);
     assert_eq!(records[0].source_offset, 0);
     assert_eq!(records[2].source_offset, 2);
@@ -167,7 +180,11 @@ async fn flush_now_writes_partial_batch() {
     sink.write(rec(0)).await.unwrap();
     sink.write(rec(1)).await.unwrap();
     sink.flush_now().await.unwrap();
-    let records = read_all_records(&tmp.path().join("ops").join("0")).unwrap();
+    let records = read_all_records(
+        &tmp.path().join("ops").join("0"),
+        mirror_envelope::Format::Ndjson,
+    )
+    .unwrap();
     assert_eq!(records.len(), 2);
     assert_eq!(records[0].source_offset, 0);
     assert_eq!(records[1].source_offset, 1);

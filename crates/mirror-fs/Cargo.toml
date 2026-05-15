@@ -9,16 +9,16 @@ description = "Filesystem sink for mirror-v3 (atomic-rename, offset-named files)
 
 [dependencies]
 mirror-core = { workspace = true }
+mirror-envelope = { workspace = true }
 async-trait = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-base64 = { workspace = true }
 uuid = { workspace = true }
 tokio = { workspace = true, features = ["fs", "io-util", "macros", "rt"] }
 metrics = { workspace = true }
 
 [dev-dependencies]
+mirror-envelope = { workspace = true }
+serde_json = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros", "time"] }

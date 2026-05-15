@@ -4,49 +4,29 @@
 //!
 //! Each flush writes the buffered records to a same-directory
 //! temporary file (`<final>.tmp.<uuid>`), `fsync`s it, then
-//! `rename(2)`s it to the canonical name `<from>-<to>.ndjson`. POSIX
-//! rename is atomic; if the canonical name already exists we treat it
-//! as a hard error (two writers shouldn't happen — k8s should keep
-//! the deployment single-replica — but we still refuse silently
-//! overwriting).
+//! `rename(2)`s it to the canonical name `<from>-<to>.<ext>` where
+//! `<ext>` matches the configured envelope format (parquet / ndjson).
+//! POSIX rename is atomic; a pre-existing canonical name is a hard
+//! error.
 //!
 //! ## Restart correctness
 //!
-//! On startup, [`FilesystemSink::open`] lists the partition directory,
-//! parses every filename, and validates the chain forms a contiguous
-//! `from→to` sequence with no gaps and no overlaps. `next_expected_offset`
-//! returns `max(to) + 1` of the durable chain plus the in-memory
-//! buffer length. Buffered-but-not-flushed records are lost on crash,
-//! which is fine: the source will re-deliver them post-restart.
+//! On startup, [`FilesystemSink::open`] lists the partition
+//! directory, parses every filename matching the configured
+//! extension, and validates the chain forms a contiguous `from→to`
+//! sequence with no gaps and no overlaps. Files with a non-matching
+//! extension are an error (no mixed-format dirs).
 
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use mirror_core::{Header, Record, Sink, SinkError, TimestampType};
-use serde::{Deserialize, Serialize};
+use mirror_core::{Record, Sink, SinkError};
+use mirror_envelope::{Format, ParquetCompression};
 use tokio::io::AsyncWriteExt;
 
 pub mod naming;
-
-/// Encode one record as a single ndjson line, appending into `out`.
-/// Shared by mirror-fs and mirror-s3 so a single decoder can read
-/// either.
-pub fn encode_line(record: &Record, out: &mut Vec<u8>) -> Result<(), serde_json::Error> {
-    let pr = PersistedRecord::from(record);
-    serde_json::to_writer(&mut *out, &pr)?;
-    out.push(b'\n');
-    Ok(())
-}
-
-/// Decode one ndjson line back to a [`Record`].
-pub fn decode_line(bytes: &[u8]) -> Result<Record, serde_json::Error> {
-    let pr: PersistedRecord = serde_json::from_slice(bytes)?;
-    Ok(pr.into_record())
-}
-
-pub const FILE_EXT: &str = "ndjson";
 
 #[derive(Debug, Clone)]
 pub struct FilesystemSinkConfig {
@@ -54,6 +34,8 @@ pub struct FilesystemSinkConfig {
     pub root: PathBuf,
     pub destination_name: String,
     pub partition: u32,
+    pub format: Format,
+    pub compression: ParquetCompression,
     pub flush: FlushTriggers,
 }
 
@@ -66,14 +48,14 @@ pub struct FlushTriggers {
 
 pub struct FilesystemSink {
     dir: PathBuf,
+    format: Format,
+    compression: ParquetCompression,
     flush: FlushTriggers,
     /// Durable destination position: `max(to) + 1` of files on disk.
     durable_position: u64,
     buffer: Vec<Record>,
     buffer_bytes: u64,
     buffer_started: Option<Instant>,
-    /// When the most recent flush completed; used to log "ms since
-    /// last flush" so operators can see flush cadence.
     last_flush_at: Option<Instant>,
 }
 
@@ -84,9 +66,11 @@ impl FilesystemSink {
             path: dir.clone(),
             source: e,
         })?;
-        let durable_position = scan_validate(&dir)?;
+        let durable_position = scan_validate(&dir, cfg.format)?;
         Ok(Self {
             dir,
+            format: cfg.format,
+            compression: cfg.compression,
             flush: cfg.flush,
             durable_position,
             buffer: Vec::new(),
@@ -96,8 +80,6 @@ impl FilesystemSink {
         })
     }
 
-    /// Force a flush even if no trigger has tripped. Used by tests and
-    /// will be called by the loop on graceful shutdown (Phase 5).
     pub async fn flush_now(&mut self) -> Result<(), SinkError> {
         if self.buffer.is_empty() {
             return Ok(());
@@ -124,24 +106,23 @@ impl FilesystemSink {
         let from = self.durable_position;
         let to = self.durable_position + self.buffer.len() as u64 - 1;
         let count = self.buffer.len();
-        let bytes = self.buffer_bytes;
-        let final_name = naming::batch_filename(from, to, FILE_EXT);
+        let ext = self.format.extension();
+        let final_name = naming::batch_filename(from, to, ext);
         let final_path = self.dir.join(&final_name);
         let tmp_path = self
             .dir
             .join(format!("{}.tmp.{}", final_name, uuid::Uuid::new_v4()));
 
-        // Write + fsync the temp file.
+        // Encode the whole batch into bytes (NDJSON or Parquet) and
+        // write+fsync the temp file.
+        let bytes = mirror_envelope::encode_batch(self.format, self.compression, &self.buffer)
+            .map_err(|e| SinkError::Transport(format!("encode: {e}")))?;
+        let encoded_len = bytes.len() as u64;
         {
             let mut file = tokio::fs::File::create(&tmp_path)
                 .await
                 .map_err(|e| SinkError::Transport(format!("create tmp: {e}")))?;
-            let mut buf = Vec::with_capacity(self.buffer_bytes as usize + 64 * self.buffer.len());
-            for record in &self.buffer {
-                encode_line(record, &mut buf)
-                    .map_err(|e| SinkError::Transport(format!("encode: {e}")))?;
-            }
-            file.write_all(&buf)
+            file.write_all(&bytes)
                 .await
                 .map_err(|e| SinkError::Transport(format!("write: {e}")))?;
             file.sync_all()
@@ -149,7 +130,6 @@ impl FilesystemSink {
                 .map_err(|e| SinkError::Transport(format!("fsync: {e}")))?;
         }
 
-        // Atomic publish.
         match tokio::fs::rename(&tmp_path, &final_path).await {
             Ok(()) => {}
             Err(e) => {
@@ -161,11 +141,6 @@ impl FilesystemSink {
                 )));
             }
         }
-
-        // We deliberately do NOT fsync the parent directory: rename
-        // visibility within the same fs is sufficient for our
-        // restart-from-listing model. Power-loss durability beyond
-        // that is a property of the underlying filesystem.
 
         self.durable_position = to + 1;
         self.buffer.clear();
@@ -196,7 +171,7 @@ impl FilesystemSink {
             "topic" => topic.clone(),
             "partition" => partition.clone(),
         )
-        .increment(bytes);
+        .increment(encoded_len);
         metrics::counter!(
             "mirror_v3_destination_flushes_total",
             "topic" => topic,
@@ -209,7 +184,7 @@ impl FilesystemSink {
             from,
             to,
             count,
-            bytes,
+            bytes = encoded_len,
             elapsed_ms,
             interval_ms,
             "flushed batch"
@@ -221,9 +196,8 @@ impl FilesystemSink {
 #[async_trait]
 impl Sink for FilesystemSink {
     async fn next_expected_offset(&mut self) -> Result<u64, SinkError> {
-        // Re-verify durable state on every call so idle-drift checks
-        // pick up out-of-band writes.
-        let on_disk = scan_validate(&self.dir).map_err(|e| SinkError::Transport(e.to_string()))?;
+        let on_disk = scan_validate(&self.dir, self.format)
+            .map_err(|e| SinkError::Transport(e.to_string()))?;
         if on_disk != self.durable_position {
             return Err(SinkError::UnexpectedPosition {
                 expected: self.durable_position,
@@ -275,8 +249,15 @@ fn record_byte_size(record: &Record) -> u64 {
             .sum::<usize>() as u64
 }
 
-/// Scan a partition directory, validate the chain, return next-expected-offset.
-fn scan_validate(dir: &Path) -> Result<u64, FsError> {
+/// Scan a partition directory, validate the chain (from=0 contiguous,
+/// no overlaps), and return the next-expected source offset
+/// (`max(to) + 1` of the chain).
+///
+/// Files with a non-matching extension are reported as `CorruptChain`
+/// so a misconfigured mirror (writing parquet into a directory that
+/// already contains ndjson) is caught immediately.
+fn scan_validate(dir: &Path, format: Format) -> Result<u64, FsError> {
+    let expected_ext = format.extension();
     let mut entries: Vec<(u64, u64)> = Vec::new();
     let read = match std::fs::read_dir(dir) {
         Ok(r) => r,
@@ -294,11 +275,22 @@ fn scan_validate(dir: &Path) -> Result<u64, FsError> {
             source: e,
         })?;
         let name = entry.file_name().to_string_lossy().to_string();
-        // Ignore in-flight .tmp files; they belong to a crashed writer.
         if name.contains(".tmp.") {
             continue;
         }
-        if let Some((from, to)) = naming::parse_filename(&name, FILE_EXT) {
+        // Files of the wrong extension are an error — mixed-format
+        // dirs are forbidden.
+        if let Some(other_ext) = file_extension(&name) {
+            if other_ext != expected_ext && naming::parse_filename(&name, other_ext).is_some() {
+                return Err(FsError::CorruptChain {
+                    msg: format!(
+                        "{name}: extension '{other_ext}' does not match configured format \
+                         '{expected_ext}'"
+                    ),
+                });
+            }
+        }
+        if let Some((from, to)) = naming::parse_filename(&name, expected_ext) {
             if to < from {
                 return Err(FsError::CorruptChain {
                     msg: format!("{name}: to < from"),
@@ -309,7 +301,6 @@ fn scan_validate(dir: &Path) -> Result<u64, FsError> {
     }
     entries.sort_unstable();
 
-    // Validate contiguity starting at 0.
     let mut expected_next: u64 = 0;
     for (from, to) in &entries {
         if *from != expected_next {
@@ -324,77 +315,15 @@ fn scan_validate(dir: &Path) -> Result<u64, FsError> {
     Ok(expected_next)
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct PersistedRecord {
-    topic: String,
-    partition: i32,
-    offset: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    timestamp_ms: Option<i64>,
-    timestamp_type: String,
-    #[serde(skip_serializing_if = "Option::is_none", with = "opt_base64")]
-    key: Option<Vec<u8>>,
-    #[serde(skip_serializing_if = "Option::is_none", with = "opt_base64")]
-    value: Option<Vec<u8>>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    headers: Vec<PersistedHeader>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct PersistedHeader {
-    key: String,
-    #[serde(skip_serializing_if = "Option::is_none", with = "opt_base64")]
-    value: Option<Vec<u8>>,
-}
-
-impl From<&Record> for PersistedRecord {
-    fn from(r: &Record) -> Self {
-        PersistedRecord {
-            topic: r.topic.clone(),
-            partition: r.partition,
-            offset: r.source_offset,
-            timestamp_ms: r.timestamp_ms,
-            timestamp_type: r.timestamp_type.as_str().to_string(),
-            key: r.key.clone(),
-            value: r.value.clone(),
-            headers: r
-                .headers
-                .iter()
-                .map(|h| PersistedHeader {
-                    key: h.key.clone(),
-                    value: h.value.clone(),
-                })
-                .collect(),
-        }
-    }
-}
-
-impl PersistedRecord {
-    pub fn into_record(self) -> Record {
-        Record {
-            topic: self.topic,
-            partition: self.partition,
-            source_offset: self.offset,
-            timestamp_ms: self.timestamp_ms,
-            timestamp_type: TimestampType::from_wire(&self.timestamp_type)
-                .unwrap_or(TimestampType::NotAvailable),
-            key: self.key,
-            value: self.value,
-            headers: self
-                .headers
-                .into_iter()
-                .map(|h| Header {
-                    key: h.key,
-                    value: h.value,
-                })
-                .collect(),
-        }
-    }
+fn file_extension(name: &str) -> Option<&str> {
+    let dot = name.rfind('.')?;
+    Some(&name[dot + 1..])
 }
 
 /// Read every record from a partition directory in offset order.
 /// Convenience for tests and operators verifying state.
-pub fn read_all_records(dir: &Path) -> Result<Vec<Record>, FsError> {
+pub fn read_all_records(dir: &Path, format: Format) -> Result<Vec<Record>, FsError> {
+    let expected_ext = format.extension();
     let mut entries: Vec<(u64, u64, PathBuf)> = Vec::new();
     let read = match std::fs::read_dir(dir) {
         Ok(r) => r,
@@ -415,7 +344,7 @@ pub fn read_all_records(dir: &Path) -> Result<Vec<Record>, FsError> {
         if name.contains(".tmp.") {
             continue;
         }
-        if let Some((from, to)) = naming::parse_filename(&name, FILE_EXT) {
+        if let Some((from, to)) = naming::parse_filename(&name, expected_ext) {
             entries.push((from, to, entry.path()));
         }
     }
@@ -427,43 +356,13 @@ pub fn read_all_records(dir: &Path) -> Result<Vec<Record>, FsError> {
             path: path.clone(),
             source: e,
         })?;
-        for line in bytes.split(|b| *b == b'\n') {
-            if line.is_empty() {
-                continue;
-            }
-            let pr: PersistedRecord =
-                serde_json::from_slice(line).map_err(|e| FsError::CorruptChain {
-                    msg: format!("decode {}: {e}", path.display()),
-                })?;
-            out.push(pr.into_record());
-        }
+        let decoded =
+            mirror_envelope::decode_batch(format, &bytes).map_err(|e| FsError::CorruptChain {
+                msg: format!("decode {}: {e}", path.display()),
+            })?;
+        out.extend(decoded);
     }
     Ok(out)
-}
-
-mod opt_base64 {
-    use base64::Engine;
-    use serde::{Deserialize, Deserializer, Serialize, Serializer};
-
-    pub fn serialize<S: Serializer>(v: &Option<Vec<u8>>, s: S) -> Result<S::Ok, S::Error> {
-        match v {
-            Some(bytes) => {
-                let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
-                encoded.serialize(s)
-            }
-            None => s.serialize_none(),
-        }
-    }
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Vec<u8>>, D::Error> {
-        let opt: Option<String> = Option::deserialize(d)?;
-        match opt {
-            None => Ok(None),
-            Some(s) => base64::engine::general_purpose::STANDARD
-                .decode(s.as_bytes())
-                .map(Some)
-                .map_err(serde::de::Error::custom),
-        }
-    }
 }
 
 #[derive(Debug, thiserror::Error)]
