@@ -88,16 +88,16 @@ jobs:
       uses: docker/metadata-action@030e881283bb7a6894de51c315a6bfe6a94e05cf  # v6.0.0
       with:
         images: ghcr.io/yolean/mirror-v3
-        # Tag rules:
-        #   - push to main          -> :main and :latest and :sha-<short-sha>
+        # Tag rules (sha tag is the full 40-char commit SHA, no prefix):
+        #   - push to main          -> :main and :latest and :<full-sha>
         #   - push to tag vX.Y.Z    -> :vX.Y.Z (and :latest if default-branch)
-        #   - PR / workflow_dispatch -> :pr-<n> or :sha-<short-sha> (build-only, no push)
+        #   - PR / workflow_dispatch -> :pr-<n> or :<full-sha> (build-only, no push)
         tags: |
           type=raw,value=latest,enable={{is_default_branch}}
           type=ref,event=branch
           type=ref,event=tag
           type=ref,event=pr
-          type=sha,prefix=sha-
+          type=sha,format=long,prefix=
     - name: build (and push on non-PR)
       uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f  # v7.1.0
       with:
