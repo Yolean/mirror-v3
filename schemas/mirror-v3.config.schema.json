@@ -63,6 +63,11 @@
               "$ref": "#/$defs/ParquetCompression",
               "default": "zstd-1"
             },
+            "json": {
+              "description": "When `true` (and `format = parquet`), replace the binary\n`value` column with a UTF-8 `json` column carrying the\nKafka value bytes verbatim. mirror-v3 does not parse or\nvalidate JSON; it only enforces UTF-8. A non-UTF-8 value is\na hard error. Reject `json = true` if `format = ndjson`\n(ndjson already carries the value, base64-encoded).",
+              "type": "boolean",
+              "default": false
+            },
             "flush": {
               "$ref": "#/$defs/FlushTriggers"
             },
@@ -112,6 +117,11 @@
               "description": "Parquet compression. Only meaningful when `format = parquet`.\nDefaults to `zstd-1`.",
               "$ref": "#/$defs/ParquetCompression",
               "default": "zstd-1"
+            },
+            "json": {
+              "description": "When `true` (and `format = parquet`), replace the binary\n`value` column with a UTF-8 `json` column. See the\nequivalent field on `FilesystemDestination` for the\nsemantics; `json = true` with `format = ndjson` is\nrejected at config-load time.",
+              "type": "boolean",
+              "default": false
             },
             "flush": {
               "$ref": "#/$defs/FlushTriggers"

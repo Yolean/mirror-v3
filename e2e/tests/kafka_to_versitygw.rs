@@ -82,6 +82,7 @@ async fn mirrors_to_versitygw_with_offset_named_objects() {
         destination_name: "ops".into(),
         format: mirror_envelope::Format::Ndjson,
         compression: mirror_envelope::ParquetCompression::Zstd1,
+        value_as_json: false,
         flush,
     })
     .await
@@ -138,6 +139,7 @@ async fn mirrors_to_versitygw_with_offset_named_objects() {
         partition: 0,
         format: mirror_envelope::Format::Ndjson,
         compression: mirror_envelope::ParquetCompression::Zstd1,
+        value_as_json: false,
         flush,
     })
     .await

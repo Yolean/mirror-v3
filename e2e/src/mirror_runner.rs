@@ -104,6 +104,7 @@ pub struct FsMirrorSpec {
     pub destination_name: String,
     pub format: mirror_envelope::Format,
     pub compression: mirror_envelope::ParquetCompression,
+    pub value_as_json: bool,
     pub flush: mirror_fs::FlushTriggers,
 }
 
@@ -129,6 +130,7 @@ impl FsMirrorSpec {
             destination_name,
             format: mirror_envelope::Format::Ndjson,
             compression: mirror_envelope::ParquetCompression::Zstd1,
+            value_as_json: false,
             flush,
         }
     }
@@ -152,6 +154,7 @@ pub fn spawn_kafka_to_filesystem(spec: FsMirrorSpec) -> Result<MirrorHandle> {
         partition: spec.partition as u32,
         format: spec.format,
         compression: spec.compression,
+        value_as_json: spec.value_as_json,
         flush: spec.flush,
     };
     let sink = FilesystemSink::open(sink_cfg).context("open FilesystemSink")?;
@@ -170,6 +173,7 @@ pub struct S3MirrorSpec {
     pub destination_name: String,
     pub format: mirror_envelope::Format,
     pub compression: mirror_envelope::ParquetCompression,
+    pub value_as_json: bool,
     pub flush: mirror_s3::FlushTriggers,
 }
 
@@ -192,6 +196,7 @@ pub async fn spawn_kafka_to_s3(spec: S3MirrorSpec) -> Result<MirrorHandle> {
         partition: spec.partition as u32,
         format: spec.format,
         compression: spec.compression,
+        value_as_json: spec.value_as_json,
         flush: spec.flush,
     };
     let sink = S3Sink::open(sink_cfg).await.context("open S3Sink")?;

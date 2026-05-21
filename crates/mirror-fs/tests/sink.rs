@@ -32,6 +32,7 @@ fn cfg(root: &std::path::Path, max_offsets: u64) -> FilesystemSinkConfig {
         partition: 0,
         format: Format::Ndjson,
         compression: ParquetCompression::Zstd1,
+        value_as_json: false,
         flush: FlushTriggers {
             max_time: Duration::from_secs(3600),
             max_bytes: u64::MAX,

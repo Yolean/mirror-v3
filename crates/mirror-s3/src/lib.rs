@@ -57,6 +57,11 @@ pub struct S3SinkConfig {
     pub partition: u32,
     pub format: Format,
     pub compression: ParquetCompression,
+    /// When true with Parquet, value bytes are written verbatim as a
+    /// `json: Utf8` column (with `arrow.json` extension metadata) and
+    /// non-UTF-8 values are a hard error. Caller must reject this
+    /// combined with `Format::Ndjson` before constructing the sink.
+    pub value_as_json: bool,
     pub flush: FlushTriggers,
 }
 
@@ -65,6 +70,7 @@ pub struct S3Sink {
     partition_prefix: Path,
     format: Format,
     compression: ParquetCompression,
+    value_as_json: bool,
     flush: FlushTriggers,
     durable_position: u64,
     buffer: Vec<Record>,
@@ -97,6 +103,7 @@ impl S3Sink {
             partition_prefix,
             format: cfg.format,
             compression: cfg.compression,
+            value_as_json: cfg.value_as_json,
             flush: cfg.flush,
             durable_position,
             buffer: Vec::new(),
@@ -157,8 +164,13 @@ impl S3Sink {
         let name = naming::batch_filename(from, to, self.format.extension());
         let path = child_of(&self.partition_prefix, &name);
 
-        let bytes = mirror_envelope::encode_batch(self.format, self.compression, &self.buffer)
-            .map_err(|e| SinkError::Transport(format!("encode: {e}")))?;
+        let bytes = mirror_envelope::encode_batch(
+            self.format,
+            self.compression,
+            self.value_as_json,
+            &self.buffer,
+        )
+        .map_err(|e| SinkError::Transport(format!("encode: {e}")))?;
         let encoded_bytes = bytes.len() as u64;
 
         let opts = PutOptions {

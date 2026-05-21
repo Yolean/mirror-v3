@@ -71,6 +71,14 @@ pub struct FilesystemDestination {
     /// Defaults to `zstd-1`.
     #[serde(default)]
     pub compression: ParquetCompression,
+    /// When `true` (and `format = parquet`), replace the binary
+    /// `value` column with a UTF-8 `json` column carrying the
+    /// Kafka value bytes verbatim. mirror-v3 does not parse or
+    /// validate JSON; it only enforces UTF-8. A non-UTF-8 value is
+    /// a hard error. Reject `json = true` if `format = ndjson`
+    /// (ndjson already carries the value, base64-encoded).
+    #[serde(default)]
+    pub json: bool,
     pub flush: FlushTriggers,
 }
 
@@ -93,6 +101,13 @@ pub struct S3Destination {
     /// Defaults to `zstd-1`.
     #[serde(default)]
     pub compression: ParquetCompression,
+    /// When `true` (and `format = parquet`), replace the binary
+    /// `value` column with a UTF-8 `json` column. See the
+    /// equivalent field on `FilesystemDestination` for the
+    /// semantics; `json = true` with `format = ndjson` is
+    /// rejected at config-load time.
+    #[serde(default)]
+    pub json: bool,
     pub flush: FlushTriggers,
 }
 
@@ -310,10 +325,14 @@ pub enum LoadError {
     },
     #[error("parsing config: {0}")]
     Parse(#[from] serde_yaml::Error),
+    #[error("invalid config: {0}")]
+    Validation(String),
 }
 
 pub fn load_from_str(yaml: &str) -> Result<Config, LoadError> {
-    Ok(serde_yaml::from_str(yaml)?)
+    let cfg: Config = serde_yaml::from_str(yaml)?;
+    validate(&cfg)?;
+    Ok(cfg)
 }
 
 pub fn load_from_path(path: &Path) -> Result<Config, LoadError> {
@@ -321,5 +340,32 @@ pub fn load_from_path(path: &Path) -> Result<Config, LoadError> {
         path: path.to_path_buf(),
         source,
     })?;
-    Ok(serde_yaml::from_slice(&bytes)?)
+    let cfg: Config = serde_yaml::from_slice(&bytes)?;
+    validate(&cfg)?;
+    Ok(cfg)
+}
+
+/// Cross-field validation that can't be expressed in serde attributes.
+/// Currently: `json = true` requires `format = parquet`; ndjson already
+/// carries the value (base64), so the json column would be a no-op
+/// silently — better to reject loudly at load time.
+fn validate(cfg: &Config) -> Result<(), LoadError> {
+    match &cfg.destination {
+        Destination::Filesystem(fs) => {
+            if fs.json && matches!(fs.format, DestinationFormat::Ndjson) {
+                return Err(LoadError::Validation(
+                    "filesystem.json = true requires filesystem.format = parquet".into(),
+                ));
+            }
+        }
+        Destination::S3(s3) => {
+            if s3.json && matches!(s3.format, DestinationFormat::Ndjson) {
+                return Err(LoadError::Validation(
+                    "s3.json = true requires s3.format = parquet".into(),
+                ));
+            }
+        }
+        Destination::Kafka(_) => {}
+    }
+    Ok(())
 }

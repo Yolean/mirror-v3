@@ -18,3 +18,4 @@ parquet = { workspace = true }
 bytes = { workspace = true }
 
 [dev-dependencies]
+bytes = { workspace = true }

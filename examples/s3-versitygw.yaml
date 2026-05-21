@@ -23,6 +23,11 @@ destination:
   # format: ndjson
   # compression defaults to `zstd-1`.
   # compression: zstd-1
+  # Opt-in: emit the Kafka value verbatim as a Utf8 `json` column
+  # (with `arrow.json` extension metadata) instead of the default
+  # `value: LargeBinary` column. Requires `format: parquet`; non-UTF-8
+  # values become a hard error.
+  # json: true
   flush:
     max-time-ms: 60000         # at most 60s of buffering
     max-bytes: 67108864        # or 64 MiB — parquet files want some heft to amortize the footer

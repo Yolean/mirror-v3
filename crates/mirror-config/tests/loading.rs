@@ -84,6 +84,7 @@ mirrors:
             root: PathBuf::from("/var/mirror-v3"),
             format: DestinationFormat::default(),
             compression: ParquetCompression::default(),
+            json: false,
             flush: FlushTriggers {
                 max_time_ms: 5000,
                 max_bytes: 1_048_576,
@@ -124,6 +125,7 @@ mirrors:
             prefix: Some("archive/".into()),
             format: DestinationFormat::default(),
             compression: ParquetCompression::default(),
+            json: false,
             flush: FlushTriggers {
                 max_time_ms: 60_000,
                 max_bytes: 16_777_216,
@@ -152,6 +154,62 @@ mirrors:
     let msg = format!("{err}");
     assert!(
         msg.contains("typo_field") || msg.contains("unknown field"),
+        "got: {msg}"
+    );
+}
+
+#[test]
+fn json_true_requires_parquet_format() {
+    let yaml = r#"
+destination:
+  type: filesystem
+  root: /tmp/mirror
+  format: ndjson
+  json: true
+  flush:
+    max-time-ms: 5000
+    max-bytes: 1000
+    max-offsets: 100
+mirrors:
+  - name: operations
+    source:
+      bootstrap-servers: kafka:9092
+    topic: ops
+    partition: 0
+"#;
+    let err = load_from_str(yaml).expect_err("json=true + ndjson must be rejected");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("json") && msg.contains("parquet"),
+        "got: {msg}"
+    );
+}
+
+#[test]
+fn s3_json_true_requires_parquet_format() {
+    let yaml = r#"
+destination:
+  type: s3
+  endpoint: http://minio:9000
+  region: us-east-1
+  bucket: ops
+  format: ndjson
+  json: true
+  flush:
+    max-time-ms: 5000
+    max-bytes: 1000
+    max-offsets: 100
+mirrors:
+  - name: operations
+    source:
+      bootstrap-servers: kafka:9092
+    topic: ops
+    partition: 0
+"#;
+    let err = load_from_str(yaml).expect_err("s3.json=true + ndjson must be rejected");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("json") && msg.contains("parquet"),
         "got: {msg}"
     );
 }

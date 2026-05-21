@@ -35,12 +35,25 @@ fn header_struct_fields() -> Fields {
     ])
 }
 
-fn build_schema() -> SchemaRef {
+fn build_schema(value_as_json: bool) -> SchemaRef {
     let header_struct = DataType::Struct(header_struct_fields());
     // `nullable: true` matches arrow's ListBuilder<StructBuilder>
     // default; the records themselves never contain a null header
     // struct, but Arrow requires the schema to permit it.
     let header_item = Field::new("item", header_struct, true);
+    let value_field = if value_as_json {
+        // Carry the `arrow.json` canonical extension type so
+        // readers that respect it (e.g. arrow-aware tooling) get
+        // the JSON logical-type hint. DuckDB doesn't currently
+        // round-trip the extension but reads the column as
+        // VARCHAR, which is what we need.
+        let mut md = std::collections::HashMap::new();
+        md.insert("ARROW:extension:name".to_string(), "arrow.json".to_string());
+        md.insert("ARROW:extension:metadata".to_string(), String::new());
+        Field::new("json", DataType::Utf8, true).with_metadata(md)
+    } else {
+        Field::new("value", DataType::LargeBinary, true)
+    };
     Arc::new(Schema::new(vec![
         Field::new("topic", DataType::Utf8, false),
         Field::new("partition", DataType::Int32, false),
@@ -48,7 +61,7 @@ fn build_schema() -> SchemaRef {
         Field::new("timestamp_ms", DataType::Int64, true),
         Field::new("timestamp_type", DataType::Utf8, false),
         Field::new("key", DataType::LargeBinary, true),
-        Field::new("value", DataType::LargeBinary, true),
+        value_field,
         Field::new("headers", DataType::List(Arc::new(header_item)), false),
     ]))
 }
@@ -70,9 +83,10 @@ fn to_compression(c: ParquetCompression) -> Compression {
 pub fn encode_batch(
     records: &[Record],
     compression: ParquetCompression,
+    value_as_json: bool,
 ) -> Result<Vec<u8>, EnvelopeError> {
-    let schema = build_schema();
-    let batch = build_record_batch(records, &schema)?;
+    let schema = build_schema(value_as_json);
+    let batch = build_record_batch(records, &schema, value_as_json)?;
 
     let props = WriterProperties::builder()
         .set_compression(to_compression(compression))
@@ -97,6 +111,7 @@ pub fn encode_batch(
 fn build_record_batch(
     records: &[Record],
     schema: &SchemaRef,
+    value_as_json: bool,
 ) -> Result<RecordBatch, EnvelopeError> {
     let mut topics = StringBuilder::new();
     let mut partitions = Int32Builder::new();
@@ -104,7 +119,8 @@ fn build_record_batch(
     let mut timestamps = Int64Builder::new();
     let mut timestamp_types = StringBuilder::new();
     let mut keys = LargeBinaryBuilder::new();
-    let mut values = LargeBinaryBuilder::new();
+    let mut values_binary = LargeBinaryBuilder::new();
+    let mut values_json = StringBuilder::new();
 
     // Headers: List<Struct{key: Utf8, value: LargeBinary}>
     let struct_builders: Vec<Box<dyn arrow::array::ArrayBuilder>> = vec![
@@ -127,9 +143,28 @@ fn build_record_batch(
             Some(k) => keys.append_value(k),
             None => keys.append_null(),
         }
-        match &r.value {
-            Some(v) => values.append_value(v),
-            None => values.append_null(),
+        // Value column: binary by default; UTF-8 string when
+        // value_as_json is on. We fail hard on non-UTF-8 in json
+        // mode (no per-record skipping, no parse-error column).
+        if value_as_json {
+            match &r.value {
+                None => values_json.append_null(),
+                Some(bytes) => {
+                    let s = std::str::from_utf8(bytes).map_err(|e| {
+                        EnvelopeError::Encode(format!(
+                            "value at source offset {} is not valid UTF-8 \
+                             (json mode requires UTF-8): {}",
+                            r.source_offset, e
+                        ))
+                    })?;
+                    values_json.append_value(s);
+                }
+            }
+        } else {
+            match &r.value {
+                Some(v) => values_binary.append_value(v),
+                None => values_binary.append_null(),
+            }
         }
         append_headers(&mut headers_builder, &r.headers);
     }
@@ -140,7 +175,11 @@ fn build_record_batch(
     let timestamps: ArrayRef = Arc::new(timestamps.finish());
     let timestamp_types: ArrayRef = Arc::new(timestamp_types.finish());
     let keys: ArrayRef = Arc::new(keys.finish());
-    let values: ArrayRef = Arc::new(values.finish());
+    let values: ArrayRef = if value_as_json {
+        Arc::new(values_json.finish())
+    } else {
+        Arc::new(values_binary.finish())
+    };
     let headers: ArrayRef = Arc::new(headers_builder.finish());
 
     RecordBatch::try_new(
@@ -194,6 +233,11 @@ pub fn decode_batch(bytes: &[u8]) -> Result<Vec<Record>, EnvelopeError> {
     Ok(out)
 }
 
+enum ValueColumn {
+    Binary(ArrayRef),
+    Json(ArrayRef),
+}
+
 fn record_batch_into_records(batch: &RecordBatch) -> Result<Vec<Record>, EnvelopeError> {
     use arrow::array::{
         Int32Array, Int64Array, LargeBinaryArray, ListArray, StringArray, StructArray, UInt64Array,
@@ -212,7 +256,21 @@ fn record_batch_into_records(batch: &RecordBatch) -> Result<Vec<Record>, Envelop
     let timestamps = col("timestamp_ms")?;
     let timestamp_types = col("timestamp_type")?;
     let keys = col("key")?;
-    let values = col("value")?;
+    // Files written before the `json: true` feature have a `value`
+    // column (LargeBinary); files written under json-mode have a
+    // `json` column (Utf8). Auto-detect from the schema so the same
+    // decoder works for both.
+    let value_column = batch
+        .column_by_name("value")
+        .map(|c| ValueColumn::Binary(c.clone()))
+        .or_else(|| {
+            batch
+                .column_by_name("json")
+                .map(|c| ValueColumn::Json(c.clone()))
+        })
+        .ok_or_else(|| {
+            EnvelopeError::Decode("missing column: expected `value` or `json`".into())
+        })?;
     let headers = col("headers")?;
 
     let topics = topics
@@ -239,10 +297,41 @@ fn record_batch_into_records(batch: &RecordBatch) -> Result<Vec<Record>, Envelop
         .as_any()
         .downcast_ref::<LargeBinaryArray>()
         .ok_or_else(|| EnvelopeError::Decode("key not LargeBinary".into()))?;
-    let values = values
-        .as_any()
-        .downcast_ref::<LargeBinaryArray>()
-        .ok_or_else(|| EnvelopeError::Decode("value not LargeBinary".into()))?;
+    let values_binary;
+    let values_string;
+    let read_value: Box<dyn Fn(usize) -> Option<Vec<u8>>>;
+    match &value_column {
+        ValueColumn::Binary(arr) => {
+            values_binary = arr
+                .as_any()
+                .downcast_ref::<LargeBinaryArray>()
+                .ok_or_else(|| EnvelopeError::Decode("value column not LargeBinary".into()))?
+                .clone();
+            let v = values_binary.clone();
+            read_value = Box::new(move |i| {
+                if v.is_null(i) {
+                    None
+                } else {
+                    Some(v.value(i).to_vec())
+                }
+            });
+        }
+        ValueColumn::Json(arr) => {
+            values_string = arr
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| EnvelopeError::Decode("json column not Utf8".into()))?
+                .clone();
+            let v = values_string.clone();
+            read_value = Box::new(move |i| {
+                if v.is_null(i) {
+                    None
+                } else {
+                    Some(v.value(i).as_bytes().to_vec())
+                }
+            });
+        }
+    }
     let headers_list = headers
         .as_any()
         .downcast_ref::<ListArray>()
@@ -280,11 +369,7 @@ fn record_batch_into_records(batch: &RecordBatch) -> Result<Vec<Record>, Envelop
         } else {
             Some(keys.value(i).to_vec())
         };
-        let value = if values.is_null(i) {
-            None
-        } else {
-            Some(values.value(i).to_vec())
-        };
+        let value = read_value(i);
         let h_start = header_offsets[i] as usize;
         let h_end = header_offsets[i + 1] as usize;
         let mut headers = Vec::with_capacity(h_end - h_start);

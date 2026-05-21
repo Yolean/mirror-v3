@@ -47,6 +47,11 @@ pub struct FilesystemSinkConfig {
     pub partition: u32,
     pub format: Format,
     pub compression: ParquetCompression,
+    /// When true with Parquet, value bytes are written verbatim as a
+    /// `json: Utf8` column (with `arrow.json` extension metadata) and
+    /// non-UTF-8 values are a hard error. Caller must reject this
+    /// combined with `Format::Ndjson` before constructing the sink.
+    pub value_as_json: bool,
     pub flush: FlushTriggers,
 }
 
@@ -65,6 +70,7 @@ pub struct FilesystemSink {
     dir: PathBuf,
     format: Format,
     compression: ParquetCompression,
+    value_as_json: bool,
     flush: FlushTriggers,
     /// Durable destination position: `max(to) + 1` of files on disk.
     durable_position: u64,
@@ -109,6 +115,7 @@ impl FilesystemSink {
             dir,
             format: cfg.format,
             compression: cfg.compression,
+            value_as_json: cfg.value_as_json,
             flush: cfg.flush,
             durable_position,
             buffer: Vec::new(),
@@ -183,8 +190,13 @@ impl FilesystemSink {
 
         // Encode the whole batch into bytes (NDJSON or Parquet) and
         // write+fsync the temp file.
-        let bytes = mirror_envelope::encode_batch(self.format, self.compression, &self.buffer)
-            .map_err(|e| SinkError::Transport(format!("encode: {e}")))?;
+        let bytes = mirror_envelope::encode_batch(
+            self.format,
+            self.compression,
+            self.value_as_json,
+            &self.buffer,
+        )
+        .map_err(|e| SinkError::Transport(format!("encode: {e}")))?;
         let encoded_len = bytes.len() as u64;
         {
             let mut file = tokio::fs::File::create(&tmp_path)
