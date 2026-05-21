@@ -27,11 +27,26 @@ use mirror_fs::naming;
 use object_store::path::Path;
 use object_store::{ObjectStore, PutMode, PutOptions, PutPayload};
 
+/// Same shape as `mirror_fs::UnixClock`. Tests inject; production
+/// uses [`system_unix_clock`].
+pub type UnixClock = Arc<dyn Fn() -> u64 + Send + Sync>;
+
+fn system_unix_clock() -> UnixClock {
+    Arc::new(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    })
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct FlushTriggers {
     pub max_time: Duration,
     pub max_bytes: u64,
     pub max_offsets: u64,
+    /// Seconds since UTC midnight (0..86400). `None` disables.
+    pub daily_at_utc_seconds: Option<u32>,
 }
 
 pub struct S3SinkConfig {
@@ -56,14 +71,27 @@ pub struct S3Sink {
     buffer_bytes: u64,
     buffer_started: Option<Instant>,
     last_flush_at: Option<Instant>,
+    next_daily_unix: Option<u64>,
+    clock: UnixClock,
 }
 
 impl S3Sink {
     pub async fn open(cfg: S3SinkConfig) -> Result<Self, S3Error> {
+        Self::open_with_clock(cfg, system_unix_clock()).await
+    }
+
+    #[doc(hidden)]
+    pub async fn open_with_clock(cfg: S3SinkConfig, clock: UnixClock) -> Result<Self, S3Error> {
         let partition_prefix =
             build_prefix(cfg.prefix.as_ref(), &cfg.destination_name, cfg.partition);
         let durable_position =
             scan_validate(cfg.store.as_ref(), &partition_prefix, cfg.format).await?;
+        // See mirror-fs::FilesystemSink::open_with_clock for the
+        // naive-vs-smart story.
+        let next_daily_unix = cfg
+            .flush
+            .daily_at_utc_seconds
+            .map(|target| mirror_fs::schedule_next_daily_public(target, (clock)()));
         Ok(Self {
             store: cfg.store,
             partition_prefix,
@@ -75,7 +103,29 @@ impl S3Sink {
             buffer_bytes: 0,
             buffer_started: None,
             last_flush_at: None,
+            next_daily_unix,
+            clock,
         })
+    }
+
+    async fn tick_daily(&mut self) -> Result<(), SinkError> {
+        let Some(next) = self.next_daily_unix else {
+            return Ok(());
+        };
+        let now = (self.clock)();
+        if now < next {
+            return Ok(());
+        }
+        if !self.buffer.is_empty() {
+            self.flush_locked().await?;
+        }
+        let mut t = next;
+        let now = (self.clock)();
+        while now >= t {
+            t += 86_400;
+        }
+        self.next_daily_unix = Some(t);
+        Ok(())
     }
 
     pub async fn flush_now(&mut self) -> Result<(), SinkError> {
@@ -143,10 +193,6 @@ impl S3Sink {
         self.last_flush_at = Some(Instant::now());
 
         let (topic, partition) = mirror_core::current_labels();
-        let unix_now_seconds = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
         metrics::gauge!(
             "mirror_v3_destination_offset_verified",
             "topic" => topic.clone(),
@@ -158,7 +204,7 @@ impl S3Sink {
             "topic" => topic.clone(),
             "partition" => partition.clone(),
         )
-        .set(unix_now_seconds as f64);
+        .set((self.clock)() as f64);
         metrics::counter!(
             "mirror_v3_destination_bytes_total",
             "topic" => topic.clone(),
@@ -190,6 +236,7 @@ impl S3Sink {
 #[async_trait]
 impl Sink for S3Sink {
     async fn next_expected_offset(&mut self) -> Result<u64, SinkError> {
+        self.tick_daily().await?;
         let on_remote = scan_validate(self.store.as_ref(), &self.partition_prefix, self.format)
             .await
             .map_err(|e| SinkError::Transport(e.to_string()))?;
@@ -203,6 +250,7 @@ impl Sink for S3Sink {
     }
 
     async fn write(&mut self, record: Record) -> Result<(), SinkError> {
+        self.tick_daily().await?;
         let expected = self.durable_position + self.buffer.len() as u64;
         if record.source_offset != expected {
             return Err(SinkError::UnexpectedPosition {

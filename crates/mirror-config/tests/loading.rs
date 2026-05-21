@@ -88,6 +88,7 @@ mirrors:
                 max_time_ms: 5000,
                 max_bytes: 1_048_576,
                 max_offsets: 1000,
+                daily: None,
             },
         })
     );
@@ -127,6 +128,7 @@ mirrors:
                 max_time_ms: 60_000,
                 max_bytes: 16_777_216,
                 max_offsets: 10_000,
+                daily: None,
             },
         })
     );

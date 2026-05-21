@@ -132,9 +132,10 @@ pub enum ParquetCompression {
     Uncompressed,
 }
 
-/// Flush triggers for blob-style destinations (Filesystem, S3). All
-/// three must be set; any one tripping causes a flush. Set a value to
-/// a very large number to effectively disable that trigger.
+/// Flush triggers for blob-style destinations (Filesystem, S3). The
+/// three size/time triggers must be set; any one tripping causes a
+/// flush (set to a very large number to effectively disable). The
+/// optional `daily` trigger adds a wall-clock-UTC boundary on top.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct FlushTriggers {
@@ -144,6 +145,120 @@ pub struct FlushTriggers {
     pub max_bytes: u64,
     /// Maximum buffered source offsets before a flush.
     pub max_offsets: u64,
+    /// Optional once-per-day wall-clock-UTC flush boundary.
+    #[serde(default)]
+    pub daily: Option<DailyFlush>,
+}
+
+/// Wall-clock-UTC daily flush boundary. Naive implementation: on
+/// startup, schedule the next future occurrence of `at_utc`; when
+/// the clock crosses it, flush any buffered records and advance to
+/// tomorrow's slot. If the buffer is empty at the boundary, the
+/// slot is silently skipped (no zero-record file).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct DailyFlush {
+    /// UTC wall-clock time of day, `HH:MM` or `HH:MM:SS`.
+    pub at_utc: String,
+    // Future: jitter-ms, debounce-ms, and a smarter restart
+    // schedule that consults the destination's most recent blob
+    // (mtime / last record timestamp) to decide whether the
+    // boundary was already honored across a process bounce.
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum AtUtcError {
+    #[error("at-utc must be HH:MM or HH:MM:SS, got {0:?}")]
+    Format(String),
+    #[error("at-utc out of range (HH 0-23, MM 0-59, SS 0-59), got {0:?}")]
+    Range(String),
+}
+
+impl DailyFlush {
+    /// Parse `at_utc` to seconds since UTC midnight, `0..86400`.
+    pub fn parse_at_utc(&self) -> Result<u32, AtUtcError> {
+        let parts: Vec<&str> = self.at_utc.split(':').collect();
+        let (h_s, m_s, s_s) = match parts.as_slice() {
+            [h, m] => (*h, *m, "0"),
+            [h, m, s] => (*h, *m, *s),
+            _ => return Err(AtUtcError::Format(self.at_utc.clone())),
+        };
+        let h: u32 = h_s
+            .parse()
+            .map_err(|_| AtUtcError::Format(self.at_utc.clone()))?;
+        let m: u32 = m_s
+            .parse()
+            .map_err(|_| AtUtcError::Format(self.at_utc.clone()))?;
+        let s: u32 = s_s
+            .parse()
+            .map_err(|_| AtUtcError::Format(self.at_utc.clone()))?;
+        if h > 23 || m > 59 || s > 59 {
+            return Err(AtUtcError::Range(self.at_utc.clone()));
+        }
+        Ok(h * 3600 + m * 60 + s)
+    }
+}
+
+#[cfg(test)]
+mod daily_tests {
+    use super::*;
+
+    fn d(s: &str) -> DailyFlush {
+        DailyFlush { at_utc: s.into() }
+    }
+
+    #[test]
+    fn parses_hh_mm_ss() {
+        assert_eq!(d("00:00:00").parse_at_utc().unwrap(), 0);
+        assert_eq!(d("00:00:01").parse_at_utc().unwrap(), 1);
+        assert_eq!(d("01:02:03").parse_at_utc().unwrap(), 3723);
+        assert_eq!(d("23:59:59").parse_at_utc().unwrap(), 86399);
+    }
+
+    #[test]
+    fn parses_hh_mm() {
+        assert_eq!(d("00:00").parse_at_utc().unwrap(), 0);
+        assert_eq!(d("12:34").parse_at_utc().unwrap(), 45240);
+        assert_eq!(d("23:59").parse_at_utc().unwrap(), 86340);
+    }
+
+    #[test]
+    fn rejects_out_of_range() {
+        assert!(matches!(
+            d("24:00").parse_at_utc(),
+            Err(AtUtcError::Range(_))
+        ));
+        assert!(matches!(
+            d("00:60").parse_at_utc(),
+            Err(AtUtcError::Range(_))
+        ));
+        assert!(matches!(
+            d("00:00:60").parse_at_utc(),
+            Err(AtUtcError::Range(_))
+        ));
+        assert!(matches!(
+            d("99:99:99").parse_at_utc(),
+            Err(AtUtcError::Range(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_garbage() {
+        assert!(matches!(d("").parse_at_utc(), Err(AtUtcError::Format(_))));
+        assert!(matches!(
+            d("abc").parse_at_utc(),
+            Err(AtUtcError::Format(_))
+        ));
+        assert!(matches!(d("12").parse_at_utc(), Err(AtUtcError::Format(_))));
+        assert!(matches!(
+            d("1:2:3:4").parse_at_utc(),
+            Err(AtUtcError::Format(_))
+        ));
+        assert!(matches!(
+            d("12:").parse_at_utc(),
+            Err(AtUtcError::Format(_))
+        ));
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]

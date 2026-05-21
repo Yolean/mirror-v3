@@ -37,6 +37,7 @@ fn spec(source: &str, root: &std::path::Path, group: &str, max_offsets: u64) -> 
             max_time: Duration::from_secs(3600),
             max_bytes: u64::MAX,
             max_offsets,
+            daily_at_utc_seconds: None,
         },
     }
 }

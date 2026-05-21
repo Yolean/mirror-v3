@@ -24,6 +24,7 @@ fn flush_every(n: u64) -> FlushTriggers {
         max_time: Duration::from_secs(3600),
         max_bytes: u64::MAX,
         max_offsets: n,
+        daily_at_utc_seconds: None,
     }
 }
 

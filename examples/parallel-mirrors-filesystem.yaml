@@ -22,6 +22,10 @@ destination:
     max-time-ms: 5000          # at most 5s of buffering
     max-bytes: 67108864        # or 64 MiB — parquet files want some heft to amortize the footer
     max-offsets: 10000         # or 10k source offsets
+    # Optional: also force a flush at a fixed UTC time each day. If the
+    # buffer is empty at the boundary, the slot is silently skipped.
+    # daily:
+    #   at-utc: "00:00:00"
 
 mirrors:
   - name: operations-p0

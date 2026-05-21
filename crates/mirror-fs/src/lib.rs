@@ -19,6 +19,7 @@
 
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -27,6 +28,16 @@ use mirror_envelope::{Format, ParquetCompression};
 use tokio::io::AsyncWriteExt;
 
 pub mod naming;
+
+/// Unix-seconds clock the sink consults for the daily flush trigger
+/// and for the `last_flush_timestamp_seconds` metric. The default
+/// reads `SystemTime::now()`; tests inject a closure over an
+/// `AtomicU64` via [`FilesystemSink::open_with_clock`].
+pub type UnixClock = Arc<dyn Fn() -> u64 + Send + Sync>;
+
+fn system_unix_clock() -> UnixClock {
+    Arc::new(unix_now_seconds)
+}
 
 #[derive(Debug, Clone)]
 pub struct FilesystemSinkConfig {
@@ -44,6 +55,10 @@ pub struct FlushTriggers {
     pub max_time: Duration,
     pub max_bytes: u64,
     pub max_offsets: u64,
+    /// Seconds since UTC midnight (0..86400). `None` disables the
+    /// daily wall-clock flush boundary. See `mirror_config::DailyFlush`
+    /// for the YAML surface.
+    pub daily_at_utc_seconds: Option<u32>,
 }
 
 pub struct FilesystemSink {
@@ -57,16 +72,39 @@ pub struct FilesystemSink {
     buffer_bytes: u64,
     buffer_started: Option<Instant>,
     last_flush_at: Option<Instant>,
+    /// Absolute unix-seconds for the next daily-flush boundary, or
+    /// `None` when the trigger is disabled.
+    next_daily_unix: Option<u64>,
+    clock: UnixClock,
 }
 
 impl FilesystemSink {
     pub fn open(cfg: FilesystemSinkConfig) -> Result<Self, FsError> {
+        Self::open_with_clock(cfg, system_unix_clock())
+    }
+
+    /// Same as [`open`] but with a caller-supplied clock for tests.
+    /// The clock returns "now" in unix seconds. Not for production.
+    #[doc(hidden)]
+    pub fn open_with_clock(cfg: FilesystemSinkConfig, clock: UnixClock) -> Result<Self, FsError> {
         let dir = naming::partition_dir(&cfg.root, &cfg.destination_name, cfg.partition);
         std::fs::create_dir_all(&dir).map_err(|e| FsError::Io {
             path: dir.clone(),
             source: e,
         })?;
         let durable_position = scan_validate(&dir, cfg.format)?;
+        // NOTE: naive — computes the next future occurrence and
+        // accepts that a mirror down at the boundary silently misses
+        // it for that day. The richer version (planned alongside
+        // debounce) inspects the destination chain (mtime / last
+        // record timestamp) and uses last_flush_at to decide whether
+        // the boundary was already honored. The shape of this
+        // computation — `(target_secs, now) -> next_unix` — does not
+        // change.
+        let next_daily_unix = cfg
+            .flush
+            .daily_at_utc_seconds
+            .map(|target| schedule_next_daily(target, (clock)()));
         Ok(Self {
             dir,
             format: cfg.format,
@@ -77,7 +115,37 @@ impl FilesystemSink {
             buffer_bytes: 0,
             buffer_started: None,
             last_flush_at: None,
+            next_daily_unix,
+            clock,
         })
+    }
+
+    /// If the daily-flush boundary has been crossed, flush any
+    /// buffered records and advance to the next boundary. Called
+    /// from the top of `write` and `next_expected_offset` so both
+    /// the record-arrival and idle-poll paths honor the schedule.
+    async fn tick_daily(&mut self) -> Result<(), SinkError> {
+        let Some(next) = self.next_daily_unix else {
+            return Ok(());
+        };
+        let now = (self.clock)();
+        if now < next {
+            return Ok(());
+        }
+        // Boundary crossed. Flush only if there's data — an empty-
+        // buffer slot is silently skipped (no zero-record file). The
+        // boundary is *always* advanced so we don't fire repeatedly
+        // until tomorrow.
+        if !self.buffer.is_empty() {
+            self.flush_locked().await?;
+        }
+        let mut t = next;
+        let now = (self.clock)();
+        while now >= t {
+            t += 86_400;
+        }
+        self.next_daily_unix = Some(t);
+        Ok(())
     }
 
     pub async fn flush_now(&mut self) -> Result<(), SinkError> {
@@ -165,7 +233,7 @@ impl FilesystemSink {
             "topic" => topic.clone(),
             "partition" => partition.clone(),
         )
-        .set(unix_now_seconds() as f64);
+        .set((self.clock)() as f64);
         metrics::counter!(
             "mirror_v3_destination_bytes_total",
             "topic" => topic.clone(),
@@ -196,6 +264,7 @@ impl FilesystemSink {
 #[async_trait]
 impl Sink for FilesystemSink {
     async fn next_expected_offset(&mut self) -> Result<u64, SinkError> {
+        self.tick_daily().await?;
         let on_disk = scan_validate(&self.dir, self.format)
             .map_err(|e| SinkError::Transport(e.to_string()))?;
         if on_disk != self.durable_position {
@@ -208,6 +277,7 @@ impl Sink for FilesystemSink {
     }
 
     async fn write(&mut self, record: Record) -> Result<(), SinkError> {
+        self.tick_daily().await?;
         let expected = self.durable_position + self.buffer.len() as u64;
         if record.source_offset != expected {
             return Err(SinkError::UnexpectedPosition {
@@ -237,6 +307,28 @@ fn unix_now_seconds() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// Public re-export so `mirror_s3` shares the same scheduling math
+/// without re-implementing it (and inheriting any future changes).
+#[doc(hidden)]
+pub fn schedule_next_daily_public(target_secs: u32, now_unix: u64) -> u64 {
+    schedule_next_daily(target_secs, now_unix)
+}
+
+/// First future unix-seconds at which the daily wall-clock-UTC
+/// boundary should fire, given a target seconds-since-midnight and
+/// the current unix-seconds. Pure math, no I/O — kept as a free
+/// function so the smart-startup variant (which inspects the
+/// destination chain) can replace just this body.
+pub(crate) fn schedule_next_daily(target_secs: u32, now_unix: u64) -> u64 {
+    let midnight = (now_unix / 86_400) * 86_400;
+    let today_target = midnight + target_secs as u64;
+    if now_unix < today_target {
+        today_target
+    } else {
+        today_target + 86_400
+    }
 }
 
 fn record_byte_size(record: &Record) -> u64 {

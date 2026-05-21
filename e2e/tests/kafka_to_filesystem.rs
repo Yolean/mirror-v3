@@ -51,6 +51,7 @@ async fn mirrors_to_filesystem_with_offset_named_files() {
         max_time: Duration::from_secs(3600),
         max_bytes: u64::MAX,
         max_offsets: 10,
+        daily_at_utc_seconds: None,
     };
     let mirror = spawn_kafka_to_filesystem(FsMirrorSpec {
         source_bootstrap: source.clone(),

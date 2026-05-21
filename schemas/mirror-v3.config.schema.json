@@ -192,7 +192,7 @@
       ]
     },
     "FlushTriggers": {
-      "description": "Flush triggers for blob-style destinations (Filesystem, S3). All\nthree must be set; any one tripping causes a flush. Set a value to\na very large number to effectively disable that trigger.",
+      "description": "Flush triggers for blob-style destinations (Filesystem, S3). The\nthree size/time triggers must be set; any one tripping causes a\nflush (set to a very large number to effectively disable). The\noptional `daily` trigger adds a wall-clock-UTC boundary on top.",
       "type": "object",
       "properties": {
         "max-time-ms": {
@@ -212,6 +212,18 @@
           "type": "integer",
           "format": "uint64",
           "minimum": 0
+        },
+        "daily": {
+          "description": "Optional once-per-day wall-clock-UTC flush boundary.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DailyFlush"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         }
       },
       "additionalProperties": false,
@@ -219,6 +231,20 @@
         "max-time-ms",
         "max-bytes",
         "max-offsets"
+      ]
+    },
+    "DailyFlush": {
+      "description": "Wall-clock-UTC daily flush boundary. Naive implementation: on\nstartup, schedule the next future occurrence of `at_utc`; when\nthe clock crosses it, flush any buffered records and advance to\ntomorrow's slot. If the buffer is empty at the boundary, the\nslot is silently skipped (no zero-record file).",
+      "type": "object",
+      "properties": {
+        "at-utc": {
+          "description": "UTC wall-clock time of day, `HH:MM` or `HH:MM:SS`.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "at-utc"
       ]
     },
     "Mirror": {

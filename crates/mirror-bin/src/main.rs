@@ -172,6 +172,19 @@ fn timestamp_mode_to_kafka(m: mirror_config::TimestampMode) -> mirror_kafka::Tim
     }
 }
 
+/// Translate an optional `daily:` block into seconds-since-midnight
+/// or an actionable error at config-load time (so a bad `at-utc`
+/// fails fast, not on the first record).
+fn daily_to_seconds(d: &Option<mirror_config::DailyFlush>) -> Result<Option<u32>> {
+    match d {
+        None => Ok(None),
+        Some(d) => d
+            .parse_at_utc()
+            .map(Some)
+            .map_err(|e| anyhow::anyhow!("daily.at-utc: {e}")),
+    }
+}
+
 #[derive(Debug, serde::Serialize)]
 struct StatusRow {
     name: String,
@@ -273,6 +286,7 @@ async fn query_destination_next(mirror: &Mirror, destination: &Destination) -> R
                     max_time: std::time::Duration::from_millis(fs.flush.max_time_ms),
                     max_bytes: fs.flush.max_bytes,
                     max_offsets: fs.flush.max_offsets,
+                    daily_at_utc_seconds: daily_to_seconds(&fs.flush.daily)?,
                 },
             };
             let mut sink = FilesystemSink::open(cfg).map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -302,6 +316,7 @@ async fn query_destination_next(mirror: &Mirror, destination: &Destination) -> R
                     max_time: std::time::Duration::from_millis(s3.flush.max_time_ms),
                     max_bytes: s3.flush.max_bytes,
                     max_offsets: s3.flush.max_offsets,
+                    daily_at_utc_seconds: daily_to_seconds(&s3.flush.daily)?,
                 },
             };
             let mut sink = S3Sink::open(cfg)
@@ -490,6 +505,7 @@ fn spawn_mirror(
                     max_time: std::time::Duration::from_millis(fs.flush.max_time_ms),
                     max_bytes: fs.flush.max_bytes,
                     max_offsets: fs.flush.max_offsets,
+                    daily_at_utc_seconds: daily_to_seconds(&fs.flush.daily)?,
                 },
             };
             let sink = FilesystemSink::open(sink_cfg)
@@ -532,6 +548,7 @@ fn spawn_mirror(
                     max_time: std::time::Duration::from_millis(s3.flush.max_time_ms),
                     max_bytes: s3.flush.max_bytes,
                     max_offsets: s3.flush.max_offsets,
+                    daily_at_utc_seconds: daily_to_seconds(&s3.flush.daily)?,
                 },
             };
             Ok(tokio::spawn(async move {

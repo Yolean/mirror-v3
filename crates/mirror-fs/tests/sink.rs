@@ -36,6 +36,7 @@ fn cfg(root: &std::path::Path, max_offsets: u64) -> FilesystemSinkConfig {
             max_time: Duration::from_secs(3600),
             max_bytes: u64::MAX,
             max_offsets,
+            daily_at_utc_seconds: None,
         },
     }
 }
@@ -170,6 +171,143 @@ async fn corrupt_chain_is_rejected() {
     assert!(
         msg.contains("gap or overlap") || msg.contains("corrupt"),
         "got {msg}"
+    );
+}
+
+// --- daily-flush tests (clock-injected) ---
+
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+
+/// Returns (atomic clock, clock-fn handle). Tests mutate the atomic
+/// to advance wall-clock time without `tokio::time::sleep`.
+fn injected_clock(initial: u64) -> (Arc<AtomicU64>, mirror_fs::UnixClock) {
+    let val = Arc::new(AtomicU64::new(initial));
+    let val2 = Arc::clone(&val);
+    let f: mirror_fs::UnixClock = Arc::new(move || val2.load(Ordering::SeqCst));
+    (val, f)
+}
+
+fn cfg_with_daily(root: &std::path::Path, target_secs: u32) -> FilesystemSinkConfig {
+    let mut c = cfg(root, 1000); // large max_offsets so only daily can trip
+    c.flush.daily_at_utc_seconds = Some(target_secs);
+    c
+}
+
+fn files_in(root: &std::path::Path) -> Vec<String> {
+    let dir = root.join("ops").join("0");
+    if !dir.exists() {
+        return Vec::new();
+    }
+    let mut out: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| !n.contains(".tmp."))
+        .collect();
+    out.sort();
+    out
+}
+
+#[tokio::test]
+async fn daily_flush_trips_when_clock_crosses_boundary() {
+    let tmp = tempfile::tempdir().unwrap();
+    // 23:55:00 UTC today; daily target = 00:00:00 UTC (= 86400 absolute)
+    let (clock_val, clock) = injected_clock(23 * 3600 + 55 * 60);
+    let mut sink = FilesystemSink::open_with_clock(cfg_with_daily(tmp.path(), 0), clock).unwrap();
+
+    sink.write(rec(0)).await.unwrap();
+    sink.write(rec(1)).await.unwrap();
+    assert!(files_in(tmp.path()).is_empty(), "no flush before boundary");
+
+    // Jump past midnight UTC.
+    clock_val.store(86_400 + 5, Ordering::SeqCst);
+    // tick_daily runs at the top of write, flushes records 0+1, then
+    // appends record 2 into an empty buffer for tomorrow's batch.
+    sink.write(rec(2)).await.unwrap();
+
+    let records = read_all_records(
+        &tmp.path().join("ops").join("0"),
+        mirror_envelope::Format::Ndjson,
+    )
+    .unwrap();
+    assert_eq!(
+        records.iter().map(|r| r.source_offset).collect::<Vec<_>>(),
+        vec![0, 1],
+        "boundary flush carries records buffered before midnight"
+    );
+    assert_eq!(
+        files_in(tmp.path()),
+        vec!["00000000000000000000-00000000000000000001.ndjson"]
+    );
+}
+
+#[tokio::test]
+async fn daily_flush_with_empty_buffer_skips_silently_and_advances() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (clock_val, clock) = injected_clock(23 * 3600 + 55 * 60);
+    let mut sink = FilesystemSink::open_with_clock(cfg_with_daily(tmp.path(), 0), clock).unwrap();
+
+    // No writes. Cross midnight. tick_daily on the idle-poll path
+    // (next_expected_offset) should advance the boundary but not
+    // produce a zero-record file.
+    clock_val.store(86_400 + 5, Ordering::SeqCst);
+    let _ = sink.next_expected_offset().await.unwrap();
+    assert!(files_in(tmp.path()).is_empty(), "empty buffer => no file");
+
+    // A record arriving 5s after the boundary now sits in the
+    // buffer waiting for the *next* trigger (tomorrow's midnight,
+    // or max-*). Today's slot is gone.
+    sink.write(rec(0)).await.unwrap();
+    assert!(files_in(tmp.path()).is_empty(), "no premature flush");
+    sink.flush_now().await.unwrap();
+    let recs = read_all_records(
+        &tmp.path().join("ops").join("0"),
+        mirror_envelope::Format::Ndjson,
+    )
+    .unwrap();
+    assert_eq!(recs.len(), 1);
+}
+
+#[tokio::test]
+async fn daily_flush_skips_correctly_across_a_multi_day_jump() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (clock_val, clock) = injected_clock(23 * 3600);
+    let mut sink = FilesystemSink::open_with_clock(cfg_with_daily(tmp.path(), 0), clock).unwrap();
+
+    sink.write(rec(0)).await.unwrap();
+    // Jump three days forward.
+    clock_val.store(3 * 86_400 + 10, Ordering::SeqCst);
+    sink.write(rec(1)).await.unwrap();
+
+    // tick_daily flushes the pre-jump buffer ([0]) exactly once and
+    // advances next_daily past the new "now" — we don't fire again
+    // per skipped day.
+    let records = read_all_records(
+        &tmp.path().join("ops").join("0"),
+        mirror_envelope::Format::Ndjson,
+    )
+    .unwrap();
+    assert_eq!(
+        records.iter().map(|r| r.source_offset).collect::<Vec<_>>(),
+        vec![0]
+    );
+    assert_eq!(files_in(tmp.path()).len(), 1);
+}
+
+#[tokio::test]
+async fn no_daily_trigger_means_midnight_crossing_does_not_flush() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (clock_val, clock) = injected_clock(23 * 3600);
+    let mut sink = FilesystemSink::open_with_clock(cfg(tmp.path(), 1000), clock).unwrap();
+
+    sink.write(rec(0)).await.unwrap();
+    clock_val.store(2 * 86_400, Ordering::SeqCst);
+    sink.write(rec(1)).await.unwrap();
+
+    assert!(
+        files_in(tmp.path()).is_empty(),
+        "with daily disabled, crossing midnight must not trigger a flush"
     );
 }
 

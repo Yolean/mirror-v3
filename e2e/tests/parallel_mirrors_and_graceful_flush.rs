@@ -57,6 +57,7 @@ async fn two_mirrors_run_in_parallel_and_flush_on_shutdown() {
         max_time: Duration::from_secs(3600),
         max_bytes: u64::MAX,
         max_offsets: 10,
+        daily_at_utc_seconds: None,
     };
 
     let m0 = spawn_kafka_to_filesystem(FsMirrorSpec {

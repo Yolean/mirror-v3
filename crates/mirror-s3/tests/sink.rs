@@ -38,6 +38,7 @@ fn cfg(store: Arc<dyn ObjectStore>, max_offsets: u64) -> S3SinkConfig {
             max_time: Duration::from_secs(3600),
             max_bytes: u64::MAX,
             max_offsets,
+            daily_at_utc_seconds: None,
         },
     }
 }
@@ -146,6 +147,7 @@ async fn put_mode_create_rejects_overwrite() {
             max_time: Duration::from_secs(3600),
             max_bytes: u64::MAX,
             max_offsets: 100,
+            daily_at_utc_seconds: None,
         },
     })
     .await
