@@ -40,6 +40,7 @@ fn spec(source: &str, root: &std::path::Path, group: &str, flush: FlushTriggers)
         compression: mirror_envelope::ParquetCompression::Zstd1,
         value_as_json: false,
         key_type: mirror_envelope::KeyType::Utf8,
+        compaction: None,
         flush,
     }
 }
@@ -188,6 +189,7 @@ async fn two_writers_with_different_flush_triggers_are_caught() {
         compression: mirror_envelope::ParquetCompression::Zstd1,
         value_as_json: false,
         key_type: mirror_envelope::KeyType::Utf8,
+        compaction: None,
         flush: flush_every(10),
     });
 

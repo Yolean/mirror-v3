@@ -36,6 +36,7 @@ fn cfg(store: Arc<dyn ObjectStore>, max_offsets: u64) -> S3SinkConfig {
         compression: ParquetCompression::Zstd1,
         value_as_json: false,
         key_type: mirror_envelope::KeyType::Utf8,
+        compaction: None,
         flush: FlushTriggers {
             max_time: Duration::from_secs(3600),
             max_bytes: u64::MAX,
@@ -147,6 +148,7 @@ async fn put_mode_create_rejects_overwrite() {
         compression: ParquetCompression::Zstd1,
         value_as_json: false,
         key_type: mirror_envelope::KeyType::Utf8,
+        compaction: None,
         flush: FlushTriggers {
             max_time: Duration::from_secs(3600),
             max_bytes: u64::MAX,
@@ -206,4 +208,81 @@ async fn corrupt_chain_is_rejected_on_open() {
             || format!("{err}").to_lowercase().contains("corrupt"),
         "got {err}"
     );
+}
+
+// ---------- compaction tests ----------
+
+fn cfg_compacted(store: Arc<dyn ObjectStore>, max_offsets: u64) -> S3SinkConfig {
+    S3SinkConfig {
+        store,
+        prefix: Some(Path::from("archive")),
+        destination_name: "ops".into(),
+        partition: 0,
+        format: Format::Parquet,
+        compression: ParquetCompression::Zstd1,
+        value_as_json: false,
+        key_type: mirror_envelope::KeyType::Utf8,
+        compaction: Some(mirror_s3::CompactionMode::Log),
+        flush: FlushTriggers {
+            max_time: Duration::from_secs(3600),
+            max_bytes: u64::MAX,
+            max_offsets,
+            daily_at_utc_seconds: None,
+        },
+    }
+}
+
+fn rec_kv(offset: u64, key: &str, value: Option<&str>) -> Record {
+    Record {
+        topic: "s3-test".into(),
+        partition: 0,
+        source_offset: offset,
+        timestamp_ms: Some(1_700_000_000_000 + offset as i64),
+        timestamp_type: TimestampType::CreateTime,
+        key: Some(key.as_bytes().to_vec()),
+        value: value.map(|s| s.as_bytes().to_vec()),
+        headers: vec![],
+    }
+}
+
+#[tokio::test]
+async fn compaction_emits_one_object_per_flush_with_full_view() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let mut sink = S3Sink::open(cfg_compacted(Arc::clone(&store), 4))
+        .await
+        .unwrap();
+    sink.write(rec_kv(0, "k1", Some("v1a"))).await.unwrap();
+    sink.write(rec_kv(1, "k2", Some("v2"))).await.unwrap();
+    sink.write(rec_kv(2, "k1", Some("v1b"))).await.unwrap();
+    sink.write(rec_kv(3, "k3", Some("v3"))).await.unwrap(); // triggers flush
+    let names = list_names(store.as_ref(), &Path::from("archive/ops/0")).await;
+    assert_eq!(names.len(), 1, "one snapshot expected: {names:?}");
+}
+
+#[tokio::test]
+async fn compaction_restart_resumes_at_latest_to_plus_one() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    {
+        let mut sink = S3Sink::open(cfg_compacted(Arc::clone(&store), 2))
+            .await
+            .unwrap();
+        sink.write(rec_kv(0, "k1", Some("v1"))).await.unwrap();
+        sink.write(rec_kv(1, "k2", Some("v2"))).await.unwrap(); // flush 0-1
+    }
+    let mut restarted = S3Sink::open(cfg_compacted(Arc::clone(&store), 2))
+        .await
+        .unwrap();
+    assert_eq!(restarted.next_expected_offset().await.unwrap(), 2);
+}
+
+#[tokio::test]
+async fn compaction_rejects_null_key_at_write() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let mut sink = S3Sink::open(cfg_compacted(Arc::clone(&store), 100))
+        .await
+        .unwrap();
+    let mut r = rec_kv(0, "x", Some("v"));
+    r.key = None;
+    let err = sink.write(r).await.expect_err("null key must be rejected");
+    assert!(format!("{err}").contains("null"), "got: {err}");
 }

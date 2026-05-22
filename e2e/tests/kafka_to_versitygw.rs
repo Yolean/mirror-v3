@@ -84,6 +84,7 @@ async fn mirrors_to_versitygw_with_offset_named_objects() {
         compression: mirror_envelope::ParquetCompression::Zstd1,
         value_as_json: false,
         key_type: mirror_envelope::KeyType::Utf8,
+        compaction: None,
         flush,
     })
     .await
@@ -142,6 +143,7 @@ async fn mirrors_to_versitygw_with_offset_named_objects() {
         compression: mirror_envelope::ParquetCompression::Zstd1,
         value_as_json: false,
         key_type: mirror_envelope::KeyType::Utf8,
+        compaction: None,
         flush,
     })
     .await

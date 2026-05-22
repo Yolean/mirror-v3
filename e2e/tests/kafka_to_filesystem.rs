@@ -64,6 +64,7 @@ async fn mirrors_to_filesystem_with_offset_named_files() {
         compression: mirror_envelope::ParquetCompression::Zstd1,
         value_as_json: false,
         key_type: mirror_envelope::KeyType::Utf8,
+        compaction: None,
         flush,
     })
     .expect("spawn mirror");
@@ -129,6 +130,7 @@ async fn mirrors_to_filesystem_with_offset_named_files() {
         compression: mirror_envelope::ParquetCompression::Zstd1,
         value_as_json: false,
         key_type: mirror_envelope::KeyType::Utf8,
+        compaction: None,
         flush,
     })
     .expect("reopen");

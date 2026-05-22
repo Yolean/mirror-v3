@@ -73,6 +73,18 @@
               "$ref": "#/$defs/KeyType",
               "default": "utf8"
             },
+            "compaction": {
+              "description": "Opt-in log-compaction mode. `null` (default) leaves the sink\nin append mode. `log` switches to Kafka-style key-based\ncompaction: each Parquet file is a full materialized snapshot\nof the latest value per key. Requires `format = parquet` and\n`key-type = utf8`.",
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Compaction"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null
+            },
             "flush": {
               "$ref": "#/$defs/FlushTriggers"
             },
@@ -132,6 +144,18 @@
               "description": "Key storage representation. See `FilesystemDestination::key_type`.",
               "$ref": "#/$defs/KeyType",
               "default": "utf8"
+            },
+            "compaction": {
+              "description": "Log-compaction mode. See `FilesystemDestination::compaction`.",
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Compaction"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null
             },
             "flush": {
               "$ref": "#/$defs/FlushTriggers"
@@ -220,9 +244,19 @@
           "const": "utf8"
         },
         {
-          "description": "Keys are opaque bytes — no validation. Parquet column type:\n`LargeBinary`. Required for non-UTF-8 keys (e.g. protobuf-keyed\ntopics).",
+          "description": "Keys are opaque bytes — no validation. Parquet column type:\n`LargeBinary`. Required for non-UTF-8 keys (e.g. protobuf-keyed\ntopics). Incompatible with `compaction = log`.",
           "type": "string",
           "const": "binary"
+        }
+      ]
+    },
+    "Compaction": {
+      "description": "Compaction strategy. Reserved for future variants (e.g. windowed,\nrange). Default is \"no compaction\" (omit the field).",
+      "oneOf": [
+        {
+          "description": "Kafka-style log compaction: keep the latest value per key.\nEach Parquet file is a full materialized snapshot. Null-value\nrecords are interpreted as tombstones (the key is removed\nfrom the materialized view). Null and non-UTF-8 keys are hard\nerrors at encode time.",
+          "type": "string",
+          "const": "log"
         }
       ]
     },

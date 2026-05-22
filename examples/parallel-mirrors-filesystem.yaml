@@ -24,6 +24,18 @@ destination:
   # values become a hard error. Useful for DuckDB / Athena consumers
   # that want VARCHAR / JSON straight from the schema.
   # json: true
+  # Key storage representation. Defaults to `utf8` — the Parquet column
+  # is `key: Utf8` (readable as VARCHAR) and non-UTF-8 keys are a hard
+  # error at encode. Use `binary` for protobuf-keyed topics or anything
+  # else with raw byte keys.
+  # key-type: utf8
+  # Opt-in: Kafka-style log compaction. Each Parquet file is a full
+  # materialized snapshot of the latest value per key; null-value
+  # records are tombstones; null/non-UTF-8 keys are hard errors at
+  # encode. Requires `format: parquet` and `key-type: utf8` (default).
+  # On restart the latest snapshot bootstraps the in-memory view; old
+  # snapshots can be GC'd out-of-band (e.g. `find ... -mtime +N -delete`).
+  # compaction: log
   flush:
     max-time-ms: 5000          # at most 5s of buffering
     max-bytes: 67108864        # or 64 MiB — parquet files want some heft to amortize the footer

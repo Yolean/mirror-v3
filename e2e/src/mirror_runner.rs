@@ -106,6 +106,7 @@ pub struct FsMirrorSpec {
     pub compression: mirror_envelope::ParquetCompression,
     pub value_as_json: bool,
     pub key_type: mirror_envelope::KeyType,
+    pub compaction: Option<mirror_fs::CompactionMode>,
     pub flush: mirror_fs::FlushTriggers,
 }
 
@@ -133,6 +134,7 @@ impl FsMirrorSpec {
             compression: mirror_envelope::ParquetCompression::Zstd1,
             value_as_json: false,
             key_type: mirror_envelope::KeyType::Utf8,
+            compaction: None,
             flush,
         }
     }
@@ -158,6 +160,7 @@ pub fn spawn_kafka_to_filesystem(spec: FsMirrorSpec) -> Result<MirrorHandle> {
         compression: spec.compression,
         value_as_json: spec.value_as_json,
         key_type: spec.key_type,
+        compaction: spec.compaction,
         flush: spec.flush,
     };
     let sink = FilesystemSink::open(sink_cfg).context("open FilesystemSink")?;
@@ -178,6 +181,7 @@ pub struct S3MirrorSpec {
     pub compression: mirror_envelope::ParquetCompression,
     pub value_as_json: bool,
     pub key_type: mirror_envelope::KeyType,
+    pub compaction: Option<mirror_s3::CompactionMode>,
     pub flush: mirror_s3::FlushTriggers,
 }
 
@@ -202,6 +206,7 @@ pub async fn spawn_kafka_to_s3(spec: S3MirrorSpec) -> Result<MirrorHandle> {
         compression: spec.compression,
         value_as_json: spec.value_as_json,
         key_type: spec.key_type,
+        compaction: spec.compaction,
         flush: spec.flush,
     };
     let sink = S3Sink::open(sink_cfg).await.context("open S3Sink")?;

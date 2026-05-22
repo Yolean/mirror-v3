@@ -15,6 +15,7 @@
 //! names, sort, and require a contiguous chain from 0. Anything else
 //! is a hard error.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -62,9 +63,20 @@ pub struct S3SinkConfig {
     /// non-UTF-8 values are a hard error. Caller must reject this
     /// combined with `Format::Ndjson` before constructing the sink.
     pub value_as_json: bool,
-    /// Storage representation for the record `key`.
+    /// Storage representation for the record `key`. Compaction requires Utf8.
     pub key_type: KeyType,
+    /// Optional log-compaction mode. See `mirror_fs::CompactionMode`.
+    /// Caller must combine `Some(Log)` with `Format::Parquet` and
+    /// `KeyType::Utf8`.
+    pub compaction: Option<CompactionMode>,
     pub flush: FlushTriggers,
+}
+
+/// Log-compaction variant. Re-exported alias of the type used by
+/// `mirror-fs`; today's only variant is `Log` (Kafka-style LWW).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompactionMode {
+    Log,
 }
 
 pub struct S3Sink {
@@ -74,12 +86,14 @@ pub struct S3Sink {
     compression: ParquetCompression,
     value_as_json: bool,
     key_type: KeyType,
+    compaction: Option<CompactionMode>,
     flush: FlushTriggers,
     durable_position: u64,
     buffer: Vec<Record>,
     buffer_bytes: u64,
     buffer_started: Option<Instant>,
     last_flush_at: Option<Instant>,
+    view: Option<BTreeMap<String, Record>>,
     next_daily_unix: Option<u64>,
     clock: UnixClock,
 }
@@ -93,8 +107,23 @@ impl S3Sink {
     pub async fn open_with_clock(cfg: S3SinkConfig, clock: UnixClock) -> Result<Self, S3Error> {
         let partition_prefix =
             build_prefix(cfg.prefix.as_ref(), &cfg.destination_name, cfg.partition);
-        let durable_position =
-            scan_validate(cfg.store.as_ref(), &partition_prefix, cfg.format).await?;
+        let (durable_position, view) = match cfg.compaction {
+            None => (
+                scan_validate(cfg.store.as_ref(), &partition_prefix, cfg.format).await?,
+                None,
+            ),
+            Some(CompactionMode::Log) => {
+                let (pos, latest) =
+                    scan_validate_compacted(cfg.store.as_ref(), &partition_prefix, cfg.format)
+                        .await?;
+                let view = match latest {
+                    None => BTreeMap::new(),
+                    Some(path) => load_view(cfg.store.as_ref(), &path, cfg.format).await?,
+                };
+                report_compaction_keys(view.len());
+                (pos, Some(view))
+            }
+        };
         // See mirror-fs::FilesystemSink::open_with_clock for the
         // naive-vs-smart story.
         let next_daily_unix = cfg
@@ -108,12 +137,14 @@ impl S3Sink {
             compression: cfg.compression,
             value_as_json: cfg.value_as_json,
             key_type: cfg.key_type,
+            compaction: cfg.compaction,
             flush: cfg.flush,
             durable_position,
             buffer: Vec::new(),
             buffer_bytes: 0,
             buffer_started: None,
             last_flush_at: None,
+            view,
             next_daily_unix,
             clock,
         })
@@ -168,12 +199,30 @@ impl S3Sink {
         let name = naming::batch_filename(from, to, self.format.extension());
         let path = child_of(&self.partition_prefix, &name);
 
+        let to_encode: Vec<Record> = match (self.compaction, self.view.as_mut()) {
+            (Some(CompactionMode::Log), Some(view)) => {
+                for r in self.buffer.drain(..) {
+                    let key_bytes = r.key.as_ref().expect("compaction write rejects null key");
+                    let key_str = std::str::from_utf8(key_bytes)
+                        .expect("compaction write rejects non-UTF-8 key")
+                        .to_string();
+                    if r.value.is_none() {
+                        view.remove(&key_str);
+                    } else {
+                        view.insert(key_str, r);
+                    }
+                }
+                report_compaction_keys(view.len());
+                view.values().cloned().collect()
+            }
+            _ => std::mem::take(&mut self.buffer),
+        };
         let bytes = mirror_envelope::encode_batch(
             self.format,
             self.compression,
             self.value_as_json,
             self.key_type,
-            &self.buffer,
+            &to_encode,
         )
         .map_err(|e| SinkError::Transport(format!("encode: {e}")))?;
         let encoded_bytes = bytes.len() as u64;
@@ -254,9 +303,21 @@ impl S3Sink {
 impl Sink for S3Sink {
     async fn next_expected_offset(&mut self) -> Result<u64, SinkError> {
         self.tick_daily().await?;
-        let on_remote = scan_validate(self.store.as_ref(), &self.partition_prefix, self.format)
-            .await
-            .map_err(|e| SinkError::Transport(e.to_string()))?;
+        let on_remote = match self.compaction {
+            None => scan_validate(self.store.as_ref(), &self.partition_prefix, self.format)
+                .await
+                .map_err(|e| SinkError::Transport(e.to_string()))?,
+            Some(CompactionMode::Log) => {
+                let (pos, _) = scan_validate_compacted(
+                    self.store.as_ref(),
+                    &self.partition_prefix,
+                    self.format,
+                )
+                .await
+                .map_err(|e| SinkError::Transport(e.to_string()))?;
+                pos
+            }
+        };
         if on_remote != self.durable_position {
             return Err(SinkError::UnexpectedPosition {
                 expected: self.durable_position,
@@ -274,6 +335,26 @@ impl Sink for S3Sink {
                 expected,
                 actual: record.source_offset,
             });
+        }
+        if matches!(self.compaction, Some(CompactionMode::Log)) {
+            match &record.key {
+                None => {
+                    return Err(SinkError::Transport(format!(
+                        "compaction=log requires a non-null key; \
+                         record at source offset {} has key=null",
+                        record.source_offset
+                    )));
+                }
+                Some(k) => {
+                    if std::str::from_utf8(k).is_err() {
+                        return Err(SinkError::Transport(format!(
+                            "compaction=log requires a UTF-8 key; \
+                             record at source offset {} has non-UTF-8 key",
+                            record.source_offset
+                        )));
+                    }
+                }
+            }
         }
         self.buffer_bytes += record_byte_size(&record);
         self.buffer.push(record);
@@ -363,6 +444,99 @@ async fn scan_validate(
         expected_next = to + 1;
     }
     Ok(expected_next)
+}
+
+/// Compaction-mode scan-validate: gaps allowed (out-of-band GC),
+/// overlaps and duplicate `to` rejected. Returns durable_position
+/// (`max(to) + 1`) and the path to the latest snapshot if any exists.
+async fn scan_validate_compacted(
+    store: &dyn ObjectStore,
+    prefix: &Path,
+    format: Format,
+) -> Result<(u64, Option<Path>), S3Error> {
+    let expected_ext = format.extension();
+    let mut entries: Vec<(u64, u64, Path)> = Vec::new();
+    let mut stream = store.list(Some(prefix));
+    while let Some(meta) = stream.next().await {
+        let meta = meta.map_err(|e| S3Error::Store(e.to_string()))?;
+        let name = meta
+            .location
+            .filename()
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        if name.is_empty() || name.contains(".tmp.") {
+            continue;
+        }
+        if let Some(other_ext) = file_extension(&name) {
+            if other_ext != expected_ext && naming::parse_filename(&name, other_ext).is_some() {
+                return Err(S3Error::CorruptChain(format!(
+                    "{name}: extension '{other_ext}' does not match configured format \
+                     '{expected_ext}'"
+                )));
+            }
+        }
+        if let Some((from, to)) = naming::parse_filename(&name, expected_ext) {
+            if to < from {
+                return Err(S3Error::CorruptChain(format!("{name}: to < from")));
+            }
+            entries.push((from, to, meta.location.clone()));
+        }
+    }
+    entries.sort_by_key(|(_, to, _)| *to);
+    let mut prev_to: Option<u64> = None;
+    for (from, to, _) in &entries {
+        if let Some(p) = prev_to {
+            if *from <= p {
+                return Err(S3Error::CorruptChain(format!(
+                    "overlap in compaction chain: {from}-{to} overlaps prior to={p}"
+                )));
+            }
+        }
+        prev_to = Some(*to);
+    }
+    let durable = prev_to.map(|t| t + 1).unwrap_or(0);
+    let latest = entries.into_iter().next_back().map(|(_, _, p)| p);
+    Ok((durable, latest))
+}
+
+async fn load_view(
+    store: &dyn ObjectStore,
+    path: &Path,
+    format: Format,
+) -> Result<BTreeMap<String, Record>, S3Error> {
+    let got = store
+        .get(path)
+        .await
+        .map_err(|e| S3Error::Store(format!("get {path}: {e}")))?;
+    let bytes = got
+        .bytes()
+        .await
+        .map_err(|e| S3Error::Store(format!("read {path}: {e}")))?;
+    let records = mirror_envelope::decode_batch(format, &bytes)
+        .map_err(|e| S3Error::CorruptChain(format!("decode {path}: {e}")))?;
+    let mut view = BTreeMap::new();
+    for r in records {
+        let key_bytes = r.key.as_ref().ok_or_else(|| {
+            S3Error::CorruptChain(format!("{path}: null key in compacted snapshot"))
+        })?;
+        let key_str = std::str::from_utf8(key_bytes)
+            .map_err(|_| {
+                S3Error::CorruptChain(format!("{path}: non-UTF-8 key in compacted snapshot"))
+            })?
+            .to_string();
+        view.insert(key_str, r);
+    }
+    Ok(view)
+}
+
+fn report_compaction_keys(n: usize) {
+    let (topic, partition) = mirror_core::current_labels();
+    metrics::gauge!(
+        "mirror_v3_destination_compaction_keys",
+        "topic" => topic,
+        "partition" => partition,
+    )
+    .set(n as f64);
 }
 
 #[derive(Debug, thiserror::Error)]

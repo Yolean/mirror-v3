@@ -1,7 +1,7 @@
 use mirror_config::{
-    load_from_str, Config, Destination, DestinationFormat, FilesystemDestination, FlushTriggers,
-    KafkaDestination, KafkaSource, KeyType, Mirror, ParquetCompression, S3Destination,
-    TimestampMode,
+    load_from_str, Compaction, Config, Destination, DestinationFormat, FilesystemDestination,
+    FlushTriggers, KafkaDestination, KafkaSource, KeyType, Mirror, ParquetCompression,
+    S3Destination, TimestampMode,
 };
 use std::path::PathBuf;
 
@@ -87,6 +87,7 @@ mirrors:
             compression: ParquetCompression::default(),
             json: false,
             key_type: KeyType::default(),
+            compaction: None,
             flush: FlushTriggers {
                 max_time_ms: 5000,
                 max_bytes: 1_048_576,
@@ -129,6 +130,7 @@ mirrors:
             compression: ParquetCompression::default(),
             json: false,
             key_type: KeyType::default(),
+            compaction: None,
             flush: FlushTriggers {
                 max_time_ms: 60_000,
                 max_bytes: 16_777_216,
@@ -218,6 +220,87 @@ mirrors:
 }
 
 #[test]
+fn compaction_log_requires_parquet_format() {
+    let yaml = r#"
+destination:
+  type: filesystem
+  root: /tmp/mirror
+  format: ndjson
+  compaction: log
+  flush:
+    max-time-ms: 5000
+    max-bytes: 1000
+    max-offsets: 100
+mirrors:
+  - name: operations
+    source:
+      bootstrap-servers: kafka:9092
+    topic: ops
+    partition: 0
+"#;
+    let err = load_from_str(yaml).expect_err("compaction=log + ndjson must be rejected");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("compaction") && msg.contains("parquet"),
+        "got: {msg}"
+    );
+}
+
+#[test]
+fn compaction_log_requires_utf8_keys() {
+    let yaml = r#"
+destination:
+  type: filesystem
+  root: /tmp/mirror
+  format: parquet
+  key-type: binary
+  compaction: log
+  flush:
+    max-time-ms: 5000
+    max-bytes: 1000
+    max-offsets: 100
+mirrors:
+  - name: operations
+    source:
+      bootstrap-servers: kafka:9092
+    topic: ops
+    partition: 0
+"#;
+    let err = load_from_str(yaml).expect_err("compaction=log + binary keys must be rejected");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("compaction") && msg.contains("utf8"),
+        "got: {msg}"
+    );
+}
+
+#[test]
+fn compaction_log_with_parquet_and_default_keys_parses() {
+    let yaml = r#"
+destination:
+  type: filesystem
+  root: /tmp/mirror
+  compaction: log
+  flush:
+    max-time-ms: 5000
+    max-bytes: 1000
+    max-offsets: 100
+mirrors:
+  - name: operations
+    source:
+      bootstrap-servers: kafka:9092
+    topic: ops
+    partition: 0
+"#;
+    let cfg = load_from_str(yaml).expect("must parse");
+    let Destination::Filesystem(fs) = cfg.destination else {
+        panic!("expected filesystem destination");
+    };
+    assert_eq!(fs.compaction, Some(Compaction::Log));
+    assert_eq!(fs.key_type, KeyType::Utf8);
+}
+
+#[test]
 fn key_type_binary_parses() {
     let yaml = r#"
 destination:
@@ -240,6 +323,7 @@ mirrors:
         panic!("expected filesystem destination");
     };
     assert_eq!(fs.key_type, KeyType::Binary);
+    assert_eq!(fs.compaction, None);
 }
 
 #[test]

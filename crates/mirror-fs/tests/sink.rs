@@ -34,6 +34,7 @@ fn cfg(root: &std::path::Path, max_offsets: u64) -> FilesystemSinkConfig {
         compression: ParquetCompression::Zstd1,
         value_as_json: false,
         key_type: mirror_envelope::KeyType::Utf8,
+        compaction: None,
         flush: FlushTriggers {
             max_time: Duration::from_secs(3600),
             max_bytes: u64::MAX,
@@ -328,4 +329,207 @@ async fn flush_now_writes_partial_batch() {
     assert_eq!(records.len(), 2);
     assert_eq!(records[0].source_offset, 0);
     assert_eq!(records[1].source_offset, 1);
+}
+
+// ---------- compaction-mode tests ----------
+
+fn cfg_compacted(root: &std::path::Path, max_offsets: u64) -> FilesystemSinkConfig {
+    FilesystemSinkConfig {
+        root: root.to_path_buf(),
+        destination_name: "ops".into(),
+        partition: 0,
+        format: Format::Parquet,
+        compression: ParquetCompression::Zstd1,
+        value_as_json: false,
+        key_type: mirror_envelope::KeyType::Utf8,
+        compaction: Some(mirror_fs::CompactionMode::Log),
+        flush: FlushTriggers {
+            max_time: Duration::from_secs(3600),
+            max_bytes: u64::MAX,
+            max_offsets,
+            daily_at_utc_seconds: None,
+        },
+    }
+}
+
+fn rec_kv(offset: u64, key: &str, value: Option<&str>) -> Record {
+    Record {
+        topic: "fs-test".into(),
+        partition: 0,
+        source_offset: offset,
+        timestamp_ms: Some(1_700_000_000_000 + offset as i64),
+        timestamp_type: TimestampType::CreateTime,
+        key: Some(key.as_bytes().to_vec()),
+        value: value.map(|s| s.as_bytes().to_vec()),
+        headers: vec![],
+    }
+}
+
+#[tokio::test]
+async fn compaction_emits_one_row_per_key_with_latest_value() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut sink = FilesystemSink::open(cfg_compacted(tmp.path(), 4)).unwrap();
+    sink.write(rec_kv(0, "k1", Some("v1a"))).await.unwrap();
+    sink.write(rec_kv(1, "k2", Some("v2a"))).await.unwrap();
+    sink.write(rec_kv(2, "k1", Some("v1b"))).await.unwrap();
+    sink.write(rec_kv(3, "k3", Some("v3"))).await.unwrap(); // triggers flush
+
+    let snapshot =
+        mirror_fs::read_latest_snapshot(&tmp.path().join("ops").join("0"), Format::Parquet)
+            .unwrap();
+    // 3 distinct keys; k1 has the later value (v1b), and BTreeMap order
+    // gives us k1, k2, k3.
+    assert_eq!(snapshot.len(), 3);
+    let by_key: std::collections::BTreeMap<_, _> = snapshot
+        .iter()
+        .map(|r| {
+            (
+                std::str::from_utf8(r.key.as_ref().unwrap())
+                    .unwrap()
+                    .to_string(),
+                std::str::from_utf8(r.value.as_ref().unwrap())
+                    .unwrap()
+                    .to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(by_key["k1"], "v1b");
+    assert_eq!(by_key["k2"], "v2a");
+    assert_eq!(by_key["k3"], "v3");
+}
+
+#[tokio::test]
+async fn compaction_tombstone_removes_key_from_snapshot() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut sink = FilesystemSink::open(cfg_compacted(tmp.path(), 3)).unwrap();
+    sink.write(rec_kv(0, "k1", Some("v1"))).await.unwrap();
+    sink.write(rec_kv(1, "k2", Some("v2"))).await.unwrap();
+    sink.write(rec_kv(2, "k1", None)).await.unwrap(); // tombstone, triggers flush
+
+    let snapshot =
+        mirror_fs::read_latest_snapshot(&tmp.path().join("ops").join("0"), Format::Parquet)
+            .unwrap();
+    let keys: Vec<_> = snapshot
+        .iter()
+        .map(|r| {
+            std::str::from_utf8(r.key.as_ref().unwrap())
+                .unwrap()
+                .to_string()
+        })
+        .collect();
+    assert_eq!(keys, vec!["k2".to_string()]);
+}
+
+#[tokio::test]
+async fn compaction_restart_bootstraps_view_from_latest_snapshot() {
+    let tmp = tempfile::tempdir().unwrap();
+    {
+        let mut sink = FilesystemSink::open(cfg_compacted(tmp.path(), 2)).unwrap();
+        sink.write(rec_kv(0, "k1", Some("v1"))).await.unwrap();
+        sink.write(rec_kv(1, "k2", Some("v2"))).await.unwrap(); // flush 0-1
+    }
+    // Reopen — durable_position should be 2 (resumes from Kafka here),
+    // and the in-memory view should contain k1=v1, k2=v2.
+    let mut sink = FilesystemSink::open(cfg_compacted(tmp.path(), 2)).unwrap();
+    assert_eq!(sink.next_expected_offset().await.unwrap(), 2);
+    // Write a tombstone for k1 plus a new k3 — the resulting snapshot
+    // must reflect the merged view, not a fresh "from scratch" view.
+    sink.write(rec_kv(2, "k1", None)).await.unwrap();
+    sink.write(rec_kv(3, "k3", Some("v3"))).await.unwrap(); // flush 2-3
+
+    let snapshot =
+        mirror_fs::read_latest_snapshot(&tmp.path().join("ops").join("0"), Format::Parquet)
+            .unwrap();
+    let by_key: std::collections::BTreeMap<_, _> = snapshot
+        .iter()
+        .map(|r| {
+            (
+                std::str::from_utf8(r.key.as_ref().unwrap())
+                    .unwrap()
+                    .to_string(),
+                std::str::from_utf8(r.value.as_ref().unwrap())
+                    .unwrap()
+                    .to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(by_key.get("k1"), None, "k1 should be tombstoned");
+    assert_eq!(by_key["k2"], "v2");
+    assert_eq!(by_key["k3"], "v3");
+}
+
+#[tokio::test]
+async fn compaction_scan_validate_accepts_gap() {
+    // Simulates an operator that GC'd an old snapshot. The chain has
+    // a gap but the latest snapshot is intact, so open() must succeed.
+    let tmp = tempfile::tempdir().unwrap();
+    {
+        let mut sink = FilesystemSink::open(cfg_compacted(tmp.path(), 2)).unwrap();
+        sink.write(rec_kv(0, "k1", Some("v1"))).await.unwrap();
+        sink.write(rec_kv(1, "k2", Some("v2"))).await.unwrap(); // 0-1.parquet
+    }
+    {
+        let mut sink = FilesystemSink::open(cfg_compacted(tmp.path(), 2)).unwrap();
+        sink.write(rec_kv(2, "k3", Some("v3"))).await.unwrap();
+        sink.write(rec_kv(3, "k4", Some("v4"))).await.unwrap(); // 2-3.parquet
+    }
+    // GC the older snapshot. Filenames are zero-padded to 20 digits,
+    // so resolve by searching the directory for the earlier `from`.
+    let dir = tmp.path().join("ops").join("0");
+    let older = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .find(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .map(|s| s.starts_with("00000000000000000000-"))
+                .unwrap_or(false)
+        })
+        .expect("must find 0..=1 snapshot on disk");
+    std::fs::remove_file(&older).unwrap();
+    // Reopen — should succeed and resume at offset 4 with the latest
+    // snapshot's view (k3, k4 only, because the GC'd snapshot's keys
+    // were not in the latest).
+    let mut sink = FilesystemSink::open(cfg_compacted(tmp.path(), 100)).unwrap();
+    assert_eq!(sink.next_expected_offset().await.unwrap(), 4);
+}
+
+#[tokio::test]
+async fn compaction_rejects_null_key_at_write() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut sink = FilesystemSink::open(cfg_compacted(tmp.path(), 100)).unwrap();
+    let mut r = rec_kv(0, "x", Some("v"));
+    r.key = None;
+    let err = sink.write(r).await.expect_err("null key must be rejected");
+    assert!(format!("{err}").contains("null"), "got: {err}");
+}
+
+#[tokio::test]
+async fn compaction_rejects_non_utf8_key_at_write() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut sink = FilesystemSink::open(cfg_compacted(tmp.path(), 100)).unwrap();
+    let mut r = rec_kv(0, "x", Some("v"));
+    r.key = Some(vec![0xff, 0xfe]);
+    let err = sink
+        .write(r)
+        .await
+        .expect_err("non-UTF-8 key must be rejected");
+    assert!(format!("{err}").contains("UTF-8"), "got: {err}");
+}
+
+#[tokio::test]
+async fn compaction_idle_flush_now_does_not_emit_file() {
+    // Option A: empty buffer + no view change = no file emitted.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut sink = FilesystemSink::open(cfg_compacted(tmp.path(), 100)).unwrap();
+    sink.flush_now().await.unwrap();
+    let dir = tmp.path().join("ops").join("0");
+    let files: Vec<_> = std::fs::read_dir(&dir)
+        .map(|rd| rd.filter_map(|e| e.ok()).collect())
+        .unwrap_or_default();
+    assert!(
+        files.is_empty(),
+        "idle flush in compaction mode must not emit a file"
+    );
 }

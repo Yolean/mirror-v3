@@ -17,6 +17,7 @@
 //! sequence with no gaps and no overlaps. Files with a non-matching
 //! extension are an error (no mixed-format dirs).
 
+use std::collections::BTreeMap;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -53,9 +54,21 @@ pub struct FilesystemSinkConfig {
     /// combined with `Format::Ndjson` before constructing the sink.
     pub value_as_json: bool,
     /// Storage representation for the record `key`. See
-    /// `mirror_envelope::KeyType`.
+    /// `mirror_envelope::KeyType`. Compaction requires `Utf8`.
     pub key_type: KeyType,
+    /// Optional log-compaction mode. When `Some(CompactionMode::Log)`,
+    /// each emitted file is a full materialized snapshot of the
+    /// latest value per key. Caller must combine this with
+    /// `Format::Parquet` and `KeyType::Utf8`.
+    pub compaction: Option<CompactionMode>,
     pub flush: FlushTriggers,
+}
+
+/// Log-compaction variant. Reserved for future strategies; currently
+/// only `Log` (Kafka-style, key-based, last-writer-wins) is defined.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompactionMode {
+    Log,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -75,13 +88,20 @@ pub struct FilesystemSink {
     compression: ParquetCompression,
     value_as_json: bool,
     key_type: KeyType,
+    compaction: Option<CompactionMode>,
     flush: FlushTriggers,
     /// Durable destination position: `max(to) + 1` of files on disk.
     durable_position: u64,
+    /// Buffered records arrived since the last flush. In append mode
+    /// this is the next file's contents; in compaction mode it's the
+    /// delta to merge into the materialized view at flush time.
     buffer: Vec<Record>,
     buffer_bytes: u64,
     buffer_started: Option<Instant>,
     last_flush_at: Option<Instant>,
+    /// Compaction-mode in-memory materialized view, sorted by key.
+    /// `None` in append mode.
+    view: Option<BTreeMap<String, Record>>,
     /// Absolute unix-seconds for the next daily-flush boundary, or
     /// `None` when the trigger is disabled.
     next_daily_unix: Option<u64>,
@@ -102,7 +122,21 @@ impl FilesystemSink {
             path: dir.clone(),
             source: e,
         })?;
-        let durable_position = scan_validate(&dir, cfg.format)?;
+        // Two scan-validate flavours: append mode requires a strictly
+        // contiguous chain; compaction mode allows gaps (snapshots
+        // can be GC'd out-of-band) but still forbids overlaps.
+        let (durable_position, view) = match cfg.compaction {
+            None => (scan_validate(&dir, cfg.format)?, None),
+            Some(CompactionMode::Log) => {
+                let (pos, latest) = scan_validate_compacted(&dir, cfg.format)?;
+                let view = match latest {
+                    None => BTreeMap::new(),
+                    Some(path) => load_view(&path, cfg.format)?,
+                };
+                report_compaction_keys(view.len());
+                (pos, Some(view))
+            }
+        };
         // NOTE: naive — computes the next future occurrence and
         // accepts that a mirror down at the boundary silently misses
         // it for that day. The richer version (planned alongside
@@ -121,12 +155,14 @@ impl FilesystemSink {
             compression: cfg.compression,
             value_as_json: cfg.value_as_json,
             key_type: cfg.key_type,
+            compaction: cfg.compaction,
             flush: cfg.flush,
             durable_position,
             buffer: Vec::new(),
             buffer_bytes: 0,
             buffer_started: None,
             last_flush_at: None,
+            view,
             next_daily_unix,
             clock,
         })
@@ -193,14 +229,40 @@ impl FilesystemSink {
             .dir
             .join(format!("{}.tmp.{}", final_name, uuid::Uuid::new_v4()));
 
-        // Encode the whole batch into bytes (NDJSON or Parquet) and
-        // write+fsync the temp file.
+        // In compaction mode, merge the buffer into the view (LWW;
+        // null-value records are tombstones — they remove the key)
+        // and write the full sorted view. In append mode, write the
+        // buffer verbatim.
+        let to_encode: Vec<Record> = match (self.compaction, self.view.as_mut()) {
+            (Some(CompactionMode::Log), Some(view)) => {
+                for r in self.buffer.drain(..) {
+                    // write() has already enforced UTF-8 + non-null
+                    // key in compaction mode, so this is a clean
+                    // String conversion.
+                    let key_bytes = r.key.as_ref().expect("compaction write rejects null key");
+                    let key_str = std::str::from_utf8(key_bytes)
+                        .expect("compaction write rejects non-UTF-8 key")
+                        .to_string();
+                    if r.value.is_none() {
+                        view.remove(&key_str);
+                    } else {
+                        view.insert(key_str, r);
+                    }
+                }
+                report_compaction_keys(view.len());
+                // BTreeMap iteration is in key-sorted order, which is
+                // what we want for deterministic file content and
+                // good Parquet dictionary-encoding.
+                view.values().cloned().collect()
+            }
+            _ => std::mem::take(&mut self.buffer),
+        };
         let bytes = mirror_envelope::encode_batch(
             self.format,
             self.compression,
             self.value_as_json,
             self.key_type,
-            &self.buffer,
+            &to_encode,
         )
         .map_err(|e| SinkError::Transport(format!("encode: {e}")))?;
         let encoded_len = bytes.len() as u64;
@@ -283,8 +345,15 @@ impl FilesystemSink {
 impl Sink for FilesystemSink {
     async fn next_expected_offset(&mut self) -> Result<u64, SinkError> {
         self.tick_daily().await?;
-        let on_disk = scan_validate(&self.dir, self.format)
-            .map_err(|e| SinkError::Transport(e.to_string()))?;
+        let on_disk = match self.compaction {
+            None => scan_validate(&self.dir, self.format)
+                .map_err(|e| SinkError::Transport(e.to_string()))?,
+            Some(CompactionMode::Log) => {
+                let (pos, _) = scan_validate_compacted(&self.dir, self.format)
+                    .map_err(|e| SinkError::Transport(e.to_string()))?;
+                pos
+            }
+        };
         if on_disk != self.durable_position {
             return Err(SinkError::UnexpectedPosition {
                 expected: self.durable_position,
@@ -302,6 +371,26 @@ impl Sink for FilesystemSink {
                 expected,
                 actual: record.source_offset,
             });
+        }
+        if matches!(self.compaction, Some(CompactionMode::Log)) {
+            match &record.key {
+                None => {
+                    return Err(SinkError::Transport(format!(
+                        "compaction=log requires a non-null key; \
+                         record at source offset {} has key=null",
+                        record.source_offset
+                    )));
+                }
+                Some(k) => {
+                    if std::str::from_utf8(k).is_err() {
+                        return Err(SinkError::Transport(format!(
+                            "compaction=log requires a UTF-8 key; \
+                             record at source offset {} has non-UTF-8 key",
+                            record.source_offset
+                        )));
+                    }
+                }
+            }
         }
         let bytes = record_byte_size(&record);
         self.buffer.push(record);
@@ -428,6 +517,119 @@ fn scan_validate(dir: &Path, format: Format) -> Result<u64, FsError> {
 fn file_extension(name: &str) -> Option<&str> {
     let dot = name.rfind('.')?;
     Some(&name[dot + 1..])
+}
+
+/// Scan a partition directory under compaction-mode rules: gaps in
+/// the chain are allowed (snapshots can be GC'd) but overlaps and
+/// duplicate `to` values are still rejected. Returns the durable
+/// position (`max(to) + 1`) and the path to the latest snapshot, if
+/// any exists.
+fn scan_validate_compacted(dir: &Path, format: Format) -> Result<(u64, Option<PathBuf>), FsError> {
+    let expected_ext = format.extension();
+    let mut entries: Vec<(u64, u64, PathBuf)> = Vec::new();
+    let read = match std::fs::read_dir(dir) {
+        Ok(r) => r,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok((0, None)),
+        Err(e) => {
+            return Err(FsError::Io {
+                path: dir.to_path_buf(),
+                source: e,
+            })
+        }
+    };
+    for entry in read {
+        let entry = entry.map_err(|e| FsError::Io {
+            path: dir.to_path_buf(),
+            source: e,
+        })?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.contains(".tmp.") {
+            continue;
+        }
+        if let Some(other_ext) = file_extension(&name) {
+            if other_ext != expected_ext && naming::parse_filename(&name, other_ext).is_some() {
+                return Err(FsError::CorruptChain {
+                    msg: format!(
+                        "{name}: extension '{other_ext}' does not match configured format \
+                         '{expected_ext}'"
+                    ),
+                });
+            }
+        }
+        if let Some((from, to)) = naming::parse_filename(&name, expected_ext) {
+            if to < from {
+                return Err(FsError::CorruptChain {
+                    msg: format!("{name}: to < from"),
+                });
+            }
+            entries.push((from, to, entry.path()));
+        }
+    }
+    entries.sort_by_key(|(_, to, _)| *to);
+    let mut prev_to: Option<u64> = None;
+    for (from, to, _) in &entries {
+        if let Some(p) = prev_to {
+            if *from <= p {
+                return Err(FsError::CorruptChain {
+                    msg: format!("overlap in compaction chain: {from}-{to} overlaps prior to={p}"),
+                });
+            }
+        }
+        prev_to = Some(*to);
+    }
+    let durable = prev_to.map(|t| t + 1).unwrap_or(0);
+    let latest_path = entries.into_iter().next_back().map(|(_, _, p)| p);
+    Ok((durable, latest_path))
+}
+
+/// Decode a snapshot file into the in-memory materialized view. Keys
+/// are required to be valid UTF-8 (we wrote them as Utf8 — a non-UTF-8
+/// key here would be data corruption).
+fn load_view(path: &Path, format: Format) -> Result<BTreeMap<String, Record>, FsError> {
+    let bytes = std::fs::read(path).map_err(|e| FsError::Io {
+        path: path.to_path_buf(),
+        source: e,
+    })?;
+    let records =
+        mirror_envelope::decode_batch(format, &bytes).map_err(|e| FsError::CorruptChain {
+            msg: format!("decode {}: {e}", path.display()),
+        })?;
+    let mut view = BTreeMap::new();
+    for r in records {
+        let key_bytes = r.key.as_ref().ok_or_else(|| FsError::CorruptChain {
+            msg: format!("{}: null key in compacted snapshot", path.display()),
+        })?;
+        let key_str = std::str::from_utf8(key_bytes)
+            .map_err(|_| FsError::CorruptChain {
+                msg: format!("{}: non-UTF-8 key in compacted snapshot", path.display()),
+            })?
+            .to_string();
+        view.insert(key_str, r);
+    }
+    Ok(view)
+}
+
+fn report_compaction_keys(n: usize) {
+    let (topic, partition) = mirror_core::current_labels();
+    metrics::gauge!(
+        "mirror_v3_destination_compaction_keys",
+        "topic" => topic,
+        "partition" => partition,
+    )
+    .set(n as f64);
+}
+
+/// Read the latest compacted snapshot's contents, in key-sorted order.
+/// Convenience for tests and operators verifying state in compaction mode.
+pub fn read_latest_snapshot(dir: &Path, format: Format) -> Result<Vec<Record>, FsError> {
+    let (_, latest) = scan_validate_compacted(dir, format)?;
+    match latest {
+        None => Ok(Vec::new()),
+        Some(path) => {
+            let view = load_view(&path, format)?;
+            Ok(view.into_values().collect())
+        }
+    }
 }
 
 /// Read every record from a partition directory in offset order.

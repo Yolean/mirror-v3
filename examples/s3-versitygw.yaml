@@ -28,6 +28,13 @@ destination:
   # `value: LargeBinary` column. Requires `format: parquet`; non-UTF-8
   # values become a hard error.
   # json: true
+  # Key storage representation. Defaults to `utf8` (key column is
+  # `Utf8`, non-UTF-8 keys are a hard error). Use `binary` for raw
+  # byte keys.
+  # key-type: utf8
+  # Opt-in Kafka-style log compaction (see filesystem example for
+  # details). Requires `format: parquet` and `key-type: utf8`.
+  # compaction: log
   flush:
     max-time-ms: 60000         # at most 60s of buffering
     max-bytes: 67108864        # or 64 MiB — parquet files want some heft to amortize the footer

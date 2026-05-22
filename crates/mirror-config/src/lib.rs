@@ -87,6 +87,13 @@ pub struct FilesystemDestination {
     /// and similar.
     #[serde(default)]
     pub key_type: KeyType,
+    /// Opt-in log-compaction mode. `null` (default) leaves the sink
+    /// in append mode. `log` switches to Kafka-style key-based
+    /// compaction: each Parquet file is a full materialized snapshot
+    /// of the latest value per key. Requires `format = parquet` and
+    /// `key-type = utf8`.
+    #[serde(default)]
+    pub compaction: Option<Compaction>,
     pub flush: FlushTriggers,
 }
 
@@ -119,6 +126,9 @@ pub struct S3Destination {
     /// Key storage representation. See `FilesystemDestination::key_type`.
     #[serde(default)]
     pub key_type: KeyType,
+    /// Log-compaction mode. See `FilesystemDestination::compaction`.
+    #[serde(default)]
+    pub compaction: Option<Compaction>,
     pub flush: FlushTriggers,
 }
 
@@ -132,8 +142,21 @@ pub enum KeyType {
     Utf8,
     /// Keys are opaque bytes — no validation. Parquet column type:
     /// `LargeBinary`. Required for non-UTF-8 keys (e.g. protobuf-keyed
-    /// topics).
+    /// topics). Incompatible with `compaction = log`.
     Binary,
+}
+
+/// Compaction strategy. Reserved for future variants (e.g. windowed,
+/// range). Default is "no compaction" (omit the field).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum Compaction {
+    /// Kafka-style log compaction: keep the latest value per key.
+    /// Each Parquet file is a full materialized snapshot. Null-value
+    /// records are interpreted as tombstones (the key is removed
+    /// from the materialized view). Null and non-UTF-8 keys are hard
+    /// errors at encode time.
+    Log,
 }
 
 /// Envelope format for Filesystem and S3 destinations.
@@ -382,12 +405,36 @@ fn validate(cfg: &Config) -> Result<(), LoadError> {
                     "filesystem.json = true requires filesystem.format = parquet".into(),
                 ));
             }
+            if let Some(Compaction::Log) = fs.compaction {
+                if matches!(fs.format, DestinationFormat::Ndjson) {
+                    return Err(LoadError::Validation(
+                        "filesystem.compaction = log requires filesystem.format = parquet".into(),
+                    ));
+                }
+                if matches!(fs.key_type, KeyType::Binary) {
+                    return Err(LoadError::Validation(
+                        "filesystem.compaction = log requires filesystem.key-type = utf8".into(),
+                    ));
+                }
+            }
         }
         Destination::S3(s3) => {
             if s3.json && matches!(s3.format, DestinationFormat::Ndjson) {
                 return Err(LoadError::Validation(
                     "s3.json = true requires s3.format = parquet".into(),
                 ));
+            }
+            if let Some(Compaction::Log) = s3.compaction {
+                if matches!(s3.format, DestinationFormat::Ndjson) {
+                    return Err(LoadError::Validation(
+                        "s3.compaction = log requires s3.format = parquet".into(),
+                    ));
+                }
+                if matches!(s3.key_type, KeyType::Binary) {
+                    return Err(LoadError::Validation(
+                        "s3.compaction = log requires s3.key-type = utf8".into(),
+                    ));
+                }
             }
         }
         Destination::Kafka(_) => {}
