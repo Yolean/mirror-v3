@@ -70,6 +70,7 @@ async fn two_mirrors_run_in_parallel_and_flush_on_shutdown() {
         format: mirror_envelope::Format::Ndjson,
         compression: mirror_envelope::ParquetCompression::Zstd1,
         value_as_json: false,
+        key_type: mirror_envelope::KeyType::Utf8,
         flush,
     })
     .expect("spawn m0");
@@ -83,6 +84,7 @@ async fn two_mirrors_run_in_parallel_and_flush_on_shutdown() {
         format: mirror_envelope::Format::Ndjson,
         compression: mirror_envelope::ParquetCompression::Zstd1,
         value_as_json: false,
+        key_type: mirror_envelope::KeyType::Utf8,
         flush,
     })
     .expect("spawn m1");

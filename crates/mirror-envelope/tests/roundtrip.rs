@@ -3,7 +3,7 @@
 //! to silently drop a field when building the schema.
 
 use mirror_core::{Header, Record, TimestampType};
-use mirror_envelope::{decode_batch, encode_batch, Format, ParquetCompression};
+use mirror_envelope::{decode_batch, encode_batch, Format, KeyType, ParquetCompression};
 
 fn fixture(n: usize) -> Vec<Record> {
     (0..n as u64)
@@ -52,7 +52,14 @@ fn fixture(n: usize) -> Vec<Record> {
 #[test]
 fn ndjson_roundtrip_preserves_every_field() {
     let records = fixture(20);
-    let bytes = encode_batch(Format::Ndjson, ParquetCompression::Zstd1, false, &records).unwrap();
+    let bytes = encode_batch(
+        Format::Ndjson,
+        ParquetCompression::Zstd1,
+        false,
+        KeyType::Utf8,
+        &records,
+    )
+    .unwrap();
     let decoded = decode_batch(Format::Ndjson, &bytes).unwrap();
     assert_eq!(records, decoded);
 }
@@ -60,7 +67,14 @@ fn ndjson_roundtrip_preserves_every_field() {
 #[test]
 fn parquet_roundtrip_preserves_every_field() {
     let records = fixture(20);
-    let bytes = encode_batch(Format::Parquet, ParquetCompression::Zstd1, false, &records).unwrap();
+    let bytes = encode_batch(
+        Format::Parquet,
+        ParquetCompression::Zstd1,
+        false,
+        KeyType::Utf8,
+        &records,
+    )
+    .unwrap();
     let decoded = decode_batch(Format::Parquet, &bytes).unwrap();
     assert_eq!(records, decoded);
 }
@@ -75,7 +89,7 @@ fn parquet_with_each_compression() {
         ParquetCompression::Lz4,
         ParquetCompression::Uncompressed,
     ] {
-        let bytes = encode_batch(Format::Parquet, c, false, &records).unwrap();
+        let bytes = encode_batch(Format::Parquet, c, false, KeyType::Utf8, &records).unwrap();
         let decoded = decode_batch(Format::Parquet, &bytes).unwrap();
         assert_eq!(records, decoded, "compression={c:?}");
     }
@@ -106,7 +120,14 @@ fn json_fixture(n: usize) -> Vec<Record> {
 #[test]
 fn parquet_json_mode_roundtrip_preserves_bytes_through_utf8_column() {
     let records = json_fixture(10);
-    let bytes = encode_batch(Format::Parquet, ParquetCompression::Zstd1, true, &records).unwrap();
+    let bytes = encode_batch(
+        Format::Parquet,
+        ParquetCompression::Zstd1,
+        true,
+        KeyType::Utf8,
+        &records,
+    )
+    .unwrap();
     let decoded = decode_batch(Format::Parquet, &bytes).unwrap();
     assert_eq!(records, decoded);
 }
@@ -115,7 +136,14 @@ fn parquet_json_mode_roundtrip_preserves_bytes_through_utf8_column() {
 fn parquet_json_mode_supports_null_value() {
     let mut records = json_fixture(3);
     records[1].value = None;
-    let bytes = encode_batch(Format::Parquet, ParquetCompression::Zstd1, true, &records).unwrap();
+    let bytes = encode_batch(
+        Format::Parquet,
+        ParquetCompression::Zstd1,
+        true,
+        KeyType::Utf8,
+        &records,
+    )
+    .unwrap();
     let decoded = decode_batch(Format::Parquet, &bytes).unwrap();
     assert_eq!(records, decoded);
     assert!(decoded[1].value.is_none());
@@ -126,8 +154,14 @@ fn parquet_json_mode_rejects_non_utf8_value() {
     let mut records = json_fixture(3);
     // 0xFF is never a valid UTF-8 leading byte.
     records[1].value = Some(vec![0xff, 0xfe, 0xfd]);
-    let err = encode_batch(Format::Parquet, ParquetCompression::Zstd1, true, &records)
-        .expect_err("non-UTF-8 in json mode must error");
+    let err = encode_batch(
+        Format::Parquet,
+        ParquetCompression::Zstd1,
+        true,
+        KeyType::Utf8,
+        &records,
+    )
+    .expect_err("non-UTF-8 in json mode must error");
     let msg = format!("{err}");
     assert!(
         msg.contains("UTF-8") && msg.contains("offset 1"),
@@ -139,7 +173,14 @@ fn parquet_json_mode_rejects_non_utf8_value() {
 fn parquet_json_mode_emits_utf8_column_named_json_and_omits_value() {
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     let records = json_fixture(3);
-    let bytes = encode_batch(Format::Parquet, ParquetCompression::Zstd1, true, &records).unwrap();
+    let bytes = encode_batch(
+        Format::Parquet,
+        ParquetCompression::Zstd1,
+        true,
+        KeyType::Utf8,
+        &records,
+    )
+    .unwrap();
     let cursor = bytes::Bytes::from(bytes);
     let reader = ParquetRecordBatchReaderBuilder::try_new(cursor)
         .unwrap()
@@ -167,6 +208,80 @@ fn parquet_json_mode_emits_utf8_column_named_json_and_omits_value() {
 }
 
 #[test]
+fn parquet_key_utf8_emits_utf8_column_and_roundtrips() {
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    let records = fixture(5);
+    let bytes = encode_batch(
+        Format::Parquet,
+        ParquetCompression::Zstd1,
+        false,
+        KeyType::Utf8,
+        &records,
+    )
+    .unwrap();
+    let decoded = decode_batch(Format::Parquet, &bytes).unwrap();
+    assert_eq!(records, decoded);
+    // Verify schema.
+    let cursor = bytes::Bytes::from(bytes);
+    let reader = ParquetRecordBatchReaderBuilder::try_new(cursor)
+        .unwrap()
+        .build()
+        .unwrap();
+    let batch = reader.into_iter().next().unwrap().unwrap();
+    let schema = batch.schema();
+    let key_field = schema.field_with_name("key").unwrap();
+    assert_eq!(key_field.data_type(), &arrow::datatypes::DataType::Utf8);
+}
+
+#[test]
+fn parquet_key_binary_preserves_non_utf8_keys() {
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    let mut records = fixture(3);
+    records[1].key = Some(vec![0xff, 0xfe, 0xfd]);
+    let bytes = encode_batch(
+        Format::Parquet,
+        ParquetCompression::Zstd1,
+        false,
+        KeyType::Binary,
+        &records,
+    )
+    .unwrap();
+    let decoded = decode_batch(Format::Parquet, &bytes).unwrap();
+    assert_eq!(records, decoded);
+    let cursor = bytes::Bytes::from(bytes);
+    let reader = ParquetRecordBatchReaderBuilder::try_new(cursor)
+        .unwrap()
+        .build()
+        .unwrap();
+    let batch = reader.into_iter().next().unwrap().unwrap();
+    let schema = batch.schema();
+    let key_field = schema.field_with_name("key").unwrap();
+    assert_eq!(
+        key_field.data_type(),
+        &arrow::datatypes::DataType::LargeBinary
+    );
+}
+
+#[test]
+fn parquet_key_utf8_rejects_non_utf8_key() {
+    let mut records = fixture(3);
+    records[1].key = Some(vec![0xff, 0xfe, 0xfd]);
+    let err = encode_batch(
+        Format::Parquet,
+        ParquetCompression::Zstd1,
+        false,
+        KeyType::Utf8,
+        &records,
+    )
+    .expect_err("non-UTF-8 key under key-type=utf8 must error");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("key") && msg.contains("UTF-8") && msg.contains("offset 1"),
+        "error must point to the offending record: {msg}"
+    );
+}
+
+#[test]
 fn parquet_is_smaller_than_ndjson_for_repetitive_columns() {
     // 100 records all with the same topic+partition+timestamp_type
     // — dictionary encoding plus zstd should annihilate those
@@ -174,9 +289,22 @@ fn parquet_is_smaller_than_ndjson_for_repetitive_columns() {
     // is meaningfully smaller (more than the per-file footer
     // overhead).
     let records = fixture(100);
-    let ndjson = encode_batch(Format::Ndjson, ParquetCompression::Zstd1, false, &records).unwrap();
-    let parquet =
-        encode_batch(Format::Parquet, ParquetCompression::Zstd1, false, &records).unwrap();
+    let ndjson = encode_batch(
+        Format::Ndjson,
+        ParquetCompression::Zstd1,
+        false,
+        KeyType::Utf8,
+        &records,
+    )
+    .unwrap();
+    let parquet = encode_batch(
+        Format::Parquet,
+        ParquetCompression::Zstd1,
+        false,
+        KeyType::Utf8,
+        &records,
+    )
+    .unwrap();
     assert!(
         parquet.len() < ndjson.len(),
         "parquet {} bytes >= ndjson {} bytes",

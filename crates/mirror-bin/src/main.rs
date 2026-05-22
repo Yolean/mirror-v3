@@ -165,6 +165,13 @@ fn compression_to_envelope(
     }
 }
 
+fn key_type_to_envelope(k: mirror_config::KeyType) -> mirror_envelope::KeyType {
+    match k {
+        mirror_config::KeyType::Utf8 => mirror_envelope::KeyType::Utf8,
+        mirror_config::KeyType::Binary => mirror_envelope::KeyType::Binary,
+    }
+}
+
 fn timestamp_mode_to_kafka(m: mirror_config::TimestampMode) -> mirror_kafka::TimestampMode {
     match m {
         mirror_config::TimestampMode::Source => mirror_kafka::TimestampMode::Source,
@@ -283,6 +290,7 @@ async fn query_destination_next(mirror: &Mirror, destination: &Destination) -> R
                 format: format_to_envelope(fs.format),
                 compression: compression_to_envelope(fs.compression),
                 value_as_json: fs.json,
+                key_type: key_type_to_envelope(fs.key_type),
                 flush: mirror_fs::FlushTriggers {
                     max_time: std::time::Duration::from_millis(fs.flush.max_time_ms),
                     max_bytes: fs.flush.max_bytes,
@@ -314,6 +322,7 @@ async fn query_destination_next(mirror: &Mirror, destination: &Destination) -> R
                 format: format_to_envelope(s3.format),
                 compression: compression_to_envelope(s3.compression),
                 value_as_json: s3.json,
+                key_type: key_type_to_envelope(s3.key_type),
                 flush: mirror_s3::FlushTriggers {
                     max_time: std::time::Duration::from_millis(s3.flush.max_time_ms),
                     max_bytes: s3.flush.max_bytes,
@@ -504,6 +513,7 @@ fn spawn_mirror(
                 format: format_to_envelope(fs.format),
                 compression: compression_to_envelope(fs.compression),
                 value_as_json: fs.json,
+                key_type: key_type_to_envelope(fs.key_type),
                 flush: mirror_fs::FlushTriggers {
                     max_time: std::time::Duration::from_millis(fs.flush.max_time_ms),
                     max_bytes: fs.flush.max_bytes,
@@ -548,6 +558,7 @@ fn spawn_mirror(
                 format: format_to_envelope(s3.format),
                 compression: compression_to_envelope(s3.compression),
                 value_as_json: s3.json,
+                key_type: key_type_to_envelope(s3.key_type),
                 flush: mirror_s3::FlushTriggers {
                     max_time: std::time::Duration::from_millis(s3.flush.max_time_ms),
                     max_bytes: s3.flush.max_bytes,

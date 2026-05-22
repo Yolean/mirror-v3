@@ -78,6 +78,7 @@ async fn parquet_roundtrip_via_kafka_native_to_filesystem() {
         format: Format::Parquet,
         compression: ParquetCompression::Zstd1,
         value_as_json: false,
+        key_type: mirror_envelope::KeyType::Utf8,
         flush,
     })
     .expect("spawn mirror");

@@ -34,6 +34,7 @@ fn spec(source: &str, root: &std::path::Path, group: &str, max_offsets: u64) -> 
         format: mirror_envelope::Format::Ndjson,
         compression: mirror_envelope::ParquetCompression::Zstd1,
         value_as_json: false,
+        key_type: mirror_envelope::KeyType::Utf8,
         flush: FlushTriggers {
             max_time: Duration::from_secs(3600),
             max_bytes: u64::MAX,

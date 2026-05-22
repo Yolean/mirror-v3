@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use mirror_core::{Record, Sink, SinkError};
-use mirror_envelope::{Format, ParquetCompression};
+use mirror_envelope::{Format, KeyType, ParquetCompression};
 use tokio::io::AsyncWriteExt;
 
 pub mod naming;
@@ -52,6 +52,9 @@ pub struct FilesystemSinkConfig {
     /// non-UTF-8 values are a hard error. Caller must reject this
     /// combined with `Format::Ndjson` before constructing the sink.
     pub value_as_json: bool,
+    /// Storage representation for the record `key`. See
+    /// `mirror_envelope::KeyType`.
+    pub key_type: KeyType,
     pub flush: FlushTriggers,
 }
 
@@ -71,6 +74,7 @@ pub struct FilesystemSink {
     format: Format,
     compression: ParquetCompression,
     value_as_json: bool,
+    key_type: KeyType,
     flush: FlushTriggers,
     /// Durable destination position: `max(to) + 1` of files on disk.
     durable_position: u64,
@@ -116,6 +120,7 @@ impl FilesystemSink {
             format: cfg.format,
             compression: cfg.compression,
             value_as_json: cfg.value_as_json,
+            key_type: cfg.key_type,
             flush: cfg.flush,
             durable_position,
             buffer: Vec::new(),
@@ -194,6 +199,7 @@ impl FilesystemSink {
             self.format,
             self.compression,
             self.value_as_json,
+            self.key_type,
             &self.buffer,
         )
         .map_err(|e| SinkError::Transport(format!("encode: {e}")))?;

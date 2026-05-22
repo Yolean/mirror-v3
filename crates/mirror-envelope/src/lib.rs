@@ -44,6 +44,20 @@ pub enum ParquetCompression {
     Uncompressed,
 }
 
+/// How the record `key` is represented on disk for Parquet writes.
+/// NDJSON is unaffected: keys are always base64-encoded byte strings
+/// in the JSON output regardless of this setting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum KeyType {
+    /// Keys are valid UTF-8; the Parquet column is `Utf8`. Non-UTF-8
+    /// keys at encode are a hard `Encode` error pointing at the
+    /// offending source offset.
+    #[default]
+    Utf8,
+    /// Keys are opaque bytes; the Parquet column is `LargeBinary`.
+    Binary,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum EnvelopeError {
     #[error("encode: {0}")]
@@ -63,15 +77,21 @@ pub enum EnvelopeError {
 /// rejecting `value_as_json = true` with `Format::Ndjson` before
 /// reaching here — `encode_batch` silently ignores the flag for
 /// NDJSON.
+///
+/// `key_type` is only meaningful for Parquet. `KeyType::Utf8` writes
+/// a `key: Utf8` column and validates UTF-8 at encode; `KeyType::Binary`
+/// writes the legacy `key: LargeBinary` column with no validation.
+/// NDJSON ignores the flag.
 pub fn encode_batch(
     format: Format,
     compression: ParquetCompression,
     value_as_json: bool,
+    key_type: KeyType,
     records: &[Record],
 ) -> Result<Vec<u8>, EnvelopeError> {
     match format {
         Format::Ndjson => ndjson::encode_batch(records),
-        Format::Parquet => parquet::encode_batch(records, compression, value_as_json),
+        Format::Parquet => parquet::encode_batch(records, compression, value_as_json, key_type),
     }
 }
 

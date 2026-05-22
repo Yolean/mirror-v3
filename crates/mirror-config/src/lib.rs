@@ -79,6 +79,14 @@ pub struct FilesystemDestination {
     /// (ndjson already carries the value, base64-encoded).
     #[serde(default)]
     pub json: bool,
+    /// Storage representation for the record `key`. Defaults to
+    /// `utf8`: keys are validated UTF-8 at encode time and the
+    /// Parquet column is `Utf8` (operator-friendly — DuckDB reads it
+    /// as `VARCHAR`). Set to `binary` for raw bytes (no validation,
+    /// `LargeBinary` column) — required for protobuf-keyed topics
+    /// and similar.
+    #[serde(default)]
+    pub key_type: KeyType,
     pub flush: FlushTriggers,
 }
 
@@ -108,7 +116,24 @@ pub struct S3Destination {
     /// rejected at config-load time.
     #[serde(default)]
     pub json: bool,
+    /// Key storage representation. See `FilesystemDestination::key_type`.
+    #[serde(default)]
+    pub key_type: KeyType,
     pub flush: FlushTriggers,
+}
+
+/// How the record `key` is represented on disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum KeyType {
+    /// Keys are validated as UTF-8 at encode (hard error on non-UTF-8,
+    /// with the offending source offset). Parquet column type: `Utf8`.
+    #[default]
+    Utf8,
+    /// Keys are opaque bytes — no validation. Parquet column type:
+    /// `LargeBinary`. Required for non-UTF-8 keys (e.g. protobuf-keyed
+    /// topics).
+    Binary,
 }
 
 /// Envelope format for Filesystem and S3 destinations.

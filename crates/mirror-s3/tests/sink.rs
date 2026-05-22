@@ -35,6 +35,7 @@ fn cfg(store: Arc<dyn ObjectStore>, max_offsets: u64) -> S3SinkConfig {
         format: Format::Ndjson,
         compression: ParquetCompression::Zstd1,
         value_as_json: false,
+        key_type: mirror_envelope::KeyType::Utf8,
         flush: FlushTriggers {
             max_time: Duration::from_secs(3600),
             max_bytes: u64::MAX,
@@ -145,6 +146,7 @@ async fn put_mode_create_rejects_overwrite() {
         format: Format::Ndjson,
         compression: ParquetCompression::Zstd1,
         value_as_json: false,
+        key_type: mirror_envelope::KeyType::Utf8,
         flush: FlushTriggers {
             max_time: Duration::from_secs(3600),
             max_bytes: u64::MAX,

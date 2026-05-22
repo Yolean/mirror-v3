@@ -22,7 +22,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::StreamExt;
 use mirror_core::{Record, Sink, SinkError};
-use mirror_envelope::{Format, ParquetCompression};
+use mirror_envelope::{Format, KeyType, ParquetCompression};
 use mirror_fs::naming;
 use object_store::path::Path;
 use object_store::{ObjectStore, PutMode, PutOptions, PutPayload};
@@ -62,6 +62,8 @@ pub struct S3SinkConfig {
     /// non-UTF-8 values are a hard error. Caller must reject this
     /// combined with `Format::Ndjson` before constructing the sink.
     pub value_as_json: bool,
+    /// Storage representation for the record `key`.
+    pub key_type: KeyType,
     pub flush: FlushTriggers,
 }
 
@@ -71,6 +73,7 @@ pub struct S3Sink {
     format: Format,
     compression: ParquetCompression,
     value_as_json: bool,
+    key_type: KeyType,
     flush: FlushTriggers,
     durable_position: u64,
     buffer: Vec<Record>,
@@ -104,6 +107,7 @@ impl S3Sink {
             format: cfg.format,
             compression: cfg.compression,
             value_as_json: cfg.value_as_json,
+            key_type: cfg.key_type,
             flush: cfg.flush,
             durable_position,
             buffer: Vec::new(),
@@ -168,6 +172,7 @@ impl S3Sink {
             self.format,
             self.compression,
             self.value_as_json,
+            self.key_type,
             &self.buffer,
         )
         .map_err(|e| SinkError::Transport(format!("encode: {e}")))?;
