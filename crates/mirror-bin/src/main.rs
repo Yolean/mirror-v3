@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -8,7 +9,6 @@ use mirror_core::{run_mirror, MetricLabels, MIRROR_LABELS};
 use mirror_fs::{FilesystemSink, FilesystemSinkConfig};
 use mirror_kafka::{KafkaSink, KafkaSinkConfig, KafkaSource, KafkaSourceConfig};
 use mirror_s3::{S3Sink, S3SinkConfig};
-use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
@@ -165,10 +165,11 @@ fn compression_to_envelope(
     }
 }
 
-fn key_type_to_envelope(k: mirror_config::KeyType) -> mirror_envelope::KeyType {
+fn column_type_to_envelope(k: mirror_config::ColumnType) -> mirror_envelope::ColumnType {
     match k {
-        mirror_config::KeyType::Utf8 => mirror_envelope::KeyType::Utf8,
-        mirror_config::KeyType::Binary => mirror_envelope::KeyType::Binary,
+        mirror_config::ColumnType::Bytes => mirror_envelope::ColumnType::Bytes,
+        mirror_config::ColumnType::Utf8 => mirror_envelope::ColumnType::Utf8,
+        mirror_config::ColumnType::Json => mirror_envelope::ColumnType::Json,
     }
 }
 
@@ -187,17 +188,44 @@ fn timestamp_mode_to_kafka(m: mirror_config::TimestampMode) -> mirror_kafka::Tim
     }
 }
 
-/// Translate an optional `daily:` block into seconds-since-midnight
-/// or an actionable error at config-load time (so a bad `at-utc`
-/// fails fast, not on the first record).
-fn daily_to_seconds(d: &Option<mirror_config::DailyFlush>) -> Result<Option<u32>> {
-    match d {
-        None => Ok(None),
-        Some(d) => d
-            .parse_at_utc()
-            .map(Some)
-            .map_err(|e| anyhow::anyhow!("daily.at-utc: {e}")),
-    }
+/// Bundle of per-mirror encoding/flush values resolved against
+/// defaults. Pulled out so the FS and S3 sink-config builders are
+/// trivial.
+struct BlobMirrorParams {
+    format: mirror_envelope::Format,
+    compression: mirror_envelope::ParquetCompression,
+    keys: mirror_envelope::ColumnType,
+    values: mirror_envelope::ColumnType,
+    flush: mirror_fs::FlushTriggers,
+}
+
+fn resolve_blob_params(mirror: &Mirror) -> Result<BlobMirrorParams> {
+    let format = format_to_envelope(mirror.format.unwrap_or_default());
+    let compression = compression_to_envelope(mirror.compression.unwrap_or_default());
+    let keys = column_type_to_envelope(mirror.keys.unwrap_or_default().kind);
+    let values = column_type_to_envelope(mirror.values.unwrap_or_default().kind);
+    let cfg_flush = mirror
+        .flush
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("mirror {:?}: missing `flush`", mirror.name))?;
+    let flush = mirror_fs::FlushTriggers {
+        max_time: std::time::Duration::from_millis(cfg_flush.max_time_ms),
+        max_bytes: cfg_flush.max_bytes,
+        max_offsets: cfg_flush.max_offsets,
+        daily_at_utc_seconds: cfg_flush
+            .daily
+            .as_ref()
+            .map(|d| d.parse_at_utc())
+            .transpose()
+            .with_context(|| format!("mirror {:?}: daily.at-utc", mirror.name))?,
+    };
+    Ok(BlobMirrorParams {
+        format,
+        compression,
+        keys,
+        values,
+        flush,
+    })
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -272,15 +300,11 @@ async fn compute_status_row(mirror: &Mirror, destination: &Destination) -> Statu
 
 async fn query_destination_next(mirror: &Mirror, destination: &Destination) -> Result<u64> {
     use mirror_core::Sink;
-    let destination_name = mirror
-        .destination_name_override
-        .clone()
-        .unwrap_or_else(|| mirror.topic.clone());
     match destination {
         Destination::Kafka(k) => {
             let cfg = KafkaSinkConfig::new(
                 k.bootstrap_servers.clone(),
-                destination_name,
+                mirror.name.clone(),
                 mirror.partition as i32,
             );
             let mut sink = KafkaSink::open(cfg).map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -289,23 +313,17 @@ async fn query_destination_next(mirror: &Mirror, destination: &Destination) -> R
                 .map_err(|e| anyhow::anyhow!("{e}"))
         }
         Destination::Filesystem(fs) => {
-            // Flush triggers don't matter for a read-only query — they
-            // only fire on write — but the constructor requires them.
+            let params = resolve_blob_params(mirror)?;
             let cfg = FilesystemSinkConfig {
                 root: fs.root.clone(),
-                destination_name,
+                destination_name: mirror.name.clone(),
                 partition: mirror.partition,
-                format: format_to_envelope(fs.format),
-                compression: compression_to_envelope(fs.compression),
-                value_as_json: fs.json,
-                key_type: key_type_to_envelope(fs.key_type),
-                compaction: compaction_to_fs(fs.compaction),
-                flush: mirror_fs::FlushTriggers {
-                    max_time: std::time::Duration::from_millis(fs.flush.max_time_ms),
-                    max_bytes: fs.flush.max_bytes,
-                    max_offsets: fs.flush.max_offsets,
-                    daily_at_utc_seconds: daily_to_seconds(&fs.flush.daily)?,
-                },
+                format: params.format,
+                compression: params.compression,
+                keys: params.keys,
+                values: params.values,
+                compaction: compaction_to_fs(mirror.compaction),
+                flush: params.flush,
             };
             let mut sink = FilesystemSink::open(cfg).map_err(|e| anyhow::anyhow!("{e}"))?;
             sink.next_expected_offset()
@@ -313,6 +331,7 @@ async fn query_destination_next(mirror: &Mirror, destination: &Destination) -> R
                 .map_err(|e| anyhow::anyhow!("{e}"))
         }
         Destination::S3(s3) => {
+            let params = resolve_blob_params(mirror)?;
             let mut builder = object_store::aws::AmazonS3Builder::from_env()
                 .with_region(&s3.region)
                 .with_bucket_name(&s3.bucket);
@@ -326,18 +345,18 @@ async fn query_destination_next(mirror: &Mirror, destination: &Destination) -> R
             let cfg = S3SinkConfig {
                 store: Arc::new(store),
                 prefix: s3.prefix.as_deref().map(object_store::path::Path::from),
-                destination_name,
+                destination_name: mirror.name.clone(),
                 partition: mirror.partition,
-                format: format_to_envelope(s3.format),
-                compression: compression_to_envelope(s3.compression),
-                value_as_json: s3.json,
-                key_type: key_type_to_envelope(s3.key_type),
-                compaction: compaction_to_s3(s3.compaction),
+                format: params.format,
+                compression: params.compression,
+                keys: params.keys,
+                values: params.values,
+                compaction: compaction_to_s3(mirror.compaction),
                 flush: mirror_s3::FlushTriggers {
-                    max_time: std::time::Duration::from_millis(s3.flush.max_time_ms),
-                    max_bytes: s3.flush.max_bytes,
-                    max_offsets: s3.flush.max_offsets,
-                    daily_at_utc_seconds: daily_to_seconds(&s3.flush.daily)?,
+                    max_time: params.flush.max_time,
+                    max_bytes: params.flush.max_bytes,
+                    max_offsets: params.flush.max_offsets,
+                    daily_at_utc_seconds: params.flush.daily_at_utc_seconds,
                 },
             };
             let mut sink = S3Sink::open(cfg)
@@ -486,19 +505,16 @@ fn spawn_mirror(
         topic: mirror.topic.clone(),
         partition: mirror.partition,
     };
-    let destination_name = mirror
-        .destination_name_override
-        .clone()
-        .unwrap_or_else(|| mirror.topic.clone());
 
     match destination {
         Destination::Kafka(k) => {
             let mut sink_cfg = KafkaSinkConfig::new(
                 k.bootstrap_servers,
-                destination_name,
+                mirror.name.clone(),
                 mirror.partition as i32,
             );
-            sink_cfg.timestamp_mode = timestamp_mode_to_kafka(k.timestamp_mode);
+            sink_cfg.timestamp_mode =
+                timestamp_mode_to_kafka(mirror.timestamp_mode.unwrap_or_default());
             let sink = KafkaSink::open(sink_cfg)
                 .with_context(|| format!("opening sink for mirror {name}"))?;
             Ok(tokio::spawn(async move {
@@ -516,21 +532,17 @@ fn spawn_mirror(
             }))
         }
         Destination::Filesystem(fs) => {
+            let params = resolve_blob_params(&mirror)?;
             let sink_cfg = FilesystemSinkConfig {
                 root: fs.root,
-                destination_name,
+                destination_name: mirror.name.clone(),
                 partition: mirror.partition,
-                format: format_to_envelope(fs.format),
-                compression: compression_to_envelope(fs.compression),
-                value_as_json: fs.json,
-                key_type: key_type_to_envelope(fs.key_type),
-                compaction: compaction_to_fs(fs.compaction),
-                flush: mirror_fs::FlushTriggers {
-                    max_time: std::time::Duration::from_millis(fs.flush.max_time_ms),
-                    max_bytes: fs.flush.max_bytes,
-                    max_offsets: fs.flush.max_offsets,
-                    daily_at_utc_seconds: daily_to_seconds(&fs.flush.daily)?,
-                },
+                format: params.format,
+                compression: params.compression,
+                keys: params.keys,
+                values: params.values,
+                compaction: compaction_to_fs(mirror.compaction),
+                flush: params.flush,
             };
             let sink = FilesystemSink::open(sink_cfg)
                 .with_context(|| format!("opening sink for mirror {name}"))?;
@@ -549,6 +561,7 @@ fn spawn_mirror(
             }))
         }
         Destination::S3(s3) => {
+            let params = resolve_blob_params(&mirror)?;
             let mut builder = object_store::aws::AmazonS3Builder::from_env()
                 .with_region(&s3.region)
                 .with_bucket_name(&s3.bucket);
@@ -564,18 +577,18 @@ fn spawn_mirror(
             let sink_cfg = S3SinkConfig {
                 store: Arc::new(store),
                 prefix: s3.prefix.as_deref().map(object_store::path::Path::from),
-                destination_name,
+                destination_name: mirror.name.clone(),
                 partition: mirror.partition,
-                format: format_to_envelope(s3.format),
-                compression: compression_to_envelope(s3.compression),
-                value_as_json: s3.json,
-                key_type: key_type_to_envelope(s3.key_type),
-                compaction: compaction_to_s3(s3.compaction),
+                format: params.format,
+                compression: params.compression,
+                keys: params.keys,
+                values: params.values,
+                compaction: compaction_to_s3(mirror.compaction),
                 flush: mirror_s3::FlushTriggers {
-                    max_time: std::time::Duration::from_millis(s3.flush.max_time_ms),
-                    max_bytes: s3.flush.max_bytes,
-                    max_offsets: s3.flush.max_offsets,
-                    daily_at_utc_seconds: daily_to_seconds(&s3.flush.daily)?,
+                    max_time: params.flush.max_time,
+                    max_bytes: params.flush.max_bytes,
+                    max_offsets: params.flush.max_offsets,
+                    daily_at_utc_seconds: params.flush.daily_at_utc_seconds,
                 },
             };
             Ok(tokio::spawn(async move {

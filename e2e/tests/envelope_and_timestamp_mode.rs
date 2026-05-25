@@ -77,8 +77,8 @@ async fn parquet_roundtrip_via_kafka_native_to_filesystem() {
         destination_name: "ops".into(),
         format: Format::Parquet,
         compression: ParquetCompression::Zstd1,
-        value_as_json: false,
-        key_type: mirror_envelope::KeyType::Utf8,
+        keys: mirror_envelope::ColumnType::Utf8,
+        values: mirror_envelope::ColumnType::Utf8,
         compaction: None,
         flush,
     })

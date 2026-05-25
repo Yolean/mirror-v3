@@ -10,6 +10,18 @@
 //! string columns, which compresses `topic` / `partition` /
 //! `timestamp_type` (low-cardinality, repeated per record) down to
 //! near-nothing.
+//!
+//! The `key` and `value` columns are always named `key` and `value`
+//! respectively. Their physical type follows the caller-supplied
+//! [`ColumnType`]: `Bytes` → `LargeBinary`, `Utf8`/`Json` → `Utf8`.
+//! `Json` additionally carries the `arrow.json` canonical extension
+//! metadata — purely operator-facing; mirror-v3 does not parse JSON.
+//! On decode, the column's physical type is what disambiguates, not
+//! its name.
+//!
+//! UTF-8 enforcement: when `keys`/`values` is `Utf8` or `Json`, each
+//! non-null payload is validated as UTF-8 at encode time. A bad byte
+//! is a hard `Encode` error pointing at the offending source offset.
 
 use std::sync::Arc;
 
@@ -26,7 +38,7 @@ use parquet::basic::Compression;
 use parquet::basic::ZstdLevel;
 use parquet::file::properties::{EnabledStatistics, WriterProperties};
 
-use crate::{EnvelopeError, KeyType, ParquetCompression};
+use crate::{ColumnType, EnvelopeError, ParquetCompression};
 
 fn header_struct_fields() -> Fields {
     Fields::from(vec![
@@ -35,37 +47,33 @@ fn header_struct_fields() -> Fields {
     ])
 }
 
-fn build_schema(value_as_json: bool, key_type: KeyType) -> SchemaRef {
+fn column_field(name: &str, kind: ColumnType) -> Field {
+    match kind {
+        ColumnType::Bytes => Field::new(name, DataType::LargeBinary, true),
+        ColumnType::Utf8 => Field::new(name, DataType::Utf8, true),
+        ColumnType::Json => {
+            let mut md = std::collections::HashMap::new();
+            md.insert("ARROW:extension:name".to_string(), "arrow.json".to_string());
+            md.insert("ARROW:extension:metadata".to_string(), String::new());
+            Field::new(name, DataType::Utf8, true).with_metadata(md)
+        }
+    }
+}
+
+fn build_schema(keys: ColumnType, values: ColumnType) -> SchemaRef {
     let header_struct = DataType::Struct(header_struct_fields());
     // `nullable: true` matches arrow's ListBuilder<StructBuilder>
     // default; the records themselves never contain a null header
     // struct, but Arrow requires the schema to permit it.
     let header_item = Field::new("item", header_struct, true);
-    let value_field = if value_as_json {
-        // Carry the `arrow.json` canonical extension type so
-        // readers that respect it (e.g. arrow-aware tooling) get
-        // the JSON logical-type hint. DuckDB doesn't currently
-        // round-trip the extension but reads the column as
-        // VARCHAR, which is what we need.
-        let mut md = std::collections::HashMap::new();
-        md.insert("ARROW:extension:name".to_string(), "arrow.json".to_string());
-        md.insert("ARROW:extension:metadata".to_string(), String::new());
-        Field::new("json", DataType::Utf8, true).with_metadata(md)
-    } else {
-        Field::new("value", DataType::LargeBinary, true)
-    };
-    let key_field = match key_type {
-        KeyType::Utf8 => Field::new("key", DataType::Utf8, true),
-        KeyType::Binary => Field::new("key", DataType::LargeBinary, true),
-    };
     Arc::new(Schema::new(vec![
         Field::new("topic", DataType::Utf8, false),
         Field::new("partition", DataType::Int32, false),
         Field::new("offset", DataType::UInt64, false),
         Field::new("timestamp_ms", DataType::Int64, true),
         Field::new("timestamp_type", DataType::Utf8, false),
-        key_field,
-        value_field,
+        column_field("key", keys),
+        column_field("value", values),
         Field::new("headers", DataType::List(Arc::new(header_item)), false),
     ]))
 }
@@ -87,11 +95,11 @@ fn to_compression(c: ParquetCompression) -> Compression {
 pub fn encode_batch(
     records: &[Record],
     compression: ParquetCompression,
-    value_as_json: bool,
-    key_type: KeyType,
+    keys: ColumnType,
+    values: ColumnType,
 ) -> Result<Vec<u8>, EnvelopeError> {
-    let schema = build_schema(value_as_json, key_type);
-    let batch = build_record_batch(records, &schema, value_as_json, key_type)?;
+    let schema = build_schema(keys, values);
+    let batch = build_record_batch(records, &schema, keys, values)?;
 
     let props = WriterProperties::builder()
         .set_compression(to_compression(compression))
@@ -116,8 +124,8 @@ pub fn encode_batch(
 fn build_record_batch(
     records: &[Record],
     schema: &SchemaRef,
-    value_as_json: bool,
-    key_type: KeyType,
+    keys: ColumnType,
+    values: ColumnType,
 ) -> Result<RecordBatch, EnvelopeError> {
     let mut topics = StringBuilder::new();
     let mut partitions = Int32Builder::new();
@@ -127,7 +135,7 @@ fn build_record_batch(
     let mut keys_binary = LargeBinaryBuilder::new();
     let mut keys_string = StringBuilder::new();
     let mut values_binary = LargeBinaryBuilder::new();
-    let mut values_json = StringBuilder::new();
+    let mut values_string = StringBuilder::new();
 
     // Headers: List<Struct{key: Utf8, value: LargeBinary}>
     let struct_builders: Vec<Box<dyn arrow::array::ArrayBuilder>> = vec![
@@ -146,48 +154,22 @@ fn build_record_batch(
             None => timestamps.append_null(),
         }
         timestamp_types.append_value(r.timestamp_type.as_str());
-        match key_type {
-            KeyType::Binary => match &r.key {
-                Some(k) => keys_binary.append_value(k),
-                None => keys_binary.append_null(),
-            },
-            KeyType::Utf8 => match &r.key {
-                None => keys_string.append_null(),
-                Some(bytes) => {
-                    let s = std::str::from_utf8(bytes).map_err(|e| {
-                        EnvelopeError::Encode(format!(
-                            "key at source offset {} is not valid UTF-8 \
-                             (key-type=utf8 requires UTF-8): {}",
-                            r.source_offset, e
-                        ))
-                    })?;
-                    keys_string.append_value(s);
-                }
-            },
-        }
-        // Value column: binary by default; UTF-8 string when
-        // value_as_json is on. We fail hard on non-UTF-8 in json
-        // mode (no per-record skipping, no parse-error column).
-        if value_as_json {
-            match &r.value {
-                None => values_json.append_null(),
-                Some(bytes) => {
-                    let s = std::str::from_utf8(bytes).map_err(|e| {
-                        EnvelopeError::Encode(format!(
-                            "value at source offset {} is not valid UTF-8 \
-                             (json mode requires UTF-8): {}",
-                            r.source_offset, e
-                        ))
-                    })?;
-                    values_json.append_value(s);
-                }
-            }
-        } else {
-            match &r.value {
-                Some(v) => values_binary.append_value(v),
-                None => values_binary.append_null(),
-            }
-        }
+        append_payload(
+            "key",
+            keys,
+            r.source_offset,
+            r.key.as_deref(),
+            &mut keys_binary,
+            &mut keys_string,
+        )?;
+        append_payload(
+            "value",
+            values,
+            r.source_offset,
+            r.value.as_deref(),
+            &mut values_binary,
+            &mut values_string,
+        )?;
         append_headers(&mut headers_builder, &r.headers);
     }
 
@@ -196,14 +178,13 @@ fn build_record_batch(
     let offsets: ArrayRef = Arc::new(offsets.finish());
     let timestamps: ArrayRef = Arc::new(timestamps.finish());
     let timestamp_types: ArrayRef = Arc::new(timestamp_types.finish());
-    let keys: ArrayRef = match key_type {
-        KeyType::Binary => Arc::new(keys_binary.finish()),
-        KeyType::Utf8 => Arc::new(keys_string.finish()),
+    let keys_arr: ArrayRef = match keys {
+        ColumnType::Bytes => Arc::new(keys_binary.finish()),
+        ColumnType::Utf8 | ColumnType::Json => Arc::new(keys_string.finish()),
     };
-    let values: ArrayRef = if value_as_json {
-        Arc::new(values_json.finish())
-    } else {
-        Arc::new(values_binary.finish())
+    let values_arr: ArrayRef = match values {
+        ColumnType::Bytes => Arc::new(values_binary.finish()),
+        ColumnType::Utf8 | ColumnType::Json => Arc::new(values_string.finish()),
     };
     let headers: ArrayRef = Arc::new(headers_builder.finish());
 
@@ -215,12 +196,40 @@ fn build_record_batch(
             offsets,
             timestamps,
             timestamp_types,
-            keys,
-            values,
+            keys_arr,
+            values_arr,
             headers,
         ],
     )
     .map_err(|e| EnvelopeError::Encode(format!("record batch: {e}")))
+}
+
+fn append_payload(
+    column: &str,
+    kind: ColumnType,
+    source_offset: u64,
+    payload: Option<&[u8]>,
+    binary: &mut LargeBinaryBuilder,
+    string: &mut StringBuilder,
+) -> Result<(), EnvelopeError> {
+    match kind {
+        ColumnType::Bytes => match payload {
+            Some(b) => binary.append_value(b),
+            None => binary.append_null(),
+        },
+        ColumnType::Utf8 | ColumnType::Json => match payload {
+            None => string.append_null(),
+            Some(bytes) => {
+                let s = std::str::from_utf8(bytes).map_err(|e| {
+                    EnvelopeError::Encode(format!(
+                        "{column} at source offset {source_offset} is not valid UTF-8: {e}",
+                    ))
+                })?;
+                string.append_value(s);
+            }
+        },
+    }
+    Ok(())
 }
 
 fn append_headers(builder: &mut ListBuilder<StructBuilder>, headers: &[Header]) {
@@ -258,16 +267,6 @@ pub fn decode_batch(bytes: &[u8]) -> Result<Vec<Record>, EnvelopeError> {
     Ok(out)
 }
 
-enum ValueColumn {
-    Binary(ArrayRef),
-    Json(ArrayRef),
-}
-
-enum KeyColumn {
-    Binary(ArrayRef),
-    Utf8(ArrayRef),
-}
-
 fn record_batch_into_records(batch: &RecordBatch) -> Result<Vec<Record>, EnvelopeError> {
     use arrow::array::{
         Int32Array, Int64Array, LargeBinaryArray, ListArray, StringArray, StructArray, UInt64Array,
@@ -285,34 +284,12 @@ fn record_batch_into_records(batch: &RecordBatch) -> Result<Vec<Record>, Envelop
     let offsets = col("offset")?;
     let timestamps = col("timestamp_ms")?;
     let timestamp_types = col("timestamp_type")?;
-    let keys = col("key")?;
-    // Key column may be LargeBinary (legacy / key-type=binary) or
-    // Utf8 (key-type=utf8). Auto-detect from the schema.
-    let key_column = match keys.data_type() {
-        DataType::LargeBinary => KeyColumn::Binary(keys.clone()),
-        DataType::Utf8 => KeyColumn::Utf8(keys.clone()),
-        other => {
-            return Err(EnvelopeError::Decode(format!(
-                "key column must be LargeBinary or Utf8, got {other:?}"
-            )))
-        }
-    };
-    // Files written before the `json: true` feature have a `value`
-    // column (LargeBinary); files written under json-mode have a
-    // `json` column (Utf8). Auto-detect from the schema so the same
-    // decoder works for both.
-    let value_column = batch
-        .column_by_name("value")
-        .map(|c| ValueColumn::Binary(c.clone()))
-        .or_else(|| {
-            batch
-                .column_by_name("json")
-                .map(|c| ValueColumn::Json(c.clone()))
-        })
-        .ok_or_else(|| {
-            EnvelopeError::Decode("missing column: expected `value` or `json`".into())
-        })?;
+    let keys_col = col("key")?;
+    let values_col = col("value")?;
     let headers = col("headers")?;
+
+    let read_key = payload_reader("key", &keys_col)?;
+    let read_value = payload_reader("value", &values_col)?;
 
     let topics = topics
         .as_any()
@@ -334,76 +311,6 @@ fn record_batch_into_records(batch: &RecordBatch) -> Result<Vec<Record>, Envelop
         .as_any()
         .downcast_ref::<StringArray>()
         .ok_or_else(|| EnvelopeError::Decode("timestamp_type not Utf8".into()))?;
-    let keys_binary;
-    let keys_string;
-    let read_key: Box<dyn Fn(usize) -> Option<Vec<u8>>>;
-    match &key_column {
-        KeyColumn::Binary(arr) => {
-            keys_binary = arr
-                .as_any()
-                .downcast_ref::<LargeBinaryArray>()
-                .ok_or_else(|| EnvelopeError::Decode("key column not LargeBinary".into()))?
-                .clone();
-            let k = keys_binary.clone();
-            read_key = Box::new(move |i| {
-                if k.is_null(i) {
-                    None
-                } else {
-                    Some(k.value(i).to_vec())
-                }
-            });
-        }
-        KeyColumn::Utf8(arr) => {
-            keys_string = arr
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| EnvelopeError::Decode("key column not Utf8".into()))?
-                .clone();
-            let k = keys_string.clone();
-            read_key = Box::new(move |i| {
-                if k.is_null(i) {
-                    None
-                } else {
-                    Some(k.value(i).as_bytes().to_vec())
-                }
-            });
-        }
-    }
-    let values_binary;
-    let values_string;
-    let read_value: Box<dyn Fn(usize) -> Option<Vec<u8>>>;
-    match &value_column {
-        ValueColumn::Binary(arr) => {
-            values_binary = arr
-                .as_any()
-                .downcast_ref::<LargeBinaryArray>()
-                .ok_or_else(|| EnvelopeError::Decode("value column not LargeBinary".into()))?
-                .clone();
-            let v = values_binary.clone();
-            read_value = Box::new(move |i| {
-                if v.is_null(i) {
-                    None
-                } else {
-                    Some(v.value(i).to_vec())
-                }
-            });
-        }
-        ValueColumn::Json(arr) => {
-            values_string = arr
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| EnvelopeError::Decode("json column not Utf8".into()))?
-                .clone();
-            let v = values_string.clone();
-            read_value = Box::new(move |i| {
-                if v.is_null(i) {
-                    None
-                } else {
-                    Some(v.value(i).as_bytes().to_vec())
-                }
-            });
-        }
-    }
     let headers_list = headers
         .as_any()
         .downcast_ref::<ListArray>()
@@ -463,4 +370,46 @@ fn record_batch_into_records(batch: &RecordBatch) -> Result<Vec<Record>, Envelop
         });
     }
     Ok(out)
+}
+
+type PayloadReader = Box<dyn Fn(usize) -> Option<Vec<u8>>>;
+
+/// Returns a reader that converts the given column's value at index
+/// `i` into `Option<Vec<u8>>`. Branches once on the physical type and
+/// produces a small closure for the hot loop.
+fn payload_reader(name: &str, col: &ArrayRef) -> Result<PayloadReader, EnvelopeError> {
+    use arrow::array::{LargeBinaryArray, StringArray};
+    match col.data_type() {
+        DataType::LargeBinary => {
+            let arr = col
+                .as_any()
+                .downcast_ref::<LargeBinaryArray>()
+                .ok_or_else(|| EnvelopeError::Decode(format!("{name} not LargeBinary")))?
+                .clone();
+            Ok(Box::new(move |i| {
+                if arr.is_null(i) {
+                    None
+                } else {
+                    Some(arr.value(i).to_vec())
+                }
+            }))
+        }
+        DataType::Utf8 => {
+            let arr = col
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| EnvelopeError::Decode(format!("{name} not Utf8")))?
+                .clone();
+            Ok(Box::new(move |i| {
+                if arr.is_null(i) {
+                    None
+                } else {
+                    Some(arr.value(i).as_bytes().to_vec())
+                }
+            }))
+        }
+        other => Err(EnvelopeError::Decode(format!(
+            "{name} column must be LargeBinary or Utf8, got {other:?}"
+        ))),
+    }
 }

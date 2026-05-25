@@ -4,6 +4,16 @@
 //! - [`Config`] is the root type; see [`load_from_str`] / [`load_from_path`].
 //! - [`schema`] returns the JSON Schema for [`Config`], committed to
 //!   `schemas/mirror-v3.config.schema.json` in the repo and gated in CI.
+//!
+//! ## Shape
+//!
+//! - The `destination` block is **transport only**: where bytes land
+//!   (`type`, `bucket`, `endpoint`, `root`, `bootstrap-servers`, …).
+//! - Every property that shapes a file or governs a single mirror's
+//!   cadence — `format`, `compression`, `keys`, `values`, `flush`,
+//!   `compaction`, `timestamp-mode` — lives on the **mirror** entry.
+//!   A single process can run two mirrors with different encoding
+//!   profiles against the same destination.
 
 use std::path::{Path, PathBuf};
 
@@ -13,9 +23,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct Config {
-    /// Shared destination configuration. A mirror may override the
-    /// destination *name* (the path/prefix segment) but not the type
-    /// or transport.
+    /// Shared transport. Every mirror writes through this destination.
     pub destination: Destination,
 
     /// One mirror per (source topic, partition). Every mirror runs
@@ -36,17 +44,134 @@ pub enum Destination {
 pub struct KafkaDestination {
     /// `bootstrap.servers` for the destination cluster.
     pub bootstrap_servers: String,
-    /// Which timestamp lands on the destination record. Defaults to
-    /// `source` — preserves the source's `timestamp_ms` exactly. Set
-    /// to `destination` to have the destination broker stamp the
-    /// record on receipt (CreateTime = producer send-time, or
-    /// LogAppendTime if the destination topic is configured that
-    /// way).
-    #[serde(default)]
-    pub timestamp_mode: TimestampMode,
 }
 
-/// Per-Kafka-destination timestamp behaviour.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct FilesystemDestination {
+    /// Absolute path to the destination root directory. Each mirror
+    /// writes under `<root>/<mirror.name>/<partition>/`.
+    pub root: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct S3Destination {
+    /// S3 endpoint URL. Required for non-AWS S3 (e.g. VersityGW); omit
+    /// for AWS regional endpoints.
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    pub region: String,
+    pub bucket: String,
+    /// Key prefix prepended to all written object keys. Each mirror
+    /// writes under `<prefix?>/<mirror.name>/<partition>/<file>`.
+    #[serde(default)]
+    pub prefix: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct Mirror {
+    /// Identifier for the mirror. Also the on-disk / S3-prefix segment
+    /// under which this mirror's files land
+    /// (`<root>/<name>/<partition>/`). Must be unique across mirrors
+    /// inside the same process.
+    pub name: String,
+
+    pub source: KafkaSource,
+
+    /// Source Kafka topic name.
+    pub topic: String,
+
+    /// Source Kafka partition. Required, no default.
+    pub partition: u32,
+
+    /// Envelope format for written files. Required for `filesystem` and
+    /// `s3` destinations; forbidden for `kafka` destinations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format: Option<DestinationFormat>,
+
+    /// Parquet compression. Only meaningful when `format = parquet`.
+    /// Defaults to `zstd-1`. Forbidden for `kafka` destinations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compression: Option<ParquetCompression>,
+
+    /// Schema and validation for the record `key` column. Defaults to
+    /// `{ type: utf8 }`. Forbidden for `kafka` destinations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keys: Option<ColumnConfig>,
+
+    /// Schema and validation for the record `value` column. Defaults to
+    /// `{ type: utf8 }`. Forbidden for `kafka` destinations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub values: Option<ColumnConfig>,
+
+    /// Optional log-compaction mode. When `log`, each Parquet file is a
+    /// full materialized snapshot of the latest value per key. Requires
+    /// `format = parquet` and `keys.type` ∈ {`utf8`, `json`}. Forbidden
+    /// for `kafka` destinations.
+    #[serde(default)]
+    pub compaction: Option<Compaction>,
+
+    /// Flush triggers. Required for `filesystem` and `s3` destinations;
+    /// forbidden for `kafka` destinations (which never buffer).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flush: Option<FlushTriggers>,
+
+    /// Which timestamp lands on the destination record. Only meaningful
+    /// for `kafka` destinations; forbidden for `filesystem` and `s3`.
+    /// Defaults to `source`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timestamp_mode: Option<TimestampMode>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct KafkaSource {
+    pub bootstrap_servers: String,
+    /// Optional consumer group id used for monitoring/back-pressure
+    /// only. Restart correctness derives from the destination, never
+    /// from committed group offsets.
+    #[serde(default)]
+    pub group_id: Option<String>,
+}
+
+/// Schema for a record column (`key` or `value`). `type` is the only
+/// field today; future extensions (schema-registry refs, codecs) hang
+/// off this block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct ColumnConfig {
+    #[serde(rename = "type", default)]
+    pub kind: ColumnType,
+}
+
+/// Storage representation for a record column.
+///
+/// All three variants are valid for both `keys` and `values`. The
+/// physical Parquet column is always named `key` or `value`; the
+/// distinction between `utf8` and `json` is carried by the
+/// `arrow.json` extension metadata, not by the column name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum ColumnType {
+    /// Opaque bytes. Parquet physical type: `LargeBinary`. No
+    /// validation; suitable for protobuf-keyed topics or other binary
+    /// payloads.
+    Bytes,
+    /// UTF-8 string. Parquet physical type: `Utf8`. Non-UTF-8 input is
+    /// a hard error at encode time, pointing at the offending source
+    /// offset.
+    #[default]
+    Utf8,
+    /// UTF-8 JSON document. Parquet physical type: `Utf8` plus the
+    /// `arrow.json` canonical extension metadata (operator-facing
+    /// hint; mirror-v3 does **not** parse or validate JSON beyond
+    /// UTF-8). Same encode-time error contract as `utf8`.
+    Json,
+}
+
+/// Kafka-destination timestamp behaviour.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum TimestampMode {
@@ -59,93 +184,6 @@ pub enum TimestampMode {
     Destination,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields, rename_all = "kebab-case")]
-pub struct FilesystemDestination {
-    /// Absolute path to the destination root directory.
-    pub root: PathBuf,
-    /// Envelope format for written files. Defaults to `parquet`.
-    #[serde(default)]
-    pub format: DestinationFormat,
-    /// Parquet compression. Only meaningful when `format = parquet`.
-    /// Defaults to `zstd-1`.
-    #[serde(default)]
-    pub compression: ParquetCompression,
-    /// When `true` (and `format = parquet`), replace the binary
-    /// `value` column with a UTF-8 `json` column carrying the
-    /// Kafka value bytes verbatim. mirror-v3 does not parse or
-    /// validate JSON; it only enforces UTF-8. A non-UTF-8 value is
-    /// a hard error. Reject `json = true` if `format = ndjson`
-    /// (ndjson already carries the value, base64-encoded).
-    #[serde(default)]
-    pub json: bool,
-    /// Storage representation for the record `key`. Defaults to
-    /// `utf8`: keys are validated UTF-8 at encode time and the
-    /// Parquet column is `Utf8` (operator-friendly — DuckDB reads it
-    /// as `VARCHAR`). Set to `binary` for raw bytes (no validation,
-    /// `LargeBinary` column) — required for protobuf-keyed topics
-    /// and similar.
-    #[serde(default)]
-    pub key_type: KeyType,
-    /// Opt-in log-compaction mode. `null` (default) leaves the sink
-    /// in append mode. `log` switches to Kafka-style key-based
-    /// compaction: each Parquet file is a full materialized snapshot
-    /// of the latest value per key. Requires `format = parquet` and
-    /// `key-type = utf8`.
-    #[serde(default)]
-    pub compaction: Option<Compaction>,
-    pub flush: FlushTriggers,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields, rename_all = "kebab-case")]
-pub struct S3Destination {
-    /// S3 endpoint URL. Required for non-AWS S3 (e.g. VersityGW); omit
-    /// for AWS regional endpoints.
-    #[serde(default)]
-    pub endpoint: Option<String>,
-    pub region: String,
-    pub bucket: String,
-    /// Key prefix prepended to all written object keys.
-    #[serde(default)]
-    pub prefix: Option<String>,
-    /// Envelope format for written objects. Defaults to `parquet`.
-    #[serde(default)]
-    pub format: DestinationFormat,
-    /// Parquet compression. Only meaningful when `format = parquet`.
-    /// Defaults to `zstd-1`.
-    #[serde(default)]
-    pub compression: ParquetCompression,
-    /// When `true` (and `format = parquet`), replace the binary
-    /// `value` column with a UTF-8 `json` column. See the
-    /// equivalent field on `FilesystemDestination` for the
-    /// semantics; `json = true` with `format = ndjson` is
-    /// rejected at config-load time.
-    #[serde(default)]
-    pub json: bool,
-    /// Key storage representation. See `FilesystemDestination::key_type`.
-    #[serde(default)]
-    pub key_type: KeyType,
-    /// Log-compaction mode. See `FilesystemDestination::compaction`.
-    #[serde(default)]
-    pub compaction: Option<Compaction>,
-    pub flush: FlushTriggers,
-}
-
-/// How the record `key` is represented on disk.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
-#[serde(rename_all = "kebab-case")]
-pub enum KeyType {
-    /// Keys are validated as UTF-8 at encode (hard error on non-UTF-8,
-    /// with the offending source offset). Parquet column type: `Utf8`.
-    #[default]
-    Utf8,
-    /// Keys are opaque bytes — no validation. Parquet column type:
-    /// `LargeBinary`. Required for non-UTF-8 keys (e.g. protobuf-keyed
-    /// topics). Incompatible with `compaction = log`.
-    Binary,
-}
-
 /// Compaction strategy. Reserved for future variants (e.g. windowed,
 /// range). Default is "no compaction" (omit the field).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -154,8 +192,8 @@ pub enum Compaction {
     /// Kafka-style log compaction: keep the latest value per key.
     /// Each Parquet file is a full materialized snapshot. Null-value
     /// records are interpreted as tombstones (the key is removed
-    /// from the materialized view). Null and non-UTF-8 keys are hard
-    /// errors at encode time.
+    /// from the materialized view). Null keys and non-UTF-8 keys are
+    /// hard errors at encode time.
     Log,
 }
 
@@ -170,7 +208,8 @@ pub enum DestinationFormat {
     Parquet,
     /// Newline-delimited JSON, one record per line, base64-encoded
     /// binary fields. Operator-friendly for `jq` debugging; larger
-    /// on disk than Parquet.
+    /// on disk than Parquet. Incompatible with non-default `keys`,
+    /// `values` and `compaction`.
     Ndjson,
 }
 
@@ -195,10 +234,10 @@ pub enum ParquetCompression {
     Uncompressed,
 }
 
-/// Flush triggers for blob-style destinations (Filesystem, S3). The
-/// three size/time triggers must be set; any one tripping causes a
-/// flush (set to a very large number to effectively disable). The
-/// optional `daily` trigger adds a wall-clock-UTC boundary on top.
+/// Flush triggers for blob-style mirrors (Filesystem, S3). The three
+/// size/time triggers must be set; any one tripping causes a flush
+/// (set a trigger to a very large number to effectively disable it).
+/// The optional `daily` trigger adds a wall-clock-UTC boundary on top.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct FlushTriggers {
@@ -324,39 +363,6 @@ mod daily_tests {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields, rename_all = "kebab-case")]
-pub struct Mirror {
-    /// Human-readable identifier; appears in logs, metrics and in the
-    /// destination naming when `destination_name_override` is unset.
-    pub name: String,
-
-    pub source: KafkaSource,
-
-    /// Source Kafka topic name.
-    pub topic: String,
-
-    /// Source Kafka partition. Required, no default.
-    pub partition: u32,
-
-    /// Override the destination naming for this mirror. For
-    /// Filesystem/S3 this replaces the leading path/prefix segment;
-    /// for Kafka it overrides the destination topic name.
-    #[serde(default)]
-    pub destination_name_override: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields, rename_all = "kebab-case")]
-pub struct KafkaSource {
-    pub bootstrap_servers: String,
-    /// Optional consumer group id used for monitoring/back-pressure
-    /// only. Restart correctness derives from the destination, never
-    /// from committed group offsets.
-    #[serde(default)]
-    pub group_id: Option<String>,
-}
-
 /// JSON Schema for [`Config`]. Use this from `xtask gen-schema` to
 /// regenerate `schemas/mirror-v3.config.schema.json`.
 pub fn schema() -> Schema {
@@ -394,50 +400,74 @@ pub fn load_from_path(path: &Path) -> Result<Config, LoadError> {
 }
 
 /// Cross-field validation that can't be expressed in serde attributes.
-/// Currently: `json = true` requires `format = parquet`; ndjson already
-/// carries the value (base64), so the json column would be a no-op
-/// silently — better to reject loudly at load time.
 fn validate(cfg: &Config) -> Result<(), LoadError> {
-    match &cfg.destination {
-        Destination::Filesystem(fs) => {
-            if fs.json && matches!(fs.format, DestinationFormat::Ndjson) {
-                return Err(LoadError::Validation(
-                    "filesystem.json = true requires filesystem.format = parquet".into(),
-                ));
+    let is_kafka = matches!(cfg.destination, Destination::Kafka(_));
+    let mut seen_names: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for m in &cfg.mirrors {
+        if !seen_names.insert(&m.name) {
+            return Err(LoadError::Validation(format!(
+                "mirror name {:?} appears more than once",
+                m.name
+            )));
+        }
+        if is_kafka {
+            for (field, present) in [
+                ("format", m.format.is_some()),
+                ("compression", m.compression.is_some()),
+                ("keys", m.keys.is_some()),
+                ("values", m.values.is_some()),
+                ("compaction", m.compaction.is_some()),
+                ("flush", m.flush.is_some()),
+            ] {
+                if present {
+                    return Err(LoadError::Validation(format!(
+                        "mirror {:?}: `{field}` is only valid for filesystem/s3 destinations",
+                        m.name
+                    )));
+                }
             }
-            if let Some(Compaction::Log) = fs.compaction {
-                if matches!(fs.format, DestinationFormat::Ndjson) {
-                    return Err(LoadError::Validation(
-                        "filesystem.compaction = log requires filesystem.format = parquet".into(),
-                    ));
+        } else {
+            if m.timestamp_mode.is_some() {
+                return Err(LoadError::Validation(format!(
+                    "mirror {:?}: `timestamp-mode` is only valid for kafka destinations",
+                    m.name
+                )));
+            }
+            if m.flush.is_none() {
+                return Err(LoadError::Validation(format!(
+                    "mirror {:?}: `flush` is required for filesystem/s3 destinations",
+                    m.name
+                )));
+            }
+            let format = m.format.unwrap_or_default();
+            let keys = m.keys.unwrap_or_default();
+            let values = m.values.unwrap_or_default();
+            if matches!(format, DestinationFormat::Ndjson) {
+                if !matches!(keys.kind, ColumnType::Utf8)
+                    || !matches!(values.kind, ColumnType::Utf8)
+                {
+                    return Err(LoadError::Validation(format!(
+                        "mirror {:?}: ndjson does not honour `keys`/`values` types; \
+                         remove them or switch to `format: parquet`",
+                        m.name
+                    )));
                 }
-                if matches!(fs.key_type, KeyType::Binary) {
-                    return Err(LoadError::Validation(
-                        "filesystem.compaction = log requires filesystem.key-type = utf8".into(),
-                    ));
+                if m.compaction.is_some() {
+                    return Err(LoadError::Validation(format!(
+                        "mirror {:?}: `compaction` requires `format: parquet`",
+                        m.name
+                    )));
                 }
+            }
+            if matches!(m.compaction, Some(Compaction::Log))
+                && matches!(keys.kind, ColumnType::Bytes)
+            {
+                return Err(LoadError::Validation(format!(
+                    "mirror {:?}: `compaction: log` requires `keys.type` ∈ {{utf8, json}}",
+                    m.name
+                )));
             }
         }
-        Destination::S3(s3) => {
-            if s3.json && matches!(s3.format, DestinationFormat::Ndjson) {
-                return Err(LoadError::Validation(
-                    "s3.json = true requires s3.format = parquet".into(),
-                ));
-            }
-            if let Some(Compaction::Log) = s3.compaction {
-                if matches!(s3.format, DestinationFormat::Ndjson) {
-                    return Err(LoadError::Validation(
-                        "s3.compaction = log requires s3.format = parquet".into(),
-                    ));
-                }
-                if matches!(s3.key_type, KeyType::Binary) {
-                    return Err(LoadError::Validation(
-                        "s3.compaction = log requires s3.key-type = utf8".into(),
-                    ));
-                }
-            }
-        }
-        Destination::Kafka(_) => {}
     }
     Ok(())
 }

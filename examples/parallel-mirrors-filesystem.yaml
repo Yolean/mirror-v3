@@ -1,7 +1,7 @@
 # yaml-language-server: $schema=../schemas/mirror-v3.config.schema.json
 #
-# Two mirrors of distinct partitions, archived to the local
-# filesystem with per-mirror flush triggers.
+# Two mirrors of distinct partitions, archived to the local filesystem
+# with per-mirror flush triggers.
 #
 # !! Deployment requirement !!
 # "Parallel" here means N mirrors run inside a SINGLE process. The
@@ -14,45 +14,41 @@
 destination:
   type: filesystem
   root: /var/lib/mirror-v3
-  # format defaults to `parquet`; uncomment for the ndjson debug format
-  # format: ndjson
-  # compression defaults to `zstd-1`. Other options: zstd-3, snappy, lz4, uncompressed.
-  # compression: zstd-1
-  # Opt-in: emit the Kafka value verbatim as a Utf8 `json` column (with
-  # `arrow.json` extension metadata) instead of the default
-  # `value: LargeBinary` column. Requires `format: parquet`; non-UTF-8
-  # values become a hard error. Useful for DuckDB / Athena consumers
-  # that want VARCHAR / JSON straight from the schema.
-  # json: true
-  # Key storage representation. Defaults to `utf8` — the Parquet column
-  # is `key: Utf8` (readable as VARCHAR) and non-UTF-8 keys are a hard
-  # error at encode. Use `binary` for protobuf-keyed topics or anything
-  # else with raw byte keys.
-  # key-type: utf8
-  # Opt-in: Kafka-style log compaction. Each Parquet file is a full
-  # materialized snapshot of the latest value per key; null-value
-  # records are tombstones; null/non-UTF-8 keys are hard errors at
-  # encode. Requires `format: parquet` and `key-type: utf8` (default).
-  # On restart the latest snapshot bootstraps the in-memory view; old
-  # snapshots can be GC'd out-of-band (e.g. `find ... -mtime +N -delete`).
-  # compaction: log
-  flush:
-    max-time-ms: 5000          # at most 5s of buffering
-    max-bytes: 67108864        # or 64 MiB — parquet files want some heft to amortize the footer
-    max-offsets: 10000         # or 10k source offsets
-    # Optional: also force a flush at a fixed UTC time each day. If the
-    # buffer is empty at the boundary, the slot is silently skipped.
-    # daily:
-    #   at-utc: "00:00:00"
 
+# Per-mirror encoding. Each mirror writes under
+# `<root>/<mirror.name>/<partition>/<from>-<to>.<ext>`.
 mirrors:
   - name: operations-p0
     source:
       bootstrap-servers: kafka-source:9092
     topic: operations-v1
     partition: 0
+    # format defaults to `parquet`; use `ndjson` for jq-friendly dumps.
+    # format: parquet
+    # compression defaults to `zstd-1`. Other options: zstd-3, snappy, lz4, uncompressed.
+    # compression: zstd-1
+    # `keys` and `values` default to `{ type: utf8 }` — UTF-8 enforced
+    # at encode, Parquet column is `Utf8`. Use `{ type: bytes }` for
+    # raw bytes (no validation, `LargeBinary`). Use `{ type: json }`
+    # for the same Utf8 column tagged with the `arrow.json` canonical
+    # extension metadata (operator-facing hint; mirror-v3 does NOT
+    # parse JSON beyond UTF-8 enforcement).
+    # keys:   { type: utf8 }
+    # values: { type: json }
+    flush:
+      max-time-ms: 5000          # at most 5s of buffering
+      max-bytes: 67108864        # or 64 MiB
+      max-offsets: 10000         # or 10k source offsets
+      # Optional: also force a flush at a fixed UTC time each day. If the
+      # buffer is empty at the boundary, the slot is silently skipped.
+      # daily:
+      #   at-utc: "00:00:00"
   - name: operations-p1
     source:
       bootstrap-servers: kafka-source:9092
     topic: operations-v1
     partition: 1
+    flush:
+      max-time-ms: 5000
+      max-bytes: 67108864
+      max-offsets: 10000

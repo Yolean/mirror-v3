@@ -38,8 +38,8 @@ fn spec(source: &str, root: &std::path::Path, group: &str, flush: FlushTriggers)
         destination_name: "ops".into(),
         format: mirror_envelope::Format::Ndjson,
         compression: mirror_envelope::ParquetCompression::Zstd1,
-        value_as_json: false,
-        key_type: mirror_envelope::KeyType::Utf8,
+        keys: mirror_envelope::ColumnType::Utf8,
+        values: mirror_envelope::ColumnType::Utf8,
         compaction: None,
         flush,
     }
@@ -187,8 +187,8 @@ async fn two_writers_with_different_flush_triggers_are_caught() {
         partition: 0,
         format: mirror_envelope::Format::Ndjson,
         compression: mirror_envelope::ParquetCompression::Zstd1,
-        value_as_json: false,
-        key_type: mirror_envelope::KeyType::Utf8,
+        keys: mirror_envelope::ColumnType::Utf8,
+        values: mirror_envelope::ColumnType::Utf8,
         compaction: None,
         flush: flush_every(10),
     });

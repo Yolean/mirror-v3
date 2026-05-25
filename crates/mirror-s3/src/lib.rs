@@ -23,7 +23,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::StreamExt;
 use mirror_core::{Record, Sink, SinkError};
-use mirror_envelope::{Format, KeyType, ParquetCompression};
+use mirror_envelope::{ColumnType, Format, ParquetCompression};
 use mirror_fs::naming;
 use object_store::path::Path;
 use object_store::{ObjectStore, PutMode, PutOptions, PutPayload};
@@ -58,16 +58,14 @@ pub struct S3SinkConfig {
     pub partition: u32,
     pub format: Format,
     pub compression: ParquetCompression,
-    /// When true with Parquet, value bytes are written verbatim as a
-    /// `json: Utf8` column (with `arrow.json` extension metadata) and
-    /// non-UTF-8 values are a hard error. Caller must reject this
-    /// combined with `Format::Ndjson` before constructing the sink.
-    pub value_as_json: bool,
-    /// Storage representation for the record `key`. Compaction requires Utf8.
-    pub key_type: KeyType,
+    /// Storage representation for the record `key`. Caller is
+    /// responsible for pairing `Bytes` with `compaction = None`.
+    pub keys: ColumnType,
+    /// Storage representation for the record `value`.
+    pub values: ColumnType,
     /// Optional log-compaction mode. See `mirror_fs::CompactionMode`.
     /// Caller must combine `Some(Log)` with `Format::Parquet` and
-    /// `KeyType::Utf8`.
+    /// `keys` ∈ {`Utf8`, `Json`}.
     pub compaction: Option<CompactionMode>,
     pub flush: FlushTriggers,
 }
@@ -84,8 +82,8 @@ pub struct S3Sink {
     partition_prefix: Path,
     format: Format,
     compression: ParquetCompression,
-    value_as_json: bool,
-    key_type: KeyType,
+    keys: ColumnType,
+    values: ColumnType,
     compaction: Option<CompactionMode>,
     flush: FlushTriggers,
     durable_position: u64,
@@ -135,8 +133,8 @@ impl S3Sink {
             partition_prefix,
             format: cfg.format,
             compression: cfg.compression,
-            value_as_json: cfg.value_as_json,
-            key_type: cfg.key_type,
+            keys: cfg.keys,
+            values: cfg.values,
             compaction: cfg.compaction,
             flush: cfg.flush,
             durable_position,
@@ -220,8 +218,8 @@ impl S3Sink {
         let bytes = mirror_envelope::encode_batch(
             self.format,
             self.compression,
-            self.value_as_json,
-            self.key_type,
+            self.keys,
+            self.values,
             &to_encode,
         )
         .map_err(|e| SinkError::Transport(format!("encode: {e}")))?;

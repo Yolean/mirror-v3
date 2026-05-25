@@ -32,8 +32,8 @@ fn cfg(root: &std::path::Path, max_offsets: u64) -> FilesystemSinkConfig {
         partition: 0,
         format: Format::Ndjson,
         compression: ParquetCompression::Zstd1,
-        value_as_json: false,
-        key_type: mirror_envelope::KeyType::Utf8,
+        keys: mirror_envelope::ColumnType::Utf8,
+        values: mirror_envelope::ColumnType::Utf8,
         compaction: None,
         flush: FlushTriggers {
             max_time: Duration::from_secs(3600),
@@ -340,8 +340,8 @@ fn cfg_compacted(root: &std::path::Path, max_offsets: u64) -> FilesystemSinkConf
         partition: 0,
         format: Format::Parquet,
         compression: ParquetCompression::Zstd1,
-        value_as_json: false,
-        key_type: mirror_envelope::KeyType::Utf8,
+        keys: mirror_envelope::ColumnType::Utf8,
+        values: mirror_envelope::ColumnType::Utf8,
         compaction: Some(mirror_fs::CompactionMode::Log),
         flush: FlushTriggers {
             max_time: Duration::from_secs(3600),

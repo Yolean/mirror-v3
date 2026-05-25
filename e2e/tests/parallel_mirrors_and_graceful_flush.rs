@@ -69,8 +69,8 @@ async fn two_mirrors_run_in_parallel_and_flush_on_shutdown() {
         destination_name: "ops".into(),
         format: mirror_envelope::Format::Ndjson,
         compression: mirror_envelope::ParquetCompression::Zstd1,
-        value_as_json: false,
-        key_type: mirror_envelope::KeyType::Utf8,
+        keys: mirror_envelope::ColumnType::Utf8,
+        values: mirror_envelope::ColumnType::Utf8,
         compaction: None,
         flush,
     })
@@ -84,8 +84,8 @@ async fn two_mirrors_run_in_parallel_and_flush_on_shutdown() {
         destination_name: "ops".into(),
         format: mirror_envelope::Format::Ndjson,
         compression: mirror_envelope::ParquetCompression::Zstd1,
-        value_as_json: false,
-        key_type: mirror_envelope::KeyType::Utf8,
+        keys: mirror_envelope::ColumnType::Utf8,
+        values: mirror_envelope::ColumnType::Utf8,
         compaction: None,
         flush,
     })

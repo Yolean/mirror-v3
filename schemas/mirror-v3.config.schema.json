@@ -4,7 +4,7 @@
   "type": "object",
   "properties": {
     "destination": {
-      "description": "Shared destination configuration. A mirror may override the\ndestination *name* (the path/prefix segment) but not the type\nor transport.",
+      "description": "Shared transport. Every mirror writes through this destination.",
       "$ref": "#/$defs/Destination"
     },
     "mirrors": {
@@ -30,11 +30,6 @@
               "description": "`bootstrap.servers` for the destination cluster.",
               "type": "string"
             },
-            "timestamp-mode": {
-              "description": "Which timestamp lands on the destination record. Defaults to\n`source` — preserves the source's `timestamp_ms` exactly. Set\nto `destination` to have the destination broker stamp the\nrecord on receipt (CreateTime = producer send-time, or\nLogAppendTime if the destination topic is configured that\nway).",
-              "$ref": "#/$defs/TimestampMode",
-              "default": "source"
-            },
             "type": {
               "type": "string",
               "const": "kafka"
@@ -50,43 +45,8 @@
           "type": "object",
           "properties": {
             "root": {
-              "description": "Absolute path to the destination root directory.",
+              "description": "Absolute path to the destination root directory. Each mirror\nwrites under `<root>/<mirror.name>/<partition>/`.",
               "type": "string"
-            },
-            "format": {
-              "description": "Envelope format for written files. Defaults to `parquet`.",
-              "$ref": "#/$defs/DestinationFormat",
-              "default": "parquet"
-            },
-            "compression": {
-              "description": "Parquet compression. Only meaningful when `format = parquet`.\nDefaults to `zstd-1`.",
-              "$ref": "#/$defs/ParquetCompression",
-              "default": "zstd-1"
-            },
-            "json": {
-              "description": "When `true` (and `format = parquet`), replace the binary\n`value` column with a UTF-8 `json` column carrying the\nKafka value bytes verbatim. mirror-v3 does not parse or\nvalidate JSON; it only enforces UTF-8. A non-UTF-8 value is\na hard error. Reject `json = true` if `format = ndjson`\n(ndjson already carries the value, base64-encoded).",
-              "type": "boolean",
-              "default": false
-            },
-            "key-type": {
-              "description": "Storage representation for the record `key`. Defaults to\n`utf8`: keys are validated UTF-8 at encode time and the\nParquet column is `Utf8` (operator-friendly — DuckDB reads it\nas `VARCHAR`). Set to `binary` for raw bytes (no validation,\n`LargeBinary` column) — required for protobuf-keyed topics\nand similar.",
-              "$ref": "#/$defs/KeyType",
-              "default": "utf8"
-            },
-            "compaction": {
-              "description": "Opt-in log-compaction mode. `null` (default) leaves the sink\nin append mode. `log` switches to Kafka-style key-based\ncompaction: each Parquet file is a full materialized snapshot\nof the latest value per key. Requires `format = parquet` and\n`key-type = utf8`.",
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/Compaction"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "default": null
-            },
-            "flush": {
-              "$ref": "#/$defs/FlushTriggers"
             },
             "type": {
               "type": "string",
@@ -96,8 +56,7 @@
           "additionalProperties": false,
           "required": [
             "type",
-            "root",
-            "flush"
+            "root"
           ]
         },
         {
@@ -118,47 +77,12 @@
               "type": "string"
             },
             "prefix": {
-              "description": "Key prefix prepended to all written object keys.",
+              "description": "Key prefix prepended to all written object keys. Each mirror\nwrites under `<prefix?>/<mirror.name>/<partition>/<file>`.",
               "type": [
                 "string",
                 "null"
               ],
               "default": null
-            },
-            "format": {
-              "description": "Envelope format for written objects. Defaults to `parquet`.",
-              "$ref": "#/$defs/DestinationFormat",
-              "default": "parquet"
-            },
-            "compression": {
-              "description": "Parquet compression. Only meaningful when `format = parquet`.\nDefaults to `zstd-1`.",
-              "$ref": "#/$defs/ParquetCompression",
-              "default": "zstd-1"
-            },
-            "json": {
-              "description": "When `true` (and `format = parquet`), replace the binary\n`value` column with a UTF-8 `json` column. See the\nequivalent field on `FilesystemDestination` for the\nsemantics; `json = true` with `format = ndjson` is\nrejected at config-load time.",
-              "type": "boolean",
-              "default": false
-            },
-            "key-type": {
-              "description": "Key storage representation. See `FilesystemDestination::key_type`.",
-              "$ref": "#/$defs/KeyType",
-              "default": "utf8"
-            },
-            "compaction": {
-              "description": "Log-compaction mode. See `FilesystemDestination::compaction`.",
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/Compaction"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "default": null
-            },
-            "flush": {
-              "$ref": "#/$defs/FlushTriggers"
             },
             "type": {
               "type": "string",
@@ -169,25 +93,136 @@
           "required": [
             "type",
             "region",
-            "bucket",
-            "flush"
+            "bucket"
           ]
         }
       ]
     },
-    "TimestampMode": {
-      "description": "Per-Kafka-destination timestamp behaviour.",
-      "oneOf": [
-        {
-          "description": "Pass `record.timestamp_ms` to the producer. Destination\nstores it as CreateTime.",
-          "type": "string",
-          "const": "source"
+    "Mirror": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "description": "Identifier for the mirror. Also the on-disk / S3-prefix segment\nunder which this mirror's files land\n(`<root>/<name>/<partition>/`). Must be unique across mirrors\ninside the same process.",
+          "type": "string"
         },
-        {
-          "description": "Do not pass an explicit timestamp; the destination broker\nstamps the record itself.",
-          "type": "string",
-          "const": "destination"
+        "source": {
+          "$ref": "#/$defs/KafkaSource"
+        },
+        "topic": {
+          "description": "Source Kafka topic name.",
+          "type": "string"
+        },
+        "partition": {
+          "description": "Source Kafka partition. Required, no default.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "format": {
+          "description": "Envelope format for written files. Required for `filesystem` and\n`s3` destinations; forbidden for `kafka` destinations.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DestinationFormat"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "compression": {
+          "description": "Parquet compression. Only meaningful when `format = parquet`.\nDefaults to `zstd-1`. Forbidden for `kafka` destinations.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ParquetCompression"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "keys": {
+          "description": "Schema and validation for the record `key` column. Defaults to\n`{ type: utf8 }`. Forbidden for `kafka` destinations.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ColumnConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "values": {
+          "description": "Schema and validation for the record `value` column. Defaults to\n`{ type: utf8 }`. Forbidden for `kafka` destinations.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ColumnConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "compaction": {
+          "description": "Optional log-compaction mode. When `log`, each Parquet file is a\nfull materialized snapshot of the latest value per key. Requires\n`format = parquet` and `keys.type` ∈ {`utf8`, `json`}. Forbidden\nfor `kafka` destinations.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Compaction"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "flush": {
+          "description": "Flush triggers. Required for `filesystem` and `s3` destinations;\nforbidden for `kafka` destinations (which never buffer).",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FlushTriggers"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "timestamp-mode": {
+          "description": "Which timestamp lands on the destination record. Only meaningful\nfor `kafka` destinations; forbidden for `filesystem` and `s3`.\nDefaults to `source`.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TimestampMode"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "source",
+        "topic",
+        "partition"
+      ]
+    },
+    "KafkaSource": {
+      "type": "object",
+      "properties": {
+        "bootstrap-servers": {
+          "type": "string"
+        },
+        "group-id": {
+          "description": "Optional consumer group id used for monitoring/back-pressure\nonly. Restart correctness derives from the destination, never\nfrom committed group offsets.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "bootstrap-servers"
       ]
     },
     "DestinationFormat": {
@@ -199,7 +234,7 @@
           "const": "parquet"
         },
         {
-          "description": "Newline-delimited JSON, one record per line, base64-encoded\nbinary fields. Operator-friendly for `jq` debugging; larger\non disk than Parquet.",
+          "description": "Newline-delimited JSON, one record per line, base64-encoded\nbinary fields. Operator-friendly for `jq` debugging; larger\non disk than Parquet. Incompatible with non-default `keys`,\n`values` and `compaction`.",
           "type": "string",
           "const": "ndjson"
         }
@@ -235,18 +270,34 @@
         }
       ]
     },
-    "KeyType": {
-      "description": "How the record `key` is represented on disk.",
+    "ColumnConfig": {
+      "description": "Schema for a record column (`key` or `value`). `type` is the only\nfield today; future extensions (schema-registry refs, codecs) hang\noff this block.",
+      "type": "object",
+      "properties": {
+        "type": {
+          "$ref": "#/$defs/ColumnType",
+          "default": "utf8"
+        }
+      },
+      "additionalProperties": false
+    },
+    "ColumnType": {
+      "description": "Storage representation for a record column.\n\nAll three variants are valid for both `keys` and `values`. The\nphysical Parquet column is always named `key` or `value`; the\ndistinction between `utf8` and `json` is carried by the\n`arrow.json` extension metadata, not by the column name.",
       "oneOf": [
         {
-          "description": "Keys are validated as UTF-8 at encode (hard error on non-UTF-8,\nwith the offending source offset). Parquet column type: `Utf8`.",
+          "description": "Opaque bytes. Parquet physical type: `LargeBinary`. No\nvalidation; suitable for protobuf-keyed topics or other binary\npayloads.",
+          "type": "string",
+          "const": "bytes"
+        },
+        {
+          "description": "UTF-8 string. Parquet physical type: `Utf8`. Non-UTF-8 input is\na hard error at encode time, pointing at the offending source\noffset.",
           "type": "string",
           "const": "utf8"
         },
         {
-          "description": "Keys are opaque bytes — no validation. Parquet column type:\n`LargeBinary`. Required for non-UTF-8 keys (e.g. protobuf-keyed\ntopics). Incompatible with `compaction = log`.",
+          "description": "UTF-8 JSON document. Parquet physical type: `Utf8` plus the\n`arrow.json` canonical extension metadata (operator-facing\nhint; mirror-v3 does **not** parse or validate JSON beyond\nUTF-8). Same encode-time error contract as `utf8`.",
           "type": "string",
-          "const": "binary"
+          "const": "json"
         }
       ]
     },
@@ -254,14 +305,14 @@
       "description": "Compaction strategy. Reserved for future variants (e.g. windowed,\nrange). Default is \"no compaction\" (omit the field).",
       "oneOf": [
         {
-          "description": "Kafka-style log compaction: keep the latest value per key.\nEach Parquet file is a full materialized snapshot. Null-value\nrecords are interpreted as tombstones (the key is removed\nfrom the materialized view). Null and non-UTF-8 keys are hard\nerrors at encode time.",
+          "description": "Kafka-style log compaction: keep the latest value per key.\nEach Parquet file is a full materialized snapshot. Null-value\nrecords are interpreted as tombstones (the key is removed\nfrom the materialized view). Null keys and non-UTF-8 keys are\nhard errors at encode time.",
           "type": "string",
           "const": "log"
         }
       ]
     },
     "FlushTriggers": {
-      "description": "Flush triggers for blob-style destinations (Filesystem, S3). The\nthree size/time triggers must be set; any one tripping causes a\nflush (set to a very large number to effectively disable). The\noptional `daily` trigger adds a wall-clock-UTC boundary on top.",
+      "description": "Flush triggers for blob-style mirrors (Filesystem, S3). The three\nsize/time triggers must be set; any one tripping causes a flush\n(set a trigger to a very large number to effectively disable it).\nThe optional `daily` trigger adds a wall-clock-UTC boundary on top.",
       "type": "object",
       "properties": {
         "max-time-ms": {
@@ -316,61 +367,19 @@
         "at-utc"
       ]
     },
-    "Mirror": {
-      "type": "object",
-      "properties": {
-        "name": {
-          "description": "Human-readable identifier; appears in logs, metrics and in the\ndestination naming when `destination_name_override` is unset.",
-          "type": "string"
+    "TimestampMode": {
+      "description": "Kafka-destination timestamp behaviour.",
+      "oneOf": [
+        {
+          "description": "Pass `record.timestamp_ms` to the producer. Destination\nstores it as CreateTime.",
+          "type": "string",
+          "const": "source"
         },
-        "source": {
-          "$ref": "#/$defs/KafkaSource"
-        },
-        "topic": {
-          "description": "Source Kafka topic name.",
-          "type": "string"
-        },
-        "partition": {
-          "description": "Source Kafka partition. Required, no default.",
-          "type": "integer",
-          "format": "uint32",
-          "minimum": 0
-        },
-        "destination-name-override": {
-          "description": "Override the destination naming for this mirror. For\nFilesystem/S3 this replaces the leading path/prefix segment;\nfor Kafka it overrides the destination topic name.",
-          "type": [
-            "string",
-            "null"
-          ],
-          "default": null
+        {
+          "description": "Do not pass an explicit timestamp; the destination broker\nstamps the record itself.",
+          "type": "string",
+          "const": "destination"
         }
-      },
-      "additionalProperties": false,
-      "required": [
-        "name",
-        "source",
-        "topic",
-        "partition"
-      ]
-    },
-    "KafkaSource": {
-      "type": "object",
-      "properties": {
-        "bootstrap-servers": {
-          "type": "string"
-        },
-        "group-id": {
-          "description": "Optional consumer group id used for monitoring/back-pressure\nonly. Restart correctness derives from the destination, never\nfrom committed group offsets.",
-          "type": [
-            "string",
-            "null"
-          ],
-          "default": null
-        }
-      },
-      "additionalProperties": false,
-      "required": [
-        "bootstrap-servers"
       ]
     }
   }

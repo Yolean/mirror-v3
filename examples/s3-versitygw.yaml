@@ -1,7 +1,10 @@
 # yaml-language-server: $schema=../schemas/mirror-v3.config.schema.json
 #
-# S3 destination against an in-cluster VersityGW gateway. The same
-# config shape applies to real AWS S3 (drop `endpoint`).
+# Two mirrors against the same VersityGW bucket: an append-mode event
+# stream (`orders`, value column tagged as JSON) and a compacted table
+# (`user-states`, latest value per key per snapshot).
+#
+# Each mirror writes under `<prefix>/<mirror.name>/<partition>/<file>`.
 #
 # !! Deployment requirement !!
 # The destination MUST have exactly one writer per (topic, partition)
@@ -19,31 +22,40 @@ destination:
   region: us-east-1
   bucket: mirror-v3
   prefix: archive/
-  # format defaults to `parquet`; switch to `ndjson` for jq-friendly dumps
-  # format: ndjson
-  # compression defaults to `zstd-1`.
-  # compression: zstd-1
-  # Opt-in: emit the Kafka value verbatim as a Utf8 `json` column
-  # (with `arrow.json` extension metadata) instead of the default
-  # `value: LargeBinary` column. Requires `format: parquet`; non-UTF-8
-  # values become a hard error.
-  # json: true
-  # Key storage representation. Defaults to `utf8` (key column is
-  # `Utf8`, non-UTF-8 keys are a hard error). Use `binary` for raw
-  # byte keys.
-  # key-type: utf8
-  # Opt-in Kafka-style log compaction (see filesystem example for
-  # details). Requires `format: parquet` and `key-type: utf8`.
-  # compaction: log
-  flush:
-    max-time-ms: 60000         # at most 60s of buffering
-    max-bytes: 67108864        # or 64 MiB — parquet files want some heft to amortize the footer
-    max-offsets: 10000         # or 10k source offsets
 
 mirrors:
-  - name: operations
+  - name: orders
     source:
       bootstrap-servers: kafka-source:9092
-    topic: operations-v1
+    topic: orders
     partition: 0
-    destination-name-override: operations-archive
+    format: parquet
+    compression: zstd-1
+    # `values: { type: json }` writes `value` as a Utf8 column tagged
+    # with the `arrow.json` canonical extension metadata. Operators
+    # using DuckDB / Athena get a VARCHAR column with a JSON hint;
+    # mirror-v3 itself does not parse the values beyond UTF-8.
+    values: { type: json }
+    flush:
+      max-time-ms: 60000
+      max-bytes: 67108864
+      max-offsets: 10000
+  - name: user-states
+    source:
+      bootstrap-servers: kafka-source:9092
+    topic: user-states
+    partition: 0
+    format: parquet
+    compression: zstd-1
+    # Kafka-style log compaction. Each Parquet file is a full
+    # materialized snapshot of the latest value per key; null-value
+    # records are tombstones; null/non-UTF-8 keys are hard errors at
+    # encode. On restart the latest snapshot bootstraps the in-memory
+    # view; older snapshots may be GC'd out of band.
+    # Requires `format: parquet` and `keys.type` ∈ {utf8, json}
+    # (defaults to utf8).
+    compaction: log
+    flush:
+      max-time-ms: 60000
+      max-bytes: 67108864
+      max-offsets: 10000

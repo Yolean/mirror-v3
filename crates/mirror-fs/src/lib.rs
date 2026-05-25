@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use mirror_core::{Record, Sink, SinkError};
-use mirror_envelope::{Format, KeyType, ParquetCompression};
+use mirror_envelope::{ColumnType, Format, ParquetCompression};
 use tokio::io::AsyncWriteExt;
 
 pub mod naming;
@@ -48,18 +48,15 @@ pub struct FilesystemSinkConfig {
     pub partition: u32,
     pub format: Format,
     pub compression: ParquetCompression,
-    /// When true with Parquet, value bytes are written verbatim as a
-    /// `json: Utf8` column (with `arrow.json` extension metadata) and
-    /// non-UTF-8 values are a hard error. Caller must reject this
-    /// combined with `Format::Ndjson` before constructing the sink.
-    pub value_as_json: bool,
-    /// Storage representation for the record `key`. See
-    /// `mirror_envelope::KeyType`. Compaction requires `Utf8`.
-    pub key_type: KeyType,
+    /// Storage representation for the record `key`. Caller is
+    /// responsible for pairing `Bytes` with `compaction = None`.
+    pub keys: ColumnType,
+    /// Storage representation for the record `value`.
+    pub values: ColumnType,
     /// Optional log-compaction mode. When `Some(CompactionMode::Log)`,
     /// each emitted file is a full materialized snapshot of the
     /// latest value per key. Caller must combine this with
-    /// `Format::Parquet` and `KeyType::Utf8`.
+    /// `Format::Parquet` and `keys` ∈ {`Utf8`, `Json`}.
     pub compaction: Option<CompactionMode>,
     pub flush: FlushTriggers,
 }
@@ -86,8 +83,8 @@ pub struct FilesystemSink {
     dir: PathBuf,
     format: Format,
     compression: ParquetCompression,
-    value_as_json: bool,
-    key_type: KeyType,
+    keys: ColumnType,
+    values: ColumnType,
     compaction: Option<CompactionMode>,
     flush: FlushTriggers,
     /// Durable destination position: `max(to) + 1` of files on disk.
@@ -153,8 +150,8 @@ impl FilesystemSink {
             dir,
             format: cfg.format,
             compression: cfg.compression,
-            value_as_json: cfg.value_as_json,
-            key_type: cfg.key_type,
+            keys: cfg.keys,
+            values: cfg.values,
             compaction: cfg.compaction,
             flush: cfg.flush,
             durable_position,
@@ -260,8 +257,8 @@ impl FilesystemSink {
         let bytes = mirror_envelope::encode_batch(
             self.format,
             self.compression,
-            self.value_as_json,
-            self.key_type,
+            self.keys,
+            self.values,
             &to_encode,
         )
         .map_err(|e| SinkError::Transport(format!("encode: {e}")))?;

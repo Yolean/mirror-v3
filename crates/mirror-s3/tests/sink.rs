@@ -34,8 +34,8 @@ fn cfg(store: Arc<dyn ObjectStore>, max_offsets: u64) -> S3SinkConfig {
         partition: 0,
         format: Format::Ndjson,
         compression: ParquetCompression::Zstd1,
-        value_as_json: false,
-        key_type: mirror_envelope::KeyType::Utf8,
+        keys: mirror_envelope::ColumnType::Utf8,
+        values: mirror_envelope::ColumnType::Utf8,
         compaction: None,
         flush: FlushTriggers {
             max_time: Duration::from_secs(3600),
@@ -146,8 +146,8 @@ async fn put_mode_create_rejects_overwrite() {
         partition: 0,
         format: Format::Ndjson,
         compression: ParquetCompression::Zstd1,
-        value_as_json: false,
-        key_type: mirror_envelope::KeyType::Utf8,
+        keys: mirror_envelope::ColumnType::Utf8,
+        values: mirror_envelope::ColumnType::Utf8,
         compaction: None,
         flush: FlushTriggers {
             max_time: Duration::from_secs(3600),
@@ -220,8 +220,8 @@ fn cfg_compacted(store: Arc<dyn ObjectStore>, max_offsets: u64) -> S3SinkConfig 
         partition: 0,
         format: Format::Parquet,
         compression: ParquetCompression::Zstd1,
-        value_as_json: false,
-        key_type: mirror_envelope::KeyType::Utf8,
+        keys: mirror_envelope::ColumnType::Utf8,
+        values: mirror_envelope::ColumnType::Utf8,
         compaction: Some(mirror_s3::CompactionMode::Log),
         flush: FlushTriggers {
             max_time: Duration::from_secs(3600),

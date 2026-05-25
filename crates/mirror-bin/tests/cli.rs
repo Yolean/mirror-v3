@@ -55,16 +55,16 @@ fn status_against_unreachable_broker_exits_with_error_row() {
 destination:
   type: filesystem
   root: {}
-  flush:
-    max-time-ms: 1000
-    max-bytes: 1024
-    max-offsets: 10
 mirrors:
   - name: probe
     source:
       bootstrap-servers: localhost:1
     topic: nope
     partition: 0
+    flush:
+      max-time-ms: 1000
+      max-bytes: 1024
+      max-offsets: 10
 "#,
             root.display()
         ),
@@ -104,16 +104,16 @@ fn status_json_format_is_valid_json() {
 destination:
   type: filesystem
   root: {}
-  flush:
-    max-time-ms: 1000
-    max-bytes: 1024
-    max-offsets: 10
 mirrors:
   - name: probe
     source:
       bootstrap-servers: localhost:1
     topic: nope
     partition: 0
+    flush:
+      max-time-ms: 1000
+      max-bytes: 1024
+      max-offsets: 10
 "#,
             root.display()
         ),

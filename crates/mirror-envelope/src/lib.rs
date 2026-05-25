@@ -9,8 +9,9 @@
 //!
 //! The on-disk wire shape is identical for both: each record carries
 //! `topic`, `partition`, `offset`, `timestamp_ms` (nullable),
-//! `timestamp_type`, `key` (nullable bytes), `value` (nullable bytes),
-//! and `headers` (list of `{key, value (nullable bytes)}`).
+//! `timestamp_type`, `key` (nullable), `value` (nullable), and
+//! `headers` (list of `{key, value (nullable bytes)}`). The Parquet
+//! physical type of `key` and `value` is selected by [`ColumnType`].
 
 use mirror_core::Record;
 
@@ -44,18 +45,25 @@ pub enum ParquetCompression {
     Uncompressed,
 }
 
-/// How the record `key` is represented on disk for Parquet writes.
-/// NDJSON is unaffected: keys are always base64-encoded byte strings
-/// in the JSON output regardless of this setting.
+/// Storage representation for a record column (`key` or `value`).
+///
+/// The physical Parquet column is always named `key` or `value`
+/// regardless of this setting; the `Json` distinction is carried by
+/// `arrow.json` extension metadata, not by a column rename. NDJSON
+/// ignores this setting entirely.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum KeyType {
-    /// Keys are valid UTF-8; the Parquet column is `Utf8`. Non-UTF-8
-    /// keys at encode are a hard `Encode` error pointing at the
-    /// offending source offset.
+pub enum ColumnType {
+    /// Opaque bytes. Parquet physical type: `LargeBinary`. No
+    /// validation.
+    Bytes,
+    /// UTF-8 string. Parquet physical type: `Utf8`. Non-UTF-8 input is
+    /// a hard `Encode` error pointing at the offending source offset.
     #[default]
     Utf8,
-    /// Keys are opaque bytes; the Parquet column is `LargeBinary`.
-    Binary,
+    /// UTF-8 JSON document. Parquet physical type: `Utf8` plus the
+    /// `arrow.json` canonical extension metadata. mirror-v3 does not
+    /// parse or validate JSON beyond UTF-8.
+    Json,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -70,35 +78,26 @@ pub enum EnvelopeError {
 /// fully-formed on-disk bytes including the schema footer (Parquet)
 /// or all NDJSON lines.
 ///
-/// `value_as_json` is only meaningful for Parquet: when `true`, the
-/// output schema has a `json: Utf8` column instead of the default
-/// `value: LargeBinary`, and each record's value bytes must be valid
-/// UTF-8 (else a hard `Encode` error). Caller is responsible for
-/// rejecting `value_as_json = true` with `Format::Ndjson` before
-/// reaching here — `encode_batch` silently ignores the flag for
-/// NDJSON.
-///
-/// `key_type` is only meaningful for Parquet. `KeyType::Utf8` writes
-/// a `key: Utf8` column and validates UTF-8 at encode; `KeyType::Binary`
-/// writes the legacy `key: LargeBinary` column with no validation.
-/// NDJSON ignores the flag.
+/// `keys` and `values` are only meaningful for Parquet. They control
+/// the physical column type and (for `Utf8` / `Json`) UTF-8 validation.
+/// NDJSON ignores them — it always emits base64-encoded byte fields.
 pub fn encode_batch(
     format: Format,
     compression: ParquetCompression,
-    value_as_json: bool,
-    key_type: KeyType,
+    keys: ColumnType,
+    values: ColumnType,
     records: &[Record],
 ) -> Result<Vec<u8>, EnvelopeError> {
     match format {
         Format::Ndjson => ndjson::encode_batch(records),
-        Format::Parquet => parquet::encode_batch(records, compression, value_as_json, key_type),
+        Format::Parquet => parquet::encode_batch(records, compression, keys, values),
     }
 }
 
-/// Decode a single on-disk file's bytes back into records. The
-/// parquet path auto-detects whether the file has a `value` column
-/// (binary) or a `json` column (Utf8); the resulting `Record.value`
-/// always carries bytes, with UTF-8 strings encoded as their bytes.
+/// Decode a single on-disk file's bytes back into records. The parquet
+/// path auto-detects the physical type of the `key` and `value`
+/// columns (`LargeBinary` or `Utf8`) and reconstructs `Record.key` /
+/// `Record.value` as byte vectors either way.
 pub fn decode_batch(format: Format, bytes: &[u8]) -> Result<Vec<Record>, EnvelopeError> {
     match format {
         Format::Ndjson => ndjson::decode_batch(bytes),
