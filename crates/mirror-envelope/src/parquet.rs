@@ -16,15 +16,18 @@
 //! [`ColumnType`] picks what's *inside* the string and which
 //! `ARROW:extension:name` tag the field carries:
 //!
-//! - `BytesBase64` → base64-encoded bytes, tagged `mirror_v3.bytes_base64`.
-//! - `Utf8`        → verbatim UTF-8, no extension tag.
-//! - `Json`        → verbatim UTF-8 JSON, tagged `arrow.json`.
+//! - `Bytes` → base64-encoded bytes, tagged `mirror_v3.bytes_base64`.
+//! - `Utf8` → verbatim UTF-8, no extension tag.
+//! - `Json` → verbatim UTF-8 JSON, tagged `arrow.json`.
+//! - `JsonParseable` → verbatim UTF-8 JSON, tagged `arrow.json`, with
+//!   the encoder additionally checking the payload parses via `serde_json`.
 //!
-//! On decode, the field metadata is what disambiguates `BytesBase64`
-//! (which the decoder base64-decodes) from `Utf8` / `Json` (passed
-//! through as bytes). UTF-8 enforcement happens at encode for `Utf8`
-//! and `Json`; a bad byte is a hard `Encode` error pointing at the
-//! offending source offset.
+//! On decode, the field metadata is what disambiguates `Bytes` (which
+//! the decoder base64-decodes) from the textual variants (passed
+//! through as bytes). UTF-8 enforcement happens at encode for the
+//! three string-based variants; parseability enforcement happens for
+//! `JsonParseable`. A bad byte or unparseable JSON is a hard `Encode`
+//! error pointing at the offending source offset.
 
 use std::sync::Arc;
 
@@ -59,9 +62,9 @@ const JSON_EXT: &str = "arrow.json";
 fn column_field(name: &str, kind: ColumnType) -> Field {
     let mut md = std::collections::HashMap::new();
     let ext = match kind {
-        ColumnType::BytesBase64 => Some(BYTES_BASE64_EXT),
+        ColumnType::Bytes => Some(BYTES_BASE64_EXT),
         ColumnType::Utf8 => None,
-        ColumnType::Json => Some(JSON_EXT),
+        ColumnType::Json | ColumnType::JsonParseable => Some(JSON_EXT),
     };
     if let Some(name) = ext {
         md.insert("ARROW:extension:name".to_string(), name.to_string());
@@ -213,18 +216,22 @@ fn append_payload(
 ) -> Result<(), EnvelopeError> {
     use base64::engine::general_purpose::STANDARD as B64;
     use base64::Engine;
+    // The shared validator enforces the column-type contract; the
+    // small duplication of UTF-8 work below (str::from_utf8 inside
+    // append_value's path) is ~10s of GB/s and not worth complicating
+    // the API to avoid.
+    kind.validate(column, source_offset, payload)
+        .map_err(EnvelopeError::Encode)?;
     match payload {
         None => string.append_null(),
         Some(bytes) => match kind {
-            ColumnType::BytesBase64 => {
+            ColumnType::Bytes => {
                 string.append_value(B64.encode(bytes));
             }
-            ColumnType::Utf8 | ColumnType::Json => {
-                let s = std::str::from_utf8(bytes).map_err(|e| {
-                    EnvelopeError::Encode(format!(
-                        "{column} at source offset {source_offset} is not valid UTF-8: {e}",
-                    ))
-                })?;
+            ColumnType::Utf8 | ColumnType::Json | ColumnType::JsonParseable => {
+                // Validator already confirmed UTF-8; this can't fail.
+                let s = std::str::from_utf8(bytes)
+                    .expect("validator should have rejected non-UTF-8 input");
                 string.append_value(s);
             }
         },

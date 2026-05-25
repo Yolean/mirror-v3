@@ -12,7 +12,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use mirror_core::{Header, Record, Sink, SinkError, Source, SourceError, TimestampType};
+use mirror_core::{
+    ColumnType, Header, Record, Sink, SinkError, Source, SourceError, TimestampType,
+};
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{BaseConsumer, Consumer, StreamConsumer};
 use rdkafka::message::{Header as RdHeader, Headers, Message, OwnedHeaders};
@@ -178,6 +180,16 @@ pub struct KafkaSinkConfig {
     pub partition: i32,
     pub watermark_timeout: Duration,
     pub timestamp_mode: TimestampMode,
+    /// Topic-schema gate for the record `key`. Defaults to
+    /// [`ColumnType::Utf8`]. The sink validates each non-null payload
+    /// before producing; non-UTF-8 input (under `Utf8`/`Json`/
+    /// `JsonParseable`) or unparseable JSON (under `JsonParseable`)
+    /// is a hard `Transport` error pointing at the offending source
+    /// offset. `Bytes` skips the check.
+    pub keys: ColumnType,
+    /// Topic-schema gate for the record `value`. Same semantics as
+    /// `keys`.
+    pub values: ColumnType,
 }
 
 /// Which timestamp the destination record ends up with.
@@ -205,6 +217,8 @@ impl KafkaSinkConfig {
             partition,
             watermark_timeout: DEFAULT_WATERMARK_TIMEOUT,
             timestamp_mode: TimestampMode::Source,
+            keys: ColumnType::default(),
+            values: ColumnType::default(),
         }
     }
 }
@@ -216,6 +230,8 @@ pub struct KafkaSink {
     partition: i32,
     watermark_timeout: Duration,
     timestamp_mode: TimestampMode,
+    keys: ColumnType,
+    values: ColumnType,
 }
 
 impl KafkaSink {
@@ -242,6 +258,8 @@ impl KafkaSink {
             partition: cfg.partition,
             watermark_timeout: cfg.watermark_timeout,
             timestamp_mode: cfg.timestamp_mode,
+            keys: cfg.keys,
+            values: cfg.values,
         })
     }
 
@@ -267,6 +285,16 @@ impl Sink for KafkaSink {
     }
 
     async fn write(&mut self, record: Record) -> Result<(), SinkError> {
+        // Schema gate: enforce the declared column-type contract
+        // before producing. Bytes skips, Utf8/Json check UTF-8,
+        // JsonParseable also checks `serde_json::from_slice`.
+        self.keys
+            .validate("key", record.source_offset, record.key.as_deref())
+            .map_err(SinkError::Transport)?;
+        self.values
+            .validate("value", record.source_offset, record.value.as_deref())
+            .map_err(SinkError::Transport)?;
+
         // Gate: destination must still be at exactly source_offset.
         let current = self.fetch_high_watermark().await?;
         if current != record.source_offset {

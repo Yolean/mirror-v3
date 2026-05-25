@@ -379,7 +379,7 @@ mirrors:
     source: { bootstrap-servers: kafka:9092 }
     topic: states
     partition: 0
-    keys: { type: bytes-base64 }
+    keys: { type: bytes }
     compaction: log
     flush:
       max-time-ms: 5000
@@ -391,7 +391,7 @@ mirrors:
     assert_eq!(
         cfg.mirrors[0].keys,
         Some(ColumnConfig {
-            kind: ColumnType::BytesBase64
+            kind: ColumnType::Bytes
         })
     );
 }
@@ -440,7 +440,7 @@ mirrors:
     source: { bootstrap-servers: kafka:9092 }
     topic: ops
     partition: 0
-    keys: { type: bytes-base64 }
+    keys: { type: bytes }
     flush:
       max-time-ms: 5000
       max-bytes: 1000
@@ -450,7 +450,7 @@ mirrors:
     assert_eq!(
         cfg.mirrors[0].keys,
         Some(ColumnConfig {
-            kind: ColumnType::BytesBase64
+            kind: ColumnType::Bytes
         })
     );
 }

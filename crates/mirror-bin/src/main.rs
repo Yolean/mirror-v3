@@ -167,9 +167,10 @@ fn compression_to_envelope(
 
 fn column_type_to_envelope(k: mirror_config::ColumnType) -> mirror_envelope::ColumnType {
     match k {
-        mirror_config::ColumnType::BytesBase64 => mirror_envelope::ColumnType::BytesBase64,
+        mirror_config::ColumnType::Bytes => mirror_envelope::ColumnType::Bytes,
         mirror_config::ColumnType::Utf8 => mirror_envelope::ColumnType::Utf8,
         mirror_config::ColumnType::Json => mirror_envelope::ColumnType::Json,
+        mirror_config::ColumnType::JsonParseable => mirror_envelope::ColumnType::JsonParseable,
     }
 }
 
@@ -515,6 +516,8 @@ fn spawn_mirror(
             );
             sink_cfg.timestamp_mode =
                 timestamp_mode_to_kafka(mirror.timestamp_mode.unwrap_or_default());
+            sink_cfg.keys = column_type_to_envelope(mirror.keys.unwrap_or_default().kind);
+            sink_cfg.values = column_type_to_envelope(mirror.values.unwrap_or_default().kind);
             let sink = KafkaSink::open(sink_cfg)
                 .with_context(|| format!("opening sink for mirror {name}"))?;
             Ok(tokio::spawn(async move {

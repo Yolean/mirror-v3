@@ -141,7 +141,7 @@
           ]
         },
         "keys": {
-          "description": "Schema and validation for the record `key` column. Defaults to\n`{ type: utf8 }`. Forbidden for `kafka` destinations.",
+          "description": "Topic schema for the record `key`. Defaults to `{ type: utf8 }`.\nFor Kafka mirrors this is purely a validation contract (the\nrecord passes through unchanged); for filesystem/s3 + parquet\nit also selects the column encoding. See [`ColumnType`].",
           "anyOf": [
             {
               "$ref": "#/$defs/ColumnConfig"
@@ -152,7 +152,7 @@
           ]
         },
         "values": {
-          "description": "Schema and validation for the record `value` column. Defaults to\n`{ type: utf8 }`. Forbidden for `kafka` destinations.",
+          "description": "Topic schema for the record `value`. Same semantics as `keys`.",
           "anyOf": [
             {
               "$ref": "#/$defs/ColumnConfig"
@@ -282,22 +282,27 @@
       "additionalProperties": false
     },
     "ColumnType": {
-      "description": "Storage representation for a record column.\n\nAll three variants land as `Utf8` columns in Parquet — uniform\nfor DuckDB / Athena / `jq`-based consumers. The variant determines\nwhat's actually inside the string, conveyed via extension metadata:\n\n| Variant         | Parquet | Field metadata                          |\n| --------------- | ------- | --------------------------------------- |\n| `bytes-base64`  | `Utf8`  | `ARROW:extension:name = mirror_v3.bytes_base64` |\n| `utf8`          | `Utf8`  | (none)                                  |\n| `json`          | `Utf8`  | `ARROW:extension:name = arrow.json`     |\n\nThe `key` and `value` columns are always named `key` and `value`.",
+      "description": "Topic-schema declaration for a record column (`key` or `value`).\n\nThe variant describes *what the data is* and the validation\ncontract the mirror enforces at encode. How the destination\nrepresents the column is destination-specific:\n\n- **Kafka mirrors**: the record is passed through as-is; the\n  declared type acts as a validation gate (non-UTF-8 input under\n  `utf8`/`json`/`json-parseable`, unparseable JSON under\n  `json-parseable` → mirror fails with the offending offset).\n- **Filesystem/S3 + parquet**: every variant lands as `Utf8`.\n  `bytes` is base64-encoded; `utf8`/`json`/`json-parseable` are\n  stored verbatim. Extension metadata tags the field for\n  downstream consumers:\n\n  | Variant           | Parquet | Field metadata                          |\n  | ----------------- | ------- | --------------------------------------- |\n  | `bytes`           | `Utf8`  | `ARROW:extension:name = mirror_v3.bytes_base64` |\n  | `utf8`            | `Utf8`  | (none)                                  |\n  | `json`            | `Utf8`  | `ARROW:extension:name = arrow.json`     |\n  | `json-parseable`  | `Utf8`  | `ARROW:extension:name = arrow.json`     |\n\n- **Filesystem/S3 + ndjson**: only the default (`utf8`) is\n  accepted today; other variants are rejected at config load.\n\nThe `key` and `value` columns in Parquet are always named `key`\nand `value`.",
       "oneOf": [
         {
-          "description": "Arbitrary bytes, base64-encoded into a `Utf8` column. No\nvalidation of the underlying bytes. Use for protobuf-keyed\ntopics or other binary payloads that need to round-trip\nthrough a text-only column.",
+          "description": "Arbitrary bytes. No validation. For Kafka destinations the\nrecord passes through unchanged; for Parquet destinations the\nbytes are base64-encoded into a `Utf8` column (storage\ndetail). Use for protobuf-keyed topics or other binary\npayloads.",
           "type": "string",
-          "const": "bytes-base64"
+          "const": "bytes"
         },
         {
-          "description": "UTF-8 string. Parquet physical type: `Utf8`. Non-UTF-8 input is\na hard error at encode time, pointing at the offending source\noffset.",
+          "description": "UTF-8 string. Non-UTF-8 input is a hard `Encode` error at the\nmirror, with the offending source offset.",
           "type": "string",
           "const": "utf8"
         },
         {
-          "description": "UTF-8 JSON document. Parquet physical type: `Utf8` plus the\n`arrow.json` canonical extension metadata (operator-facing\nhint; mirror-v3 does **not** parse or validate JSON beyond\nUTF-8). Same encode-time error contract as `utf8`.",
+          "description": "UTF-8 string carrying a JSON document. Same encode contract as\n`utf8` (UTF-8 enforced, payload *not* parsed). On Parquet\ndestinations the column field is tagged with the `arrow.json`\ncanonical extension as a hint to downstream consumers.",
           "type": "string",
           "const": "json"
+        },
+        {
+          "description": "UTF-8 string carrying a JSON document, *parseability-gated*.\nIn addition to the UTF-8 check, the encoder feeds each\nnon-null payload through `serde_json` and rejects any record\nthat does not parse, with the offending source offset. The\nparser uses `serde::de::IgnoredAny` so no `serde_json::Value`\ntree is allocated — the cost is one structure walk per\npayload. Same on-disk shape as `json`.",
+          "type": "string",
+          "const": "json-parseable"
         }
       ]
     },

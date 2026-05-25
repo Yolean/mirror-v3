@@ -179,7 +179,7 @@ fn parquet_values_json_rejects_non_utf8_value() {
 #[test]
 fn parquet_value_column_is_always_utf8_named_value() {
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-    for vt in [ColumnType::BytesBase64, ColumnType::Utf8, ColumnType::Json] {
+    for vt in [ColumnType::Bytes, ColumnType::Utf8, ColumnType::Json] {
         let records = json_fixture(2);
         let bytes = encode_batch(
             Format::Parquet,
@@ -266,14 +266,14 @@ fn parquet_values_utf8_does_not_emit_arrow_json_extension() {
 }
 
 #[test]
-fn parquet_keys_bytes_base64_round_trips_non_utf8_keys() {
+fn parquet_keys_bytes_round_trips_non_utf8_keys() {
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     let mut records = fixture(3);
     records[1].key = Some(vec![0xff, 0xfe, 0xfd]);
     let bytes = encode_batch(
         Format::Parquet,
         ParquetCompression::Zstd1,
-        ColumnType::BytesBase64,
+        ColumnType::Bytes,
         ColumnType::Utf8,
         &records,
     )
@@ -294,12 +294,12 @@ fn parquet_keys_bytes_base64_round_trips_non_utf8_keys() {
     assert_eq!(
         key_field.metadata().get("ARROW:extension:name"),
         Some(&"mirror_v3.bytes_base64".to_string()),
-        "keys=BytesBase64 must tag the key column with the extension"
+        "keys=Bytes must tag the key column with the extension"
     );
 }
 
 #[test]
-fn parquet_values_bytes_base64_round_trips_all_byte_values() {
+fn parquet_values_bytes_round_trips_all_byte_values() {
     // Sweep every possible byte 0x00..=0xff to make sure base64 +
     // Parquet doesn't drop or mangle any value.
     let mut records = json_fixture(1);
@@ -308,7 +308,7 @@ fn parquet_values_bytes_base64_round_trips_all_byte_values() {
         Format::Parquet,
         ParquetCompression::Zstd1,
         ColumnType::Utf8,
-        ColumnType::BytesBase64,
+        ColumnType::Bytes,
         &records,
     )
     .unwrap();
@@ -332,6 +332,88 @@ fn parquet_keys_utf8_rejects_non_utf8_key() {
     assert!(
         msg.contains("key") && msg.contains("UTF-8") && msg.contains("offset 1"),
         "error must point to the offending record: {msg}"
+    );
+}
+
+#[test]
+fn parquet_values_json_parseable_round_trips_valid_json() {
+    let records = json_fixture(10);
+    let bytes = encode_batch(
+        Format::Parquet,
+        ParquetCompression::Zstd1,
+        ColumnType::Utf8,
+        ColumnType::JsonParseable,
+        &records,
+    )
+    .unwrap();
+    let decoded = decode_batch(Format::Parquet, &bytes).unwrap();
+    assert_eq!(records, decoded);
+}
+
+#[test]
+fn parquet_values_json_parseable_rejects_malformed_json() {
+    let mut records = json_fixture(3);
+    // Valid UTF-8 but not valid JSON (unbalanced braces).
+    records[1].value = Some(br#"{"sku":"abc1","qty":1"#.to_vec());
+    let err = encode_batch(
+        Format::Parquet,
+        ParquetCompression::Zstd1,
+        ColumnType::Utf8,
+        ColumnType::JsonParseable,
+        &records,
+    )
+    .expect_err("unparseable JSON under values=JsonParseable must error");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("value") && msg.contains("parseable JSON") && msg.contains("offset 1"),
+        "error must point to the offending record: {msg}"
+    );
+}
+
+#[test]
+fn parquet_values_json_parseable_rejects_non_utf8_value() {
+    // Non-UTF-8 must fail at the UTF-8 check, before the JSON parse,
+    // so the error message identifies "UTF-8" not "parseable JSON".
+    let mut records = json_fixture(3);
+    records[1].value = Some(vec![0xff, 0xfe, 0xfd]);
+    let err = encode_batch(
+        Format::Parquet,
+        ParquetCompression::Zstd1,
+        ColumnType::Utf8,
+        ColumnType::JsonParseable,
+        &records,
+    )
+    .expect_err("non-UTF-8 under values=JsonParseable must error on UTF-8 step");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("UTF-8") && msg.contains("offset 1"),
+        "error must point to the offending record: {msg}"
+    );
+}
+
+#[test]
+fn parquet_values_json_parseable_emits_arrow_json_extension() {
+    // Same on-disk shape as Json: Utf8 column tagged arrow.json.
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    let records = json_fixture(3);
+    let bytes = encode_batch(
+        Format::Parquet,
+        ParquetCompression::Zstd1,
+        ColumnType::Utf8,
+        ColumnType::JsonParseable,
+        &records,
+    )
+    .unwrap();
+    let cursor = bytes::Bytes::from(bytes);
+    let reader = ParquetRecordBatchReaderBuilder::try_new(cursor)
+        .unwrap()
+        .build()
+        .unwrap();
+    let batch = reader.into_iter().next().unwrap().unwrap();
+    let value_field = batch.schema().field_with_name("value").unwrap().clone();
+    assert_eq!(
+        value_field.metadata().get("ARROW:extension:name"),
+        Some(&"arrow.json".to_string())
     );
 }
 

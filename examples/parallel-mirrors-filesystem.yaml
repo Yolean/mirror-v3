@@ -27,19 +27,23 @@ mirrors:
     # format: parquet
     # compression defaults to `zstd-1`. Other options: zstd-3, snappy, lz4, uncompressed.
     # compression: zstd-1
-    # `keys` and `values` default to `{ type: utf8 }`. All three
-    # variants land as a `Utf8` Parquet column; the variant decides
-    # what's inside the string and which extension metadata is set:
-    #   - `utf8`         — UTF-8 string, no extension. Non-UTF-8 input
-    #                      is a hard error at encode.
-    #   - `json`         — UTF-8 JSON, tagged `arrow.json` (operator
-    #                      hint; mirror-v3 does NOT parse JSON).
-    #   - `bytes-base64` — arbitrary bytes, base64-encoded, tagged
-    #                      `mirror_v3.bytes_base64`. Use for raw byte
-    #                      payloads that need to round-trip through a
-    #                      text-only column.
+    # `keys` and `values` declare the topic schema. Defaults to
+    # `{ type: utf8 }`. On Parquet every variant lands as a `Utf8`
+    # column; the variant decides what's inside the string, which
+    # extension metadata is set, and what the encoder validates:
+    #   - `utf8`           — UTF-8 string, no extension. Non-UTF-8
+    #                        input is a hard error at encode.
+    #   - `json`           — UTF-8 JSON, tagged `arrow.json` (consumer
+    #                        hint; mirror-v3 enforces UTF-8 only).
+    #   - `json-parseable` — same on-disk shape as `json`; the encoder
+    #                        also runs `serde_json` and fails hard on
+    #                        unparseable JSON.
+    #   - `bytes`          — arbitrary bytes, base64-encoded, tagged
+    #                        `mirror_v3.bytes_base64`. Use for raw
+    #                        byte payloads that need to round-trip
+    #                        through a text-only column.
     # keys:   { type: utf8 }
-    # values: { type: json }
+    # values: { type: json-parseable }
     flush:
       max-time-ms: 5000          # at most 5s of buffering
       max-bytes: 67108864        # or 64 MiB

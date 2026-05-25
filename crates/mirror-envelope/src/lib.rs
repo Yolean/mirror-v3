@@ -13,6 +13,10 @@
 //! `headers` (list of `{key, value (nullable bytes)}`). The Parquet
 //! physical type of `key` and `value` is selected by [`ColumnType`].
 
+// Re-export the shared topic-schema enum so sinks and the envelope
+// crate agree on one type. Variants and validation contract live in
+// `mirror_core::ColumnType`.
+pub use mirror_core::ColumnType;
 use mirror_core::Record;
 
 pub mod ndjson;
@@ -43,28 +47,6 @@ pub enum ParquetCompression {
     Snappy,
     Lz4,
     Uncompressed,
-}
-
-/// Storage representation for a record column (`key` or `value`).
-///
-/// All three variants land as `Utf8` Parquet columns; the difference
-/// is what's inside the string and which extension metadata is set on
-/// the field. NDJSON ignores this setting entirely.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ColumnType {
-    /// Arbitrary bytes, base64-encoded into a `Utf8` Parquet column,
-    /// tagged with `ARROW:extension:name = mirror_v3.bytes_base64`.
-    /// The decoder base64-decodes back to the original bytes.
-    BytesBase64,
-    /// UTF-8 string, stored verbatim in a `Utf8` Parquet column with
-    /// no extension metadata. Non-UTF-8 input is a hard `Encode` error
-    /// pointing at the offending source offset.
-    #[default]
-    Utf8,
-    /// UTF-8 JSON document, stored verbatim in a `Utf8` Parquet column
-    /// tagged with the `arrow.json` canonical extension metadata.
-    /// mirror-v3 does not parse or validate JSON beyond UTF-8.
-    Json,
 }
 
 #[derive(Debug, thiserror::Error)]

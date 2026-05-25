@@ -101,6 +101,68 @@ pub struct Header {
     pub value: Option<Vec<u8>>,
 }
 
+/// Topic-schema declaration for a record column (`key` or `value`).
+///
+/// This is the runtime representation shared by all sinks. The
+/// validation contract is identical across destination types; how
+/// each sink *stores* the column (passthrough for Kafka, base64-into-
+/// Utf8 for Parquet `Bytes`, etc.) is destination-specific and lives
+/// in the sink crate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ColumnType {
+    /// Arbitrary bytes. No validation.
+    Bytes,
+    /// UTF-8 string. Non-UTF-8 input is a hard error pointing at the
+    /// offending source offset.
+    #[default]
+    Utf8,
+    /// UTF-8 string carrying a JSON document. Validation enforces
+    /// UTF-8 only; the payload is *not* parsed.
+    Json,
+    /// UTF-8 string carrying a JSON document, parseability-gated. In
+    /// addition to the UTF-8 check the payload is fed through
+    /// `serde_json` (with `IgnoredAny`, so no `Value` tree is
+    /// allocated) and unparseable input is a hard error.
+    JsonParseable,
+}
+
+impl ColumnType {
+    /// Run the validation contract for this column type against a
+    /// single payload. `None` is always valid (null columns).
+    /// `column` and `source_offset` appear in error messages so the
+    /// operator can find the offending record.
+    pub fn validate(
+        &self,
+        column: &str,
+        source_offset: u64,
+        payload: Option<&[u8]>,
+    ) -> Result<(), String> {
+        let Some(bytes) = payload else {
+            return Ok(());
+        };
+        match self {
+            ColumnType::Bytes => Ok(()),
+            ColumnType::Utf8 | ColumnType::Json => {
+                std::str::from_utf8(bytes).map(|_| ()).map_err(|e| {
+                    format!("{column} at source offset {source_offset} is not valid UTF-8: {e}")
+                })
+            }
+            ColumnType::JsonParseable => {
+                let s = std::str::from_utf8(bytes).map_err(|e| {
+                    format!("{column} at source offset {source_offset} is not valid UTF-8: {e}")
+                })?;
+                serde_json::from_str::<serde::de::IgnoredAny>(s)
+                    .map(|_| ())
+                    .map_err(|e| {
+                        format!(
+                            "{column} at source offset {source_offset} is not parseable JSON: {e}"
+                        )
+                    })
+            }
+        }
+    }
+}
+
 /// A Kafka-shaped record stream pinned to one (topic, partition).
 #[async_trait]
 pub trait Source: Send {
@@ -318,5 +380,85 @@ where
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod column_type_tests {
+    use super::ColumnType;
+
+    #[test]
+    fn null_payload_always_validates() {
+        for ct in [
+            ColumnType::Bytes,
+            ColumnType::Utf8,
+            ColumnType::Json,
+            ColumnType::JsonParseable,
+        ] {
+            assert!(ct.validate("key", 7, None).is_ok(), "ct={ct:?}");
+        }
+    }
+
+    #[test]
+    fn bytes_accepts_anything() {
+        assert!(ColumnType::Bytes
+            .validate("value", 0, Some(&[0xff, 0xfe, 0xfd]))
+            .is_ok());
+    }
+
+    #[test]
+    fn utf8_rejects_non_utf8_with_offending_offset() {
+        let err = ColumnType::Utf8
+            .validate("value", 42, Some(&[0xff]))
+            .expect_err("must reject");
+        assert!(err.contains("value") && err.contains("offset 42") && err.contains("UTF-8"));
+    }
+
+    #[test]
+    fn json_does_not_parse_payload() {
+        // Valid UTF-8 but not parseable JSON — Json must accept it.
+        assert!(ColumnType::Json
+            .validate("value", 0, Some(b"{this is not json"))
+            .is_ok());
+    }
+
+    #[test]
+    fn json_parseable_accepts_valid_json() {
+        for payload in [
+            br#"{"a":1}"#.as_slice(),
+            br#"[]"#.as_slice(),
+            br#""s""#.as_slice(),
+            br#"42"#.as_slice(),
+            br#"null"#.as_slice(),
+        ] {
+            assert!(
+                ColumnType::JsonParseable
+                    .validate("value", 0, Some(payload))
+                    .is_ok(),
+                "valid JSON rejected: {:?}",
+                std::str::from_utf8(payload)
+            );
+        }
+    }
+
+    #[test]
+    fn json_parseable_rejects_malformed_json() {
+        let err = ColumnType::JsonParseable
+            .validate("value", 5, Some(b"{unbalanced"))
+            .expect_err("must reject");
+        assert!(
+            err.contains("value") && err.contains("offset 5") && err.contains("parseable JSON")
+        );
+    }
+
+    #[test]
+    fn json_parseable_reports_utf8_error_before_json_error() {
+        let err = ColumnType::JsonParseable
+            .validate("value", 9, Some(&[0xff]))
+            .expect_err("must reject");
+        assert!(
+            err.contains("UTF-8") && !err.contains("parseable JSON"),
+            "got: {err}"
+        );
     }
 }

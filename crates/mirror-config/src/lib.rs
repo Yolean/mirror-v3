@@ -96,13 +96,14 @@ pub struct Mirror {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compression: Option<ParquetCompression>,
 
-    /// Schema and validation for the record `key` column. Defaults to
-    /// `{ type: utf8 }`. Forbidden for `kafka` destinations.
+    /// Topic schema for the record `key`. Defaults to `{ type: utf8 }`.
+    /// For Kafka mirrors this is purely a validation contract (the
+    /// record passes through unchanged); for filesystem/s3 + parquet
+    /// it also selects the column encoding. See [`ColumnType`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keys: Option<ColumnConfig>,
 
-    /// Schema and validation for the record `value` column. Defaults to
-    /// `{ type: utf8 }`. Forbidden for `kafka` destinations.
+    /// Topic schema for the record `value`. Same semantics as `keys`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub values: Option<ColumnConfig>,
 
@@ -145,38 +146,59 @@ pub struct ColumnConfig {
     pub kind: ColumnType,
 }
 
-/// Storage representation for a record column.
+/// Topic-schema declaration for a record column (`key` or `value`).
 ///
-/// All three variants land as `Utf8` columns in Parquet — uniform
-/// for DuckDB / Athena / `jq`-based consumers. The variant determines
-/// what's actually inside the string, conveyed via extension metadata:
+/// The variant describes *what the data is* and the validation
+/// contract the mirror enforces at encode. How the destination
+/// represents the column is destination-specific:
 ///
-/// | Variant         | Parquet | Field metadata                          |
-/// | --------------- | ------- | --------------------------------------- |
-/// | `bytes-base64`  | `Utf8`  | `ARROW:extension:name = mirror_v3.bytes_base64` |
-/// | `utf8`          | `Utf8`  | (none)                                  |
-/// | `json`          | `Utf8`  | `ARROW:extension:name = arrow.json`     |
+/// - **Kafka mirrors**: the record is passed through as-is; the
+///   declared type acts as a validation gate (non-UTF-8 input under
+///   `utf8`/`json`/`json-parseable`, unparseable JSON under
+///   `json-parseable` → mirror fails with the offending offset).
+/// - **Filesystem/S3 + parquet**: every variant lands as `Utf8`.
+///   `bytes` is base64-encoded; `utf8`/`json`/`json-parseable` are
+///   stored verbatim. Extension metadata tags the field for
+///   downstream consumers:
 ///
-/// The `key` and `value` columns are always named `key` and `value`.
+///   | Variant           | Parquet | Field metadata                          |
+///   | ----------------- | ------- | --------------------------------------- |
+///   | `bytes`           | `Utf8`  | `ARROW:extension:name = mirror_v3.bytes_base64` |
+///   | `utf8`            | `Utf8`  | (none)                                  |
+///   | `json`            | `Utf8`  | `ARROW:extension:name = arrow.json`     |
+///   | `json-parseable`  | `Utf8`  | `ARROW:extension:name = arrow.json`     |
+///
+/// - **Filesystem/S3 + ndjson**: only the default (`utf8`) is
+///   accepted today; other variants are rejected at config load.
+///
+/// The `key` and `value` columns in Parquet are always named `key`
+/// and `value`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum ColumnType {
-    /// Arbitrary bytes, base64-encoded into a `Utf8` column. No
-    /// validation of the underlying bytes. Use for protobuf-keyed
-    /// topics or other binary payloads that need to round-trip
-    /// through a text-only column.
-    #[serde(rename = "bytes-base64")]
-    BytesBase64,
-    /// UTF-8 string. Parquet physical type: `Utf8`. Non-UTF-8 input is
-    /// a hard error at encode time, pointing at the offending source
-    /// offset.
+    /// Arbitrary bytes. No validation. For Kafka destinations the
+    /// record passes through unchanged; for Parquet destinations the
+    /// bytes are base64-encoded into a `Utf8` column (storage
+    /// detail). Use for protobuf-keyed topics or other binary
+    /// payloads.
+    Bytes,
+    /// UTF-8 string. Non-UTF-8 input is a hard `Encode` error at the
+    /// mirror, with the offending source offset.
     #[default]
     Utf8,
-    /// UTF-8 JSON document. Parquet physical type: `Utf8` plus the
-    /// `arrow.json` canonical extension metadata (operator-facing
-    /// hint; mirror-v3 does **not** parse or validate JSON beyond
-    /// UTF-8). Same encode-time error contract as `utf8`.
+    /// UTF-8 string carrying a JSON document. Same encode contract as
+    /// `utf8` (UTF-8 enforced, payload *not* parsed). On Parquet
+    /// destinations the column field is tagged with the `arrow.json`
+    /// canonical extension as a hint to downstream consumers.
     Json,
+    /// UTF-8 string carrying a JSON document, *parseability-gated*.
+    /// In addition to the UTF-8 check, the encoder feeds each
+    /// non-null payload through `serde_json` and rejects any record
+    /// that does not parse, with the offending source offset. The
+    /// parser uses `serde::de::IgnoredAny` so no `serde_json::Value`
+    /// tree is allocated — the cost is one structure walk per
+    /// payload. Same on-disk shape as `json`.
+    JsonParseable,
 }
 
 /// Kafka-destination timestamp behaviour.
@@ -422,8 +444,6 @@ fn validate(cfg: &Config) -> Result<(), LoadError> {
             for (field, present) in [
                 ("format", m.format.is_some()),
                 ("compression", m.compression.is_some()),
-                ("keys", m.keys.is_some()),
-                ("values", m.values.is_some()),
                 ("compaction", m.compaction.is_some()),
                 ("flush", m.flush.is_some()),
             ] {
