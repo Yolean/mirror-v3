@@ -11,17 +11,20 @@
 //! `timestamp_type` (low-cardinality, repeated per record) down to
 //! near-nothing.
 //!
-//! The `key` and `value` columns are always named `key` and `value`
-//! respectively. Their physical type follows the caller-supplied
-//! [`ColumnType`]: `Bytes` → `LargeBinary`, `Utf8`/`Json` → `Utf8`.
-//! `Json` additionally carries the `arrow.json` canonical extension
-//! metadata — purely operator-facing; mirror-v3 does not parse JSON.
-//! On decode, the column's physical type is what disambiguates, not
-//! its name.
+//! The `key` and `value` columns are always named `key` and `value`,
+//! and their physical type is always `Utf8`. The variant of
+//! [`ColumnType`] picks what's *inside* the string and which
+//! `ARROW:extension:name` tag the field carries:
 //!
-//! UTF-8 enforcement: when `keys`/`values` is `Utf8` or `Json`, each
-//! non-null payload is validated as UTF-8 at encode time. A bad byte
-//! is a hard `Encode` error pointing at the offending source offset.
+//! - `BytesBase64` → base64-encoded bytes, tagged `mirror_v3.bytes_base64`.
+//! - `Utf8`        → verbatim UTF-8, no extension tag.
+//! - `Json`        → verbatim UTF-8 JSON, tagged `arrow.json`.
+//!
+//! On decode, the field metadata is what disambiguates `BytesBase64`
+//! (which the decoder base64-decodes) from `Utf8` / `Json` (passed
+//! through as bytes). UTF-8 enforcement happens at encode for `Utf8`
+//! and `Json`; a bad byte is a hard `Encode` error pointing at the
+//! offending source offset.
 
 use std::sync::Arc;
 
@@ -47,17 +50,24 @@ fn header_struct_fields() -> Fields {
     ])
 }
 
+/// `ARROW:extension:name` value for the bytes-base64 column variant.
+/// Custom (non-canonical) extension; tools that don't recognise it
+/// see a plain Utf8 column.
+const BYTES_BASE64_EXT: &str = "mirror_v3.bytes_base64";
+const JSON_EXT: &str = "arrow.json";
+
 fn column_field(name: &str, kind: ColumnType) -> Field {
-    match kind {
-        ColumnType::Bytes => Field::new(name, DataType::LargeBinary, true),
-        ColumnType::Utf8 => Field::new(name, DataType::Utf8, true),
-        ColumnType::Json => {
-            let mut md = std::collections::HashMap::new();
-            md.insert("ARROW:extension:name".to_string(), "arrow.json".to_string());
-            md.insert("ARROW:extension:metadata".to_string(), String::new());
-            Field::new(name, DataType::Utf8, true).with_metadata(md)
-        }
+    let mut md = std::collections::HashMap::new();
+    let ext = match kind {
+        ColumnType::BytesBase64 => Some(BYTES_BASE64_EXT),
+        ColumnType::Utf8 => None,
+        ColumnType::Json => Some(JSON_EXT),
+    };
+    if let Some(name) = ext {
+        md.insert("ARROW:extension:name".to_string(), name.to_string());
+        md.insert("ARROW:extension:metadata".to_string(), String::new());
     }
+    Field::new(name, DataType::Utf8, true).with_metadata(md)
 }
 
 fn build_schema(keys: ColumnType, values: ColumnType) -> SchemaRef {
@@ -132,9 +142,7 @@ fn build_record_batch(
     let mut offsets = UInt64Builder::new();
     let mut timestamps = Int64Builder::new();
     let mut timestamp_types = StringBuilder::new();
-    let mut keys_binary = LargeBinaryBuilder::new();
     let mut keys_string = StringBuilder::new();
-    let mut values_binary = LargeBinaryBuilder::new();
     let mut values_string = StringBuilder::new();
 
     // Headers: List<Struct{key: Utf8, value: LargeBinary}>
@@ -159,7 +167,6 @@ fn build_record_batch(
             keys,
             r.source_offset,
             r.key.as_deref(),
-            &mut keys_binary,
             &mut keys_string,
         )?;
         append_payload(
@@ -167,7 +174,6 @@ fn build_record_batch(
             values,
             r.source_offset,
             r.value.as_deref(),
-            &mut values_binary,
             &mut values_string,
         )?;
         append_headers(&mut headers_builder, &r.headers);
@@ -178,14 +184,8 @@ fn build_record_batch(
     let offsets: ArrayRef = Arc::new(offsets.finish());
     let timestamps: ArrayRef = Arc::new(timestamps.finish());
     let timestamp_types: ArrayRef = Arc::new(timestamp_types.finish());
-    let keys_arr: ArrayRef = match keys {
-        ColumnType::Bytes => Arc::new(keys_binary.finish()),
-        ColumnType::Utf8 | ColumnType::Json => Arc::new(keys_string.finish()),
-    };
-    let values_arr: ArrayRef = match values {
-        ColumnType::Bytes => Arc::new(values_binary.finish()),
-        ColumnType::Utf8 | ColumnType::Json => Arc::new(values_string.finish()),
-    };
+    let keys_arr: ArrayRef = Arc::new(keys_string.finish());
+    let values_arr: ArrayRef = Arc::new(values_string.finish());
     let headers: ArrayRef = Arc::new(headers_builder.finish());
 
     RecordBatch::try_new(
@@ -209,17 +209,17 @@ fn append_payload(
     kind: ColumnType,
     source_offset: u64,
     payload: Option<&[u8]>,
-    binary: &mut LargeBinaryBuilder,
     string: &mut StringBuilder,
 ) -> Result<(), EnvelopeError> {
-    match kind {
-        ColumnType::Bytes => match payload {
-            Some(b) => binary.append_value(b),
-            None => binary.append_null(),
-        },
-        ColumnType::Utf8 | ColumnType::Json => match payload {
-            None => string.append_null(),
-            Some(bytes) => {
+    use base64::engine::general_purpose::STANDARD as B64;
+    use base64::Engine;
+    match payload {
+        None => string.append_null(),
+        Some(bytes) => match kind {
+            ColumnType::BytesBase64 => {
+                string.append_value(B64.encode(bytes));
+            }
+            ColumnType::Utf8 | ColumnType::Json => {
                 let s = std::str::from_utf8(bytes).map_err(|e| {
                     EnvelopeError::Encode(format!(
                         "{column} at source offset {source_offset} is not valid UTF-8: {e}",
@@ -288,8 +288,9 @@ fn record_batch_into_records(batch: &RecordBatch) -> Result<Vec<Record>, Envelop
     let values_col = col("value")?;
     let headers = col("headers")?;
 
-    let read_key = payload_reader("key", &keys_col)?;
-    let read_value = payload_reader("value", &values_col)?;
+    let schema = batch.schema();
+    let read_key = payload_reader("key", &keys_col, schema.field_with_name("key").ok())?;
+    let read_value = payload_reader("value", &values_col, schema.field_with_name("value").ok())?;
 
     let topics = topics
         .as_any()
@@ -343,8 +344,8 @@ fn record_batch_into_records(batch: &RecordBatch) -> Result<Vec<Record>, Envelop
         } else {
             Some(timestamps.value(i))
         };
-        let key = read_key(i);
-        let value = read_value(i);
+        let key = read_key(i)?;
+        let value = read_value(i)?;
         let h_start = header_offsets[i] as usize;
         let h_end = header_offsets[i + 1] as usize;
         let mut headers = Vec::with_capacity(h_end - h_start);
@@ -372,44 +373,52 @@ fn record_batch_into_records(batch: &RecordBatch) -> Result<Vec<Record>, Envelop
     Ok(out)
 }
 
-type PayloadReader = Box<dyn Fn(usize) -> Option<Vec<u8>>>;
+type PayloadReader = Box<dyn Fn(usize) -> Result<Option<Vec<u8>>, EnvelopeError>>;
 
 /// Returns a reader that converts the given column's value at index
-/// `i` into `Option<Vec<u8>>`. Branches once on the physical type and
+/// `i` into `Option<Vec<u8>>`. Branches once on the column's
+/// `ARROW:extension:name` to decide whether to base64-decode and
 /// produces a small closure for the hot loop.
-fn payload_reader(name: &str, col: &ArrayRef) -> Result<PayloadReader, EnvelopeError> {
-    use arrow::array::{LargeBinaryArray, StringArray};
-    match col.data_type() {
-        DataType::LargeBinary => {
-            let arr = col
-                .as_any()
-                .downcast_ref::<LargeBinaryArray>()
-                .ok_or_else(|| EnvelopeError::Decode(format!("{name} not LargeBinary")))?
-                .clone();
-            Ok(Box::new(move |i| {
-                if arr.is_null(i) {
-                    None
-                } else {
-                    Some(arr.value(i).to_vec())
-                }
-            }))
-        }
-        DataType::Utf8 => {
-            let arr = col
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| EnvelopeError::Decode(format!("{name} not Utf8")))?
-                .clone();
-            Ok(Box::new(move |i| {
-                if arr.is_null(i) {
-                    None
-                } else {
-                    Some(arr.value(i).as_bytes().to_vec())
-                }
-            }))
-        }
-        other => Err(EnvelopeError::Decode(format!(
-            "{name} column must be LargeBinary or Utf8, got {other:?}"
-        ))),
+fn payload_reader(
+    name: &str,
+    col: &ArrayRef,
+    field: Option<&Field>,
+) -> Result<PayloadReader, EnvelopeError> {
+    use arrow::array::StringArray;
+    if !matches!(col.data_type(), DataType::Utf8) {
+        return Err(EnvelopeError::Decode(format!(
+            "{name} column must be Utf8, got {:?}",
+            col.data_type()
+        )));
+    }
+    let arr = col
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| EnvelopeError::Decode(format!("{name} not Utf8")))?
+        .clone();
+    let ext = field
+        .and_then(|f| f.metadata().get("ARROW:extension:name").cloned())
+        .unwrap_or_default();
+    let column = name.to_string();
+    if ext == BYTES_BASE64_EXT {
+        use base64::engine::general_purpose::STANDARD as B64;
+        use base64::Engine;
+        Ok(Box::new(move |i| {
+            if arr.is_null(i) {
+                Ok(None)
+            } else {
+                B64.decode(arr.value(i)).map(Some).map_err(|e| {
+                    EnvelopeError::Decode(format!("{column} row {i}: base64-decode: {e}"))
+                })
+            }
+        }))
+    } else {
+        Ok(Box::new(move |i| {
+            if arr.is_null(i) {
+                Ok(None)
+            } else {
+                Ok(Some(arr.value(i).as_bytes().to_vec()))
+            }
+        }))
     }
 }

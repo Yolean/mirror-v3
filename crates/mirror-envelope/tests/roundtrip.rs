@@ -177,9 +177,9 @@ fn parquet_values_json_rejects_non_utf8_value() {
 }
 
 #[test]
-fn parquet_value_column_is_always_named_value() {
+fn parquet_value_column_is_always_utf8_named_value() {
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-    for vt in [ColumnType::Bytes, ColumnType::Utf8, ColumnType::Json] {
+    for vt in [ColumnType::BytesBase64, ColumnType::Utf8, ColumnType::Json] {
         let records = json_fixture(2);
         let bytes = encode_batch(
             Format::Parquet,
@@ -196,11 +196,19 @@ fn parquet_value_column_is_always_named_value() {
             .unwrap();
         let batch = reader.into_iter().next().unwrap().unwrap();
         let schema = batch.schema();
-        let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
-        assert!(
-            names.contains(&"value"),
-            "value column must always be named `value` (values={vt:?}): {names:?}"
+        let value_field = schema.field_with_name("value").unwrap().clone();
+        assert_eq!(
+            value_field.data_type(),
+            &arrow::datatypes::DataType::Utf8,
+            "value column must always be Utf8 (values={vt:?})"
         );
+        let key_field = schema.field_with_name("key").unwrap().clone();
+        assert_eq!(
+            key_field.data_type(),
+            &arrow::datatypes::DataType::Utf8,
+            "key column must always be Utf8 (values={vt:?})"
+        );
+        let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
         assert!(
             !names.contains(&"json"),
             "must never emit a `json` column (values={vt:?}): {names:?}"
@@ -258,20 +266,23 @@ fn parquet_values_utf8_does_not_emit_arrow_json_extension() {
 }
 
 #[test]
-fn parquet_keys_bytes_preserves_non_utf8_keys() {
+fn parquet_keys_bytes_base64_round_trips_non_utf8_keys() {
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     let mut records = fixture(3);
     records[1].key = Some(vec![0xff, 0xfe, 0xfd]);
     let bytes = encode_batch(
         Format::Parquet,
         ParquetCompression::Zstd1,
-        ColumnType::Bytes,
+        ColumnType::BytesBase64,
         ColumnType::Utf8,
         &records,
     )
     .unwrap();
     let decoded = decode_batch(Format::Parquet, &bytes).unwrap();
-    assert_eq!(records, decoded);
+    assert_eq!(
+        records, decoded,
+        "non-UTF-8 key bytes must survive base64 round-trip"
+    );
     let cursor = bytes::Bytes::from(bytes);
     let reader = ParquetRecordBatchReaderBuilder::try_new(cursor)
         .unwrap()
@@ -279,10 +290,30 @@ fn parquet_keys_bytes_preserves_non_utf8_keys() {
         .unwrap();
     let batch = reader.into_iter().next().unwrap().unwrap();
     let key_field = batch.schema().field_with_name("key").unwrap().clone();
+    assert_eq!(key_field.data_type(), &arrow::datatypes::DataType::Utf8);
     assert_eq!(
-        key_field.data_type(),
-        &arrow::datatypes::DataType::LargeBinary
+        key_field.metadata().get("ARROW:extension:name"),
+        Some(&"mirror_v3.bytes_base64".to_string()),
+        "keys=BytesBase64 must tag the key column with the extension"
     );
+}
+
+#[test]
+fn parquet_values_bytes_base64_round_trips_all_byte_values() {
+    // Sweep every possible byte 0x00..=0xff to make sure base64 +
+    // Parquet doesn't drop or mangle any value.
+    let mut records = json_fixture(1);
+    records[0].value = Some((0u8..=255).collect());
+    let bytes = encode_batch(
+        Format::Parquet,
+        ParquetCompression::Zstd1,
+        ColumnType::Utf8,
+        ColumnType::BytesBase64,
+        &records,
+    )
+    .unwrap();
+    let decoded = decode_batch(Format::Parquet, &bytes).unwrap();
+    assert_eq!(records, decoded);
 }
 
 #[test]

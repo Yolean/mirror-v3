@@ -27,12 +27,17 @@ mirrors:
     # format: parquet
     # compression defaults to `zstd-1`. Other options: zstd-3, snappy, lz4, uncompressed.
     # compression: zstd-1
-    # `keys` and `values` default to `{ type: utf8 }` — UTF-8 enforced
-    # at encode, Parquet column is `Utf8`. Use `{ type: bytes }` for
-    # raw bytes (no validation, `LargeBinary`). Use `{ type: json }`
-    # for the same Utf8 column tagged with the `arrow.json` canonical
-    # extension metadata (operator-facing hint; mirror-v3 does NOT
-    # parse JSON beyond UTF-8 enforcement).
+    # `keys` and `values` default to `{ type: utf8 }`. All three
+    # variants land as a `Utf8` Parquet column; the variant decides
+    # what's inside the string and which extension metadata is set:
+    #   - `utf8`         — UTF-8 string, no extension. Non-UTF-8 input
+    #                      is a hard error at encode.
+    #   - `json`         — UTF-8 JSON, tagged `arrow.json` (operator
+    #                      hint; mirror-v3 does NOT parse JSON).
+    #   - `bytes-base64` — arbitrary bytes, base64-encoded, tagged
+    #                      `mirror_v3.bytes_base64`. Use for raw byte
+    #                      payloads that need to round-trip through a
+    #                      text-only column.
     # keys:   { type: utf8 }
     # values: { type: json }
     flush:

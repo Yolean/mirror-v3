@@ -163,7 +163,7 @@
           ]
         },
         "compaction": {
-          "description": "Optional log-compaction mode. When `log`, each Parquet file is a\nfull materialized snapshot of the latest value per key. Requires\n`format = parquet` and `keys.type` ∈ {`utf8`, `json`}. Forbidden\nfor `kafka` destinations.",
+          "description": "Optional log-compaction mode. When `log`, each Parquet file is a\nfull materialized snapshot of the latest value per key. Requires\n`format = parquet`. Forbidden for `kafka` destinations.",
           "anyOf": [
             {
               "$ref": "#/$defs/Compaction"
@@ -282,12 +282,12 @@
       "additionalProperties": false
     },
     "ColumnType": {
-      "description": "Storage representation for a record column.\n\nAll three variants are valid for both `keys` and `values`. The\nphysical Parquet column is always named `key` or `value`; the\ndistinction between `utf8` and `json` is carried by the\n`arrow.json` extension metadata, not by the column name.",
+      "description": "Storage representation for a record column.\n\nAll three variants land as `Utf8` columns in Parquet — uniform\nfor DuckDB / Athena / `jq`-based consumers. The variant determines\nwhat's actually inside the string, conveyed via extension metadata:\n\n| Variant         | Parquet | Field metadata                          |\n| --------------- | ------- | --------------------------------------- |\n| `bytes-base64`  | `Utf8`  | `ARROW:extension:name = mirror_v3.bytes_base64` |\n| `utf8`          | `Utf8`  | (none)                                  |\n| `json`          | `Utf8`  | `ARROW:extension:name = arrow.json`     |\n\nThe `key` and `value` columns are always named `key` and `value`.",
       "oneOf": [
         {
-          "description": "Opaque bytes. Parquet physical type: `LargeBinary`. No\nvalidation; suitable for protobuf-keyed topics or other binary\npayloads.",
+          "description": "Arbitrary bytes, base64-encoded into a `Utf8` column. No\nvalidation of the underlying bytes. Use for protobuf-keyed\ntopics or other binary payloads that need to round-trip\nthrough a text-only column.",
           "type": "string",
-          "const": "bytes"
+          "const": "bytes-base64"
         },
         {
           "description": "UTF-8 string. Parquet physical type: `Utf8`. Non-UTF-8 input is\na hard error at encode time, pointing at the offending source\noffset.",

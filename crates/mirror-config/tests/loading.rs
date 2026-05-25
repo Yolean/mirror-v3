@@ -367,7 +367,9 @@ mirrors:
 }
 
 #[test]
-fn compaction_log_rejects_bytes_keys() {
+fn compaction_log_accepts_bytes_base64_keys() {
+    // bytes-base64 stores a Utf8 column (base64-encoded), so it
+    // composes with compaction without LargeBinary in the picture.
     let yaml = r#"
 destination:
   type: filesystem
@@ -377,18 +379,20 @@ mirrors:
     source: { bootstrap-servers: kafka:9092 }
     topic: states
     partition: 0
-    keys: { type: bytes }
+    keys: { type: bytes-base64 }
     compaction: log
     flush:
       max-time-ms: 5000
       max-bytes: 1000
       max-offsets: 100
 "#;
-    let err = load_from_str(yaml).expect_err("compaction + bytes-keys must be rejected");
-    let msg = format!("{err}");
-    assert!(
-        msg.contains("compaction") && msg.contains("utf8"),
-        "got: {msg}"
+    let cfg = load_from_str(yaml).expect("must parse");
+    assert_eq!(cfg.mirrors[0].compaction, Some(Compaction::Log));
+    assert_eq!(
+        cfg.mirrors[0].keys,
+        Some(ColumnConfig {
+            kind: ColumnType::BytesBase64
+        })
     );
 }
 
@@ -426,7 +430,7 @@ mirrors:
 }
 
 #[test]
-fn keys_bytes_parses() {
+fn keys_bytes_base64_parses() {
     let yaml = r#"
 destination:
   type: filesystem
@@ -436,7 +440,7 @@ mirrors:
     source: { bootstrap-servers: kafka:9092 }
     topic: ops
     partition: 0
-    keys: { type: bytes }
+    keys: { type: bytes-base64 }
     flush:
       max-time-ms: 5000
       max-bytes: 1000
@@ -446,7 +450,7 @@ mirrors:
     assert_eq!(
         cfg.mirrors[0].keys,
         Some(ColumnConfig {
-            kind: ColumnType::Bytes
+            kind: ColumnType::BytesBase64
         })
     );
 }

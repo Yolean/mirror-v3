@@ -47,22 +47,23 @@ pub enum ParquetCompression {
 
 /// Storage representation for a record column (`key` or `value`).
 ///
-/// The physical Parquet column is always named `key` or `value`
-/// regardless of this setting; the `Json` distinction is carried by
-/// `arrow.json` extension metadata, not by a column rename. NDJSON
-/// ignores this setting entirely.
+/// All three variants land as `Utf8` Parquet columns; the difference
+/// is what's inside the string and which extension metadata is set on
+/// the field. NDJSON ignores this setting entirely.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ColumnType {
-    /// Opaque bytes. Parquet physical type: `LargeBinary`. No
-    /// validation.
-    Bytes,
-    /// UTF-8 string. Parquet physical type: `Utf8`. Non-UTF-8 input is
-    /// a hard `Encode` error pointing at the offending source offset.
+    /// Arbitrary bytes, base64-encoded into a `Utf8` Parquet column,
+    /// tagged with `ARROW:extension:name = mirror_v3.bytes_base64`.
+    /// The decoder base64-decodes back to the original bytes.
+    BytesBase64,
+    /// UTF-8 string, stored verbatim in a `Utf8` Parquet column with
+    /// no extension metadata. Non-UTF-8 input is a hard `Encode` error
+    /// pointing at the offending source offset.
     #[default]
     Utf8,
-    /// UTF-8 JSON document. Parquet physical type: `Utf8` plus the
-    /// `arrow.json` canonical extension metadata. mirror-v3 does not
-    /// parse or validate JSON beyond UTF-8.
+    /// UTF-8 JSON document, stored verbatim in a `Utf8` Parquet column
+    /// tagged with the `arrow.json` canonical extension metadata.
+    /// mirror-v3 does not parse or validate JSON beyond UTF-8.
     Json,
 }
 

@@ -108,8 +108,7 @@ pub struct Mirror {
 
     /// Optional log-compaction mode. When `log`, each Parquet file is a
     /// full materialized snapshot of the latest value per key. Requires
-    /// `format = parquet` and `keys.type` ∈ {`utf8`, `json`}. Forbidden
-    /// for `kafka` destinations.
+    /// `format = parquet`. Forbidden for `kafka` destinations.
     #[serde(default)]
     pub compaction: Option<Compaction>,
 
@@ -148,17 +147,26 @@ pub struct ColumnConfig {
 
 /// Storage representation for a record column.
 ///
-/// All three variants are valid for both `keys` and `values`. The
-/// physical Parquet column is always named `key` or `value`; the
-/// distinction between `utf8` and `json` is carried by the
-/// `arrow.json` extension metadata, not by the column name.
+/// All three variants land as `Utf8` columns in Parquet — uniform
+/// for DuckDB / Athena / `jq`-based consumers. The variant determines
+/// what's actually inside the string, conveyed via extension metadata:
+///
+/// | Variant         | Parquet | Field metadata                          |
+/// | --------------- | ------- | --------------------------------------- |
+/// | `bytes-base64`  | `Utf8`  | `ARROW:extension:name = mirror_v3.bytes_base64` |
+/// | `utf8`          | `Utf8`  | (none)                                  |
+/// | `json`          | `Utf8`  | `ARROW:extension:name = arrow.json`     |
+///
+/// The `key` and `value` columns are always named `key` and `value`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum ColumnType {
-    /// Opaque bytes. Parquet physical type: `LargeBinary`. No
-    /// validation; suitable for protobuf-keyed topics or other binary
-    /// payloads.
-    Bytes,
+    /// Arbitrary bytes, base64-encoded into a `Utf8` column. No
+    /// validation of the underlying bytes. Use for protobuf-keyed
+    /// topics or other binary payloads that need to round-trip
+    /// through a text-only column.
+    #[serde(rename = "bytes-base64")]
+    BytesBase64,
     /// UTF-8 string. Parquet physical type: `Utf8`. Non-UTF-8 input is
     /// a hard error at encode time, pointing at the offending source
     /// offset.
@@ -458,14 +466,6 @@ fn validate(cfg: &Config) -> Result<(), LoadError> {
                         m.name
                     )));
                 }
-            }
-            if matches!(m.compaction, Some(Compaction::Log))
-                && matches!(keys.kind, ColumnType::Bytes)
-            {
-                return Err(LoadError::Validation(format!(
-                    "mirror {:?}: `compaction: log` requires `keys.type` ∈ {{utf8, json}}",
-                    m.name
-                )));
             }
         }
     }

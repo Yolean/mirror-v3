@@ -167,7 +167,7 @@ fn compression_to_envelope(
 
 fn column_type_to_envelope(k: mirror_config::ColumnType) -> mirror_envelope::ColumnType {
     match k {
-        mirror_config::ColumnType::Bytes => mirror_envelope::ColumnType::Bytes,
+        mirror_config::ColumnType::BytesBase64 => mirror_envelope::ColumnType::BytesBase64,
         mirror_config::ColumnType::Utf8 => mirror_envelope::ColumnType::Utf8,
         mirror_config::ColumnType::Json => mirror_envelope::ColumnType::Json,
     }
