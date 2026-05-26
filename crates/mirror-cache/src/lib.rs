@@ -66,6 +66,34 @@ struct AppState {
     shutdown_tx: Arc<tokio::sync::Mutex<Option<oneshot::Sender<i32>>>>,
 }
 
+/// Assemble the `OpenApiRouter` with every handler's `#[utoipa::path]`
+/// metadata attached. Shared between [`build_router`] (live serving)
+/// and [`openapi_doc`] (spec generation) so the wire surface and the
+/// committed spec can't drift.
+fn open_api_router(state: AppState) -> OpenApiRouter {
+    OpenApiRouter::with_openapi(ApiDoc::openapi())
+        .routes(routes!(raw_by_key))
+        .routes(routes!(offset_for_partition))
+        .routes(routes!(keys))
+        .routes(routes!(values))
+        .routes(routes!(admin_shutdown))
+        .routes(routes!(admin_shutdown_with_exit_code))
+        .with_state(state)
+}
+
+/// The fully-populated OpenAPI 3.1 document, including every handler's
+/// path entry. This is what `openapi.json`, `openapi.yaml`, and the
+/// committed `schemas/mirror-v3.cache.openapi.json` should all match.
+pub fn openapi_doc() -> utoipa::openapi::OpenApi {
+    // No real state needed; route registration only depends on the
+    // attribute metadata. Build a placeholder so the type checks.
+    let placeholder = AppState {
+        cache: Arc::new(CacheState::new()),
+        shutdown_tx: Arc::new(tokio::sync::Mutex::new(None)),
+    };
+    open_api_router(placeholder).split_for_parts().1
+}
+
 /// Build the full router for the cache HTTP server, including
 /// `/cache/v1`, `/_admin/v1`, the OpenAPI spec endpoints, and the
 /// Scalar `/docs` UI. The returned router is ready to serve.
@@ -77,15 +105,7 @@ pub fn build_router(cache: Arc<CacheState>, shutdown_tx: oneshot::Sender<i32>) -
         cache,
         shutdown_tx: Arc::new(tokio::sync::Mutex::new(Some(shutdown_tx))),
     };
-    let (api_router, api) = OpenApiRouter::with_openapi(ApiDoc::openapi())
-        .routes(routes!(raw_by_key))
-        .routes(routes!(offset_for_partition))
-        .routes(routes!(keys))
-        .routes(routes!(values))
-        .routes(routes!(admin_shutdown))
-        .routes(routes!(admin_shutdown_with_exit_code))
-        .with_state(state)
-        .split_for_parts();
+    let (api_router, api) = open_api_router(state).split_for_parts();
 
     let openapi_json = api.clone();
     let openapi_yaml = api.clone();
@@ -274,13 +294,20 @@ async fn offset_for_partition(
         .into_response()
 }
 
-/// GET /cache/v1/keys — newline-separated key list.
+/// GET /cache/v1/keys — newline-separated key list, every line
+/// (including the last) terminated by `\n`. Order is the order each
+/// key was first seen by the cache (insertion order).
+///
+/// `Content-Type` is `application/octet-stream` to match KKV's
+/// byte-for-byte response shape. A possible future enhancement (gated
+/// on operator demand) is to surface the topic schema in the content
+/// type — see the `values` handler for the same hook.
 #[utoipa::path(
     get,
     path = "/cache/v1/keys",
     tag = "cache",
     responses(
-        (status = 200, description = "Newline-separated keys (UTF-8, no trailing newline guarantee)", body = String, content_type = "text/plain"),
+        (status = 200, description = "Newline-separated keys (UTF-8, trailing newline included)", body = Vec<u8>, content_type = "application/octet-stream"),
         (status = 503, description = "Cache is not yet caught up to the source"),
     ),
 )]
@@ -288,23 +315,45 @@ async fn keys(State(state): State<AppState>) -> Response {
     if let Err(r) = ready_or_503(&state) {
         return r;
     }
-    let keys = state.cache.snapshot_keys();
-    let body = keys.join("\n");
+    let mut body = Vec::new();
+    for k in state.cache.snapshot_keys() {
+        body.extend_from_slice(k.as_bytes());
+        body.push(b'\n');
+    }
     let mut headers = offsets_header(&state);
     headers.insert(
         axum::http::header::CONTENT_TYPE,
-        HeaderValue::from_static("text/plain; charset=utf-8"),
+        HeaderValue::from_static("application/octet-stream"),
     );
     (StatusCode::OK, headers, body).into_response()
 }
 
 /// GET /cache/v1/values — newline-separated values (raw bytes).
+/// Order matches `/cache/v1/keys`. Every line — including the last —
+/// is terminated by `\n`. Binary-safe **only** when none of the values
+/// contain a `0x0A` byte; binary topics should pin
+/// `values: { type: bytes-base64 }` so the cache returns the
+/// base64-encoded form here.
+///
+/// `Content-Type` is `text/plain; charset=utf-8` regardless of the
+/// configured value type. Future work — gated on operator demand —
+/// is to adapt the response content type to the topic schema:
+///
+/// | `values.type`        | proposed `Content-Type`            |
+/// | -------------------- | ---------------------------------- |
+/// | `bytes-base64`       | `application/octet-stream`         |
+/// | `utf8`               | `text/plain; charset=utf-8`        |
+/// | `json` / `json-parseable` | `application/x-ndjson`        |
+///
+/// Not implemented today to keep parity with KKV's
+/// `text/plain;charset=UTF-8` (mirror-v3 emits the RFC-normalised
+/// equivalent).
 #[utoipa::path(
     get,
     path = "/cache/v1/values",
     tag = "cache",
     responses(
-        (status = 200, description = "Newline-separated raw values; binary-safe insofar as none of the values contain a 0x0A byte", body = Vec<u8>, content_type = "text/plain"),
+        (status = 200, description = "Newline-separated raw values with trailing newline; binary-safe iff no value contains 0x0A", body = Vec<u8>, content_type = "text/plain"),
         (status = 503, description = "Cache is not yet caught up to the source"),
     ),
 )]
@@ -313,13 +362,9 @@ async fn values(State(state): State<AppState>) -> Response {
         return r;
     }
     let mut body = Vec::new();
-    let snapshot = state.cache.snapshot_values();
-    let last = snapshot.len().saturating_sub(1);
-    for (i, v) in snapshot.into_iter().enumerate() {
+    for v in state.cache.snapshot_values() {
         body.extend_from_slice(&v);
-        if i < last {
-            body.push(b'\n');
-        }
+        body.push(b'\n');
     }
     let mut headers = offsets_header(&state);
     headers.insert(
@@ -373,6 +418,5 @@ async fn trigger_shutdown(state: &AppState, code: i32) {
 /// Render the OpenAPI 3.1 document as pretty JSON. Used by the
 /// `xtask gen-openapi` command and by the schema-gate test.
 pub fn openapi_json_pretty() -> String {
-    let api = ApiDoc::openapi();
-    serde_json::to_string_pretty(&api).expect("openapi serialization is infallible")
+    serde_json::to_string_pretty(&openapi_doc()).expect("openapi serialization is infallible")
 }

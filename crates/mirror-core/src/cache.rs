@@ -25,9 +25,11 @@
 //! ready, [`CacheState::is_ready`] flips to `true` and stays true.
 //! HTTP handlers gate on this; they return 503 until it flips.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::RwLock;
+
+use indexmap::IndexMap;
 
 use crate::Record;
 
@@ -61,7 +63,11 @@ struct MirrorReadiness {
 #[derive(Debug, Default)]
 pub struct CacheState {
     /// Merged key → latest-value across every opt-in mirror.
-    view: RwLock<BTreeMap<String, Vec<u8>>>,
+    /// Iteration order is **insertion order**: the position a key
+    /// gets the *first* time it's seen. Overwrites don't change
+    /// position. Tombstones shift subsequent keys down to fill the
+    /// gap. Clients that want a sorted listing sort client-side.
+    view: RwLock<IndexMap<String, Vec<u8>>>,
     /// Last-seen source offset per (topic, partition). Monotonic.
     offsets: RwLock<HashMap<TopicPartition, u64>>,
     /// Per-mirror readiness slots, keyed by the mirror's
@@ -139,10 +145,18 @@ impl CacheState {
         let mut view = self.view.write().expect("cache view poisoned");
         match record.value.as_ref() {
             Some(v) => {
+                // IndexMap::insert keeps the existing position on
+                // overwrite and appends only on first sighting —
+                // which is the contract clients want for `/keys`
+                // ordering ("new keys appear at the end").
                 view.insert(key, v.clone());
             }
             None => {
-                view.remove(&key);
+                // shift_remove preserves the relative order of the
+                // remaining entries; swap_remove would be faster but
+                // shuffle the trailing key into the gap, breaking
+                // determinism.
+                view.shift_remove(&key);
             }
         }
         drop(view);
@@ -201,7 +215,7 @@ impl CacheState {
     }
 
     /// Snapshot of every key currently in the merged view, in
-    /// BTreeMap (lexicographic) order. Materializes under a single
+    /// insertion order (first-sighting). Materializes under a single
     /// read lock so callers see a consistent set.
     pub fn snapshot_keys(&self) -> Vec<String> {
         let view = self.view.read().expect("cache view poisoned");
@@ -364,12 +378,37 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_keys_in_lexicographic_order() {
+    fn snapshot_keys_in_insertion_order() {
         let s = CacheState::new();
         s.register_mirror("m", 0);
         s.apply_record("m", &rec("t", 0, 0, "c", Some(b"v")));
         s.apply_record("m", &rec("t", 0, 1, "a", Some(b"v")));
         s.apply_record("m", &rec("t", 0, 2, "b", Some(b"v")));
-        assert_eq!(s.snapshot_keys(), vec!["a", "b", "c"]);
+        assert_eq!(s.snapshot_keys(), vec!["c", "a", "b"]);
+    }
+
+    #[test]
+    fn overwrite_keeps_position_in_listing() {
+        let s = CacheState::new();
+        s.register_mirror("m", 0);
+        s.apply_record("m", &rec("t", 0, 0, "x", Some(b"v0")));
+        s.apply_record("m", &rec("t", 0, 1, "y", Some(b"v1")));
+        s.apply_record("m", &rec("t", 0, 2, "x", Some(b"v0-updated")));
+        assert_eq!(s.snapshot_keys(), vec!["x", "y"]);
+        assert_eq!(
+            s.snapshot_values(),
+            vec![b"v0-updated".to_vec(), b"v1".to_vec()]
+        );
+    }
+
+    #[test]
+    fn tombstone_preserves_order_of_remaining() {
+        let s = CacheState::new();
+        s.register_mirror("m", 0);
+        s.apply_record("m", &rec("t", 0, 0, "a", Some(b"va")));
+        s.apply_record("m", &rec("t", 0, 1, "b", Some(b"vb")));
+        s.apply_record("m", &rec("t", 0, 2, "c", Some(b"vc")));
+        s.apply_record("m", &rec("t", 0, 3, "b", None)); // tombstone middle
+        assert_eq!(s.snapshot_keys(), vec!["a", "c"]);
     }
 }

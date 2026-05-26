@@ -1796,6 +1796,7 @@ name = "mirror-core"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "indexmap 2.14.0",
  "metrics",
  "serde",
  "serde_json",

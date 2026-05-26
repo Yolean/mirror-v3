@@ -31,268 +31,174 @@ Fixture stream on topic `compat-probe` (partition 0):
 
 `bootstrap_hwm = 9` on both consumers.
 
-## Summary
+## Status
 
-23 probes total: **16 identical**, **7 divergent**. None of the
-divergences invalidate the drop-in story for the dependents we know
-about today (point lookups via `/cache/v1/raw/{key}`), but several
-warrant a decision on whether we want bug-for-bug parity or a clean
-mirror-v3 behavior.
+After the round-1 triage (F1–F7), 18 of 23 probes match byte-for-byte.
+The 5 remaining divergences are all **intentional** per the operator
+decisions recorded below. None of them break point-lookup semantics —
+`GET /cache/v1/raw/{key}` is 100 % parity across every case probed
+(present keys, overwrites, tombstones, special characters, unicode,
+URL-encoded slashes, missing keys, malformed paths).
 
-| #  | Probe                              | Match? | Triage                            |
-| -- | ---------------------------------- | ------ | --------------------------------- |
-| 1  | `GET /cache/v1/raw/k1` (latest)     | ✅      | identical                         |
-| 2  | `GET /cache/v1/raw/k3`              | ✅      | identical                         |
-| 3  | `GET /cache/v1/raw/k2` (tombstoned) | ✅      | identical (both 404)              |
-| 4  | `GET /cache/v1/raw/never`           | ✅      | identical                         |
-| 5  | `GET /cache/v1/raw/empty-value`     | ✅      | identical (200, empty body)       |
-| 6  | `GET /cache/v1/raw/special/chars`   | ✅      | identical (both 404 — slash routed)|
-| 7  | `GET /cache/v1/raw/special%2Fchars` | ✅      | identical                         |
-| 8  | `GET /cache/v1/raw/plus+key`        | ✅      | identical                         |
-| 9  | `GET /cache/v1/raw/<unicode>`       | ✅      | identical                         |
-| 10 | `GET /cache/v1/raw/`                | ✅      | identical (404)                   |
-| 11 | `GET /cache/v1/raw`                 | ✅      | identical (404)                   |
-| 12 | `GET /cache/v1/keys`                | ❌ ⚠️   | **[F1] tombstoned key listed by KKV; ordering & `Content-Type` differ** |
-| 13 | `GET /cache/v1/values`              | ❌ ⚠️   | **[F2] tombstoned value emitted as literal `null` by KKV; ordering, trailing newline, `Content-Type` differ** |
-| 14 | `GET /cache/v1/offset/{t}/0`        | ⚠️      | body identical; **[F3] `Content-Type` casing/spacing differs** |
-| 15 | `GET /cache/v1/offset/{t}/99`       | ❌      | **[F4] KKV → 204, mirror-v3 → 200** |
-| 16 | `GET /cache/v1/offset/nope/0`       | ❌      | **[F4]** same shape                |
-| 17 | `GET /cache/v1/offset//0`           | ❌      | **[F5] KKV → 404, mirror-v3 → 400**|
-| 18 | `GET /cache/v1/offset/{t}/x`        | ❌      | **[F6] KKV → 404; mirror-v3 → 400 + descriptive body** |
-| 19 | `GET /cache/v1/unknown`             | ✅      | identical (404)                   |
-| 20 | `POST /cache/v1/raw/k1`             | ✅      | identical (405)                   |
-| 21 | `DELETE /cache/v1/raw/k1`           | ✅      | identical (405)                   |
-| 22 | `GET /`                             | ✅      | identical (404)                   |
-| 23 | `GET /openapi.json`                 | ❌      | **[F7] mirror-v3 200, KKV 404** (additive — intentional) |
+| #  | Probe                              | Match? | Status / triage outcome |
+| -- | ---------------------------------- | ------ | ----------------------- |
+| 1  | `GET /cache/v1/raw/k1` (latest)    | ✅      | identical               |
+| 2  | `GET /cache/v1/raw/k3`             | ✅      | identical               |
+| 3  | `GET /cache/v1/raw/k2` (tombstoned)| ✅      | identical (404)         |
+| 4  | `GET /cache/v1/raw/never`          | ✅      | identical (404)         |
+| 5  | `GET /cache/v1/raw/empty-value`    | ✅      | identical (200, empty)  |
+| 6  | `GET /cache/v1/raw/special/chars`  | ✅      | identical (404 — slash routed) |
+| 7  | `GET /cache/v1/raw/special%2Fchars`| ✅      | identical               |
+| 8  | `GET /cache/v1/raw/plus+key`       | ✅      | identical               |
+| 9  | `GET /cache/v1/raw/<unicode>`      | ✅      | identical               |
+| 10 | `GET /cache/v1/raw/`               | ✅      | identical (404)         |
+| 11 | `GET /cache/v1/raw`                | ✅      | identical (404)         |
+| 12 | `GET /cache/v1/keys`               | ⚠️      | **status, headers, trailing newline now match KKV**. Body differs by design: see [Intentional divergence A](#a-keys-and-values-body-tombstones-and-ordering). |
+| 13 | `GET /cache/v1/values`             | ⚠️      | as above + [B](#b-values-content-type-casing-spacing) |
+| 14 | `GET /cache/v1/offset/{t}/0`       | ⚠️      | status + body identical; `Content-Type` differs per [B](#b-values-content-type-casing-spacing) |
+| 15 | `GET /cache/v1/offset/{t}/99`      | ❌      | [C](#c-offset--unknown-topicpartition-status-)            |
+| 16 | `GET /cache/v1/offset/nope/0`      | ❌      | [C](#c-offset--unknown-topicpartition-status-)            |
+| 17 | `GET /cache/v1/offset//0`          | ❌      | [D](#d-offset--malformed-input-status-)            |
+| 18 | `GET /cache/v1/offset/{t}/x`       | ❌      | [D](#d-offset--malformed-input-status-)            |
+| 19 | `GET /cache/v1/unknown`            | ✅      | identical (404)         |
+| 20 | `POST /cache/v1/raw/k1`            | ✅      | identical (405)         |
+| 21 | `DELETE /cache/v1/raw/k1`          | ✅      | identical (405)         |
+| 22 | `GET /`                            | ✅      | identical (404)         |
+| 23 | `GET /openapi.json`                | ❌      | [E](#e-openapijson--additive-on-mirror-v3) (additive) |
 
-## Identical behaviour (no action)
+## Resolved (changed in this round)
 
-- `GET /cache/v1/raw/{key}` for present keys returns identical status,
-  body, `Content-Type: application/octet-stream`, and a JSON
-  `x-kkv-last-seen-offsets` header. Tombstoned keys return 404 on both.
-  Empty-byte values come back as 200 with a zero-byte body, identical
-  on both.
-- Slash in the URL path is routed before the key matcher on both
-  servers, so `/cache/v1/raw/special/chars` is a 404 on both;
-  URL-encoded `%2F` works.
-- `+` in the key path is treated literally (not as space) by both —
-  the dependent's URL-builder is consistent across the swap.
-- Multibyte / non-ASCII keys (`ünıçødé`) work identically once
-  percent-encoded.
-- Empty trailing segment (`/cache/v1/raw/`) and the bare prefix
-  (`/cache/v1/raw`) are 404 on both.
-- 405 for `POST` / `DELETE` against `raw/{key}`.
-- 404 for unknown paths inside `/cache/v1/` and at `/`.
+### `/keys` and `/values` are now newline-terminated
 
-## Divergences worth a call
+Both servers now end every listed line — including the last — with
+`\n`. mirror-v3 changed; KKV was already this shape.
 
-### [F1] `GET /cache/v1/keys` — tombstones leak into the key listing on KKV
+### `/keys` `Content-Type` is now `application/octet-stream`
 
-KKV body (decoded for readability):
+mirror-v3 was emitting `text/plain; charset=utf-8`; it now matches
+KKV's `application/octet-stream`. The same hook is documented in code
+for the `/values` endpoint if we later want it to adapt to the topic
+schema (see [Future enhancement F](#f-future-content-type-adapts-to-valuestype)).
 
-```
-empty-value
-k1
-special/chars
-k2          ← tombstoned (offset 8) but still listed
-k3
-plus+key
-ünıçødé
-<trailing newline>
-```
+### Cache view iteration is now insertion order
 
-mirror-v3 body:
+mirror-v3 was iterating in BTreeMap (lexicographic) order; it now
+uses [`indexmap::IndexMap`](https://docs.rs/indexmap), so the position
+a key occupies in `/keys` and `/values` is the position it was *first*
+seen by the cache. Overwrites keep the existing position; tombstones
+`shift_remove` (preserving the order of the remaining entries). This
+is stricter than KKV — KKV's underlying `ConcurrentHashMap` gives
+unspecified iteration order — but it gives operators a stable contract
+they can reason about, which lex order can't (lex order changes when
+the **set** of keys changes).
 
-```
-empty-value
-k1
-k3
-plus+key
-special/chars
-ünıçødé
-<no trailing newline>
-```
+## Intentional remaining divergences
 
-Three sub-issues:
+### A. `/keys` and `/values` body: tombstones and ordering
 
-1. **Tombstoned key in the listing.** KKV keeps `k2` after the null-value
-   record. `GET /cache/v1/raw/k2` correctly returns 404 — the key is
-   "in the map" but with a value the cache reports as absent. This is
-   internally inconsistent. mirror-v3 removes the entry from both the
-   value lookup and the listing.
-2. **Ordering.** KKV returns insertion order (the first time a key
-   was seen on the partition). mirror-v3 returns lexicographic order
-   (BTreeMap iteration).
-3. **`Content-Type`.** KKV emits `application/octet-stream`. mirror-v3
-   emits `text/plain; charset=utf-8`. The KKV `CacheResource` source
-   omits `@Produces` for this endpoint, so JAX-RS falls back to the
-   surrounding default; mirror-v3 picks a content-type that matches
-   the byte content.
-4. **Trailing newline.** KKV adds one; mirror-v3 doesn't.
+KKV `/keys` body: `empty-value\nk1\nspecial/chars\nk2\nk3\nplus+key\nünıçødé\n`
 
-**Recommendation:** keep mirror-v3's behaviour. The tombstone bug in
-KKV is the kind of thing dependents will eventually trip over; the
-ordering difference is harmless (operators using `/keys` to enumerate
-should sort anyway); the `Content-Type` is a defensible upgrade.
-**Verify** no dependent parses the listing position-sensitively or
-expects a trailing newline before shipping. If any do, fix them; we
-should not preserve a bug.
+mirror-v3 `/keys` body: `k1\nk3\nempty-value\nspecial/chars\nplus+key\nünıçødé\n`
 
-### [F2] `GET /cache/v1/values` — KKV emits the literal string `null` for tombstones
+Two intentional differences:
 
-KKV body:
+1. **Tombstoned keys** (`k2` here) appear in KKV's listing even after
+   the null-value record is applied. mirror-v3 removes them from
+   both `/keys` and `/values`. **Decision F1.1: mirror-v3 is correct.**
+   Anyone consuming the listings and then doing `GET /raw/{key}` on
+   each result gets surprised by KKV's tombstone leakage; mirror-v3
+   doesn't surface entries it would 404 on.
+2. **Ordering**: mirror-v3 is insertion order; KKV is Java
+   `ConcurrentHashMap` iteration order (effectively undefined).
+   **Decision F1.2: insertion order is the contract worth giving
+   operators. Lexicographic ordering, if a consumer wants it, is one
+   client-side `sort` away.**
 
-```
-              ← empty line for the empty-value key
-v1-updated
-with/slashes
-null          ← this is KKV serializing a null-valued slot
-v3
-plusvalue
-unicode-value
-<trailing newline>
-```
+The same applies to `/values` — KKV additionally emits the literal
+ASCII bytes `null` where a tombstoned slot would be, which mirror-v3
+suppresses (consequence of F1.1).
 
-mirror-v3 body:
-
-```
-
-v1-updated
-v3
-plusvalue
-with/slashes
-unicode-value
-<no trailing newline>
-```
-
-Same ordering / trailing-newline / tombstone-listing issues as [F1],
-plus KKV silently corrupts the values stream by emitting four bytes of
-ASCII `"null"` where a missing value should have been. A binary
-consumer of `/values` (which is what the `Content-Type` of
-`text/plain;charset=UTF-8` on KKV suggests is the only safe consumer
-shape anyway) cannot tell whether the literal bytes `null` are a real
-value or a serialization artefact.
-
-**Recommendation:** keep mirror-v3's behaviour. The `null` emission is
-unambiguously a KKV bug; nobody should depend on it. Same `Content-Type`
-delta as [F1] (mirror-v3 normalises the casing/spacing to
-`text/plain; charset=utf-8`).
-
-### [F3] `Content-Type` casing / spacing on `text/plain;charset=UTF-8`
+### B. `/values` `Content-Type` casing / spacing
 
 | Header           | KKV                            | mirror-v3                      |
 | ---------------- | ------------------------------ | ------------------------------ |
 | `Content-Type`   | `text/plain;charset=UTF-8`     | `text/plain; charset=utf-8`    |
 
-Functionally identical per [RFC 9110 §5.6.6](https://www.rfc-editor.org/rfc/rfc9110#section-5.6.6)
-(charset names are case-insensitive; the `;` parameter separator can
-have surrounding whitespace). Affects `/cache/v1/keys`, `/cache/v1/values`,
-`/cache/v1/offset/...`.
+Functionally identical per
+[RFC 9110 §5.6.6](https://www.rfc-editor.org/rfc/rfc9110#section-5.6.6):
+charset names are case-insensitive and the `;` parameter separator
+may have surrounding whitespace. Affects `/cache/v1/values` and the
+`/cache/v1/offset/*` endpoints. **Decision F3: mirror-v3's
+RFC-normalised form is correct; any consumer that string-equals the
+header is the broken party.**
 
-**Recommendation:** keep mirror-v3's form. Any compliant consumer
-treats them the same; non-compliant string-equality checks would be
-the dependent's bug. Not worth changing.
+### C. `/cache/v1/offset/{topic}/{partition}` — unknown topic / partition: status `204` vs `200`
 
-### [F4] `GET /cache/v1/offset/{topic}/{partition}` for unknown partition or topic
+| Case                          | KKV   | mirror-v3 |
+| ----------------------------- | ----- | --------- |
+| Unknown partition (`/{t}/99`) | `204` | `200`     |
+| Unknown topic   (`/nope/0`)   | `204` | `200`     |
 
-| Case                    | KKV   | mirror-v3 |
-| ----------------------- | ----- | --------- |
-| Unknown partition (`99`)| `204 No Content` | `200 OK` (empty body) |
-| Unknown topic           | `204 No Content` | `200 OK` (empty body) |
+Both return an empty body in both cases. **Decision F4: keep
+mirror-v3's `200`** (per the F4+ note). Documented here so dependents
+can scope on 2xx rather than `status == 200`.
 
-Both return an empty body. The status diverges. KKV's `204` is
-arguably more idiomatic ("no representation to return"); mirror-v3
-returns `200` because our handler produces a `text/plain` body and
-just lets it be the empty string when the offset is unknown.
+### D. `/cache/v1/offset/{topic}/{partition}` — malformed input: status `400` vs `404`
 
-**Recommendation:** change mirror-v3 to return `204` for the
-unknown-(topic, partition) cases. Cheap to fix, idiomatic, matches
-KKV. Any dependent that branches on `r.status_code == 200` to mean
-"found" gets a useful upgrade; any that already handles 2xx gets the
-same behaviour.
+| Case                                       | KKV   | mirror-v3                        |
+| ------------------------------------------ | ----- | -------------------------------- |
+| Empty topic segment (`/offset//0`)         | `404` | `400` (empty body)               |
+| Non-integer partition (`/offset/{t}/x`)    | `404` | `400` + parse-error body         |
 
-Tracking: should I queue this as a follow-up? — yes.
+KKV swallows malformed input as a routing-miss 404. mirror-v3 raises a
+specific 400. **Decision F5 / F6: keep mirror-v3's `400`** — empty
+topic and non-integer partition are unambiguously *bad input*, not
+*missing resource*, and the body on the partition-parse case is
+operator-friendly during integration. Anyone branching on
+`status == 404` for "absent" will need to broaden to "absent ⇔ 404
+**or** empty body on 200" anyway because of [C](#c-offset--unknown-topicpartition-status-).
 
-### [F5] `GET /cache/v1/offset//0` (empty topic) — `400` vs `404`
+### E. `/openapi.json` — additive on mirror-v3
 
-| KKV   | mirror-v3 |
-| ----- | --------- |
-| `404` | `400 Bad Request` |
+mirror-v3 serves `/openapi.json` (and `/openapi.yaml`, plus a Scalar
+UI at `/docs`); KKV returns 404 for all of these. Additive surface;
+unaffected dependents stay unaffected. The committed spec lives at
+[`schemas/mirror-v3.cache.openapi.json`](./schemas/mirror-v3.cache.openapi.json)
+and is gated via `cargo run -p xtask -- check-openapi`.
 
-KKV routes empty topic segments as "no such resource" (Quarkus /
-JAX-RS path matching default). mirror-v3 explicitly validates
-`if topic.is_empty()` and emits `400`. Semantically, empty input is
-malformed; `400` is the more honest answer. KKV is incidental
-behaviour, not policy.
+## F. (Future) `Content-Type` adapts to `values.type`
 
-**Recommendation:** keep mirror-v3's behaviour. Document the
-difference for triage. Dependents that distinguish 4xx
-sub-classes are unusual.
+Today `/cache/v1/values` returns `text/plain; charset=utf-8`
+regardless of how the operator configured `values.type`. Once a
+dependent shows up that benefits, we could adapt:
 
-### [F6] `GET /cache/v1/offset/{topic}/x` (partition is not an integer)
+| `values.type`              | `Content-Type`                |
+| -------------------------- | ----------------------------- |
+| `bytes-base64`             | `application/octet-stream`    |
+| `utf8`                     | `text/plain; charset=utf-8`   |
+| `json` / `json-parseable`  | `application/x-ndjson`        |
 
-| Header        | KKV               | mirror-v3                                          |
-| ------------- | ----------------- | -------------------------------------------------- |
-| Status        | `404`             | `400 Bad Request`                                  |
-| Body          | empty             | `"Invalid URL: Cannot parse value at index 1 with value \`x\` to a \`u32\`"` |
+The hook is sketched in the `values` handler's doc comment for when
+we want to flip the switch. Not enabled today to preserve byte
+parity with KKV.
 
-KKV: JAX-RS couldn't match `x` against `@PathParam Integer partition`,
-falls back to 404 (resource not matched). mirror-v3: axum's path
-extractor rejects with `400` and the parse error in the body.
+## Surfaces we know are silently divergent but didn't probe
 
-**Recommendation:** the mirror-v3 body is operator-friendly during
-development and not a security risk (the input is already in the URL
-the client sent). Two choices:
+| Surface                                     | Status                                |
+| ------------------------------------------- | ------------------------------------- |
+| onupdate webhook dispatcher                 | mirror-v3 does not implement (deferred to a future PR). If a current dependent uses Yolean's KKV in sidecar mode and relies on onupdate, mirror-v3 is **not** a drop-in for them yet. |
+| `POST /_admin/v1/shutdown[/{exitcode}]`     | mirror-v3 has it; not compared        |
+| `/q/health` / `/q/health/ready` (Quarkus)   | mirror-v3 does not implement; we expose `/metrics` (Prometheus) on the metrics port instead |
+| Multi-partition `/cache/v1/offset/{t}/{p}`  | the fixture topic uses 1 partition; the multi-partition case is unit-tested in `mirror-cache`'s handler tests |
+| Readiness 503 timing                        | both serve 503 before catch-up, sticky after; deeper compare would need a controlled-rate producer |
 
-- **Match KKV:** silence the body, return `404`. Cheap; matches the
-  drop-in promise. But hides the real reason.
-- **Keep mirror-v3 as-is:** keep `400` + body. Better DX. But
-  programmatically distinguishing "bad partition" from "no such key"
-  becomes destination-dependent.
+## Open
 
-I'd take the middle ground: keep `400` (it's the right status) but
-empty the body to match KKV's silence. Small change. If we want to
-match KKV byte-for-byte, switch to `404` empty. Wants a decision.
-
-### [F7] `GET /openapi.json` — added by mirror-v3, absent on KKV
-
-mirror-v3 returns `200` + the OpenAPI 3.1 document. KKV returns `404`.
-This is additive. The committed spec lives at
-[`schemas/mirror-v3.cache.openapi.json`](./schemas/mirror-v3.cache.openapi.json).
-
-**Recommendation:** keep. Dependents that don't hit `/openapi.json`
-are unaffected; the new endpoint helps operators discover the surface.
-Also: `/openapi.yaml` and the Scalar UI at `/docs` are mirror-v3-only
-in the same way. Document in README.
-
-## What we know is silently divergent but didn't probe
-
-| Surface                                     | Status                          |
-| ------------------------------------------- | ------------------------------- |
-| onupdate webhook dispatcher                 | mirror-v3 does not implement   |
-| `POST /_admin/v1/shutdown[/{exitcode}]`     | mirror-v3 has it; not compared  |
-| `/q/health` / `/q/health/ready` (Quarkus)   | mirror-v3 does not implement   |
-| Multi-partition `/cache/v1/offset/{t}/{p}`  | fixture uses 1 partition only   |
-| Readiness 503 timing (window before catch-up) | both serve 503; deeper compare needed |
-
-The onupdate dispatcher was explicitly out of scope for this PR. If a
-PoC dependent uses Yolean's KKV in sidecar mode and relies on
-onupdate, the swap is **not** a drop-in for them yet — they'd need to
-move dispatch elsewhere or wait for the follow-up.
-
-## Triage actions
-
-| ID  | Action                                                                   | Priority |
-| --- | ------------------------------------------------------------------------ | -------- |
-| F4  | Return `204` from `/cache/v1/offset/{t}/{p}` when (t, p) has no offset    | should-do |
-| F6  | Drop the parse-error body from `/cache/v1/offset/{t}/x` (keep `400`)     | optional |
-| F1  | Confirm no current dependent reads `/cache/v1/keys` (ordering/trailing nl) | confirm-then-skip |
-| F2  | Confirm no current dependent reads `/cache/v1/values` (it's nearly always wrong on KKV anyway) | confirm-then-skip |
-| F3  | No change                                                                | n/a |
-| F5  | No change; document                                                      | n/a |
-| F7  | No change; document                                                      | n/a |
-
-Open per the user note: "It's quite possible that we'll want divergent
-behavior for anything that isn't explicitly depended on in current use
-cases." Confirm with PoC operators which of these we should preserve
-bug-for-bug.
+- Confirm with PoC operators that none of them depend on the
+  KKV-only quirks documented in [A](#a-keys-and-values-body-tombstones-and-ordering),
+  [B](#b-values-content-type-casing-spacing),
+  [C](#c-offset--unknown-topicpartition-status-),
+  [D](#d-offset--malformed-input-status-).
+- If a dependent later turns up that does want `204 No Content` for
+  the unknown-(topic, partition) case ([C](#c-offset--unknown-topicpartition-status-)),
+  the change is a one-liner and the test in this file would catch it.

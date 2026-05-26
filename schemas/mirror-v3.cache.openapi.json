@@ -9,7 +9,200 @@
     },
     "version": "1.0.0"
   },
-  "paths": {},
+  "paths": {
+    "/_admin/v1/shutdown": {
+      "post": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "POST /_admin/v1/shutdown — request graceful exit.",
+        "operationId": "admin_shutdown",
+        "responses": {
+          "202": {
+            "description": "Shutdown accepted; the supervisor will exit shortly with code 0"
+          }
+        }
+      }
+    },
+    "/_admin/v1/shutdown/{exitcode}": {
+      "post": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "POST /_admin/v1/shutdown/{exitcode} — request graceful exit with a specific code.",
+        "operationId": "admin_shutdown_with_exit_code",
+        "parameters": [
+          {
+            "name": "exitcode",
+            "in": "path",
+            "description": "Exit code the supervisor will return",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int32"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "Shutdown accepted; the supervisor will exit with the requested code"
+          }
+        }
+      }
+    },
+    "/cache/v1/keys": {
+      "get": {
+        "tags": [
+          "cache"
+        ],
+        "summary": "GET /cache/v1/keys — newline-separated key list, every line\n(including the last) terminated by `\\n`. Order is the order each\nkey was first seen by the cache (insertion order).",
+        "description": "`Content-Type` is `application/octet-stream` to match KKV's\nbyte-for-byte response shape. A possible future enhancement (gated\non operator demand) is to surface the topic schema in the content\ntype — see the `values` handler for the same hook.",
+        "operationId": "keys",
+        "responses": {
+          "200": {
+            "description": "Newline-separated keys (UTF-8, trailing newline included)",
+            "content": {
+              "application/octet-stream": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "type": "integer",
+                    "format": "int32",
+                    "minimum": 0
+                  }
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Cache is not yet caught up to the source"
+          }
+        }
+      }
+    },
+    "/cache/v1/offset/{topic}/{partition}": {
+      "get": {
+        "tags": [
+          "cache"
+        ],
+        "summary": "GET /cache/v1/offset/{topic}/{partition} — last-seen offset.",
+        "operationId": "offset_for_partition",
+        "parameters": [
+          {
+            "name": "topic",
+            "in": "path",
+            "description": "Source topic name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "partition",
+            "in": "path",
+            "description": "Source partition",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Decimal offset of the last applied record, or empty if none yet",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Empty topic"
+          }
+        }
+      }
+    },
+    "/cache/v1/raw/{key}": {
+      "get": {
+        "tags": [
+          "cache"
+        ],
+        "summary": "GET /cache/v1/raw/{key} — fetch a value by key.",
+        "operationId": "raw_by_key",
+        "parameters": [
+          {
+            "name": "key",
+            "in": "path",
+            "description": "URL-encoded key (UTF-8 string)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Value bytes for the requested key",
+            "content": {
+              "application/octet-stream": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "type": "integer",
+                    "format": "int32",
+                    "minimum": 0
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Empty or invalid key"
+          },
+          "404": {
+            "description": "Key not in cache"
+          },
+          "503": {
+            "description": "Cache is not yet caught up to the source"
+          }
+        }
+      }
+    },
+    "/cache/v1/values": {
+      "get": {
+        "tags": [
+          "cache"
+        ],
+        "summary": "GET /cache/v1/values — newline-separated values (raw bytes).\nOrder matches `/cache/v1/keys`. Every line — including the last —\nis terminated by `\\n`. Binary-safe **only** when none of the values\ncontain a `0x0A` byte; binary topics should pin\n`values: { type: bytes-base64 }` so the cache returns the\nbase64-encoded form here.",
+        "description": "`Content-Type` is `text/plain; charset=utf-8` regardless of the\nconfigured value type. Future work — gated on operator demand —\nis to adapt the response content type to the topic schema:\n\n| `values.type`        | proposed `Content-Type`            |\n| -------------------- | ---------------------------------- |\n| `bytes-base64`       | `application/octet-stream`         |\n| `utf8`               | `text/plain; charset=utf-8`        |\n| `json` / `json-parseable` | `application/x-ndjson`        |\n\nNot implemented today to keep parity with KKV's\n`text/plain;charset=UTF-8` (mirror-v3 emits the RFC-normalised\nequivalent).",
+        "operationId": "values",
+        "responses": {
+          "200": {
+            "description": "Newline-separated raw values with trailing newline; binary-safe iff no value contains 0x0A",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "type": "integer",
+                    "format": "int32",
+                    "minimum": 0
+                  }
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Cache is not yet caught up to the source"
+          }
+        }
+      }
+    }
+  },
   "components": {
     "schemas": {
       "TopicPartitionOffsetJson": {

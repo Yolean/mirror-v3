@@ -103,7 +103,7 @@ async fn tombstone_makes_key_404() {
 }
 
 #[tokio::test]
-async fn keys_and_values_are_newline_separated_and_ordered() {
+async fn keys_and_values_are_newline_terminated_in_insertion_order() {
     let cache = Arc::new(CacheState::new());
     cache.register_mirror("m", 0);
     cache.apply_record("m", &rec("t", 0, 0, "b", Some(b"vb")));
@@ -118,8 +118,18 @@ async fn keys_and_values_are_newline_separated_and_ordered() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     assert!(resp.headers().contains_key(KKV_OFFSETS_HEADER));
+    assert_eq!(
+        resp.headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+        Some("application/octet-stream"),
+        "/keys content-type matches KKV"
+    );
     let body = String::from_utf8(body_bytes(resp).await).unwrap();
-    assert_eq!(body, "a\nb\nc");
+    assert_eq!(
+        body, "b\na\nc\n",
+        "insertion order; every line ends with \\n"
+    );
 
     let resp = app
         .oneshot(
@@ -131,7 +141,7 @@ async fn keys_and_values_are_newline_separated_and_ordered() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let body = body_bytes(resp).await;
-    assert_eq!(body, b"va\nvb\nvc");
+    assert_eq!(body, b"vb\nva\nvc\n");
 }
 
 #[tokio::test]
