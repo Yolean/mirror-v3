@@ -1,7 +1,7 @@
 use mirror_config::{
     load_from_str, ColumnConfig, ColumnType, Compaction, Config, Destination, DestinationFormat,
-    FilesystemDestination, FlushTriggers, KafkaDestination, KafkaSource, Mirror, S3Destination,
-    TimestampMode,
+    FilesystemDestination, FlushTriggers, HttpAccess, HttpAccessApi, KafkaDestination, KafkaSource,
+    Mirror, S3Destination, TimestampMode,
 };
 use std::path::PathBuf;
 
@@ -41,6 +41,7 @@ fn parses_minimal_kafka_config() {
                 compaction: None,
                 flush: None,
                 timestamp_mode: None,
+                http_access: None,
             }],
         }
     );
@@ -532,4 +533,105 @@ mirrors:
     let cfg = load_from_str(yaml).expect("must parse");
     assert_eq!(cfg.mirrors.len(), 2);
     assert_eq!(cfg.mirrors[1].partition, 1);
+}
+
+#[test]
+fn http_access_cache_v1_parses() {
+    let yaml = r#"
+destination:
+  type: filesystem
+  root: /tmp/mirror
+mirrors:
+  - name: user-states
+    source: { bootstrap-servers: kafka:9092 }
+    topic: user-states
+    partition: 0
+    http-access:
+      api: cache-v1
+    flush:
+      max-time-ms: 5000
+      max-bytes: 1000
+      max-offsets: 100
+"#;
+    let cfg = load_from_str(yaml).expect("must parse");
+    assert_eq!(
+        cfg.mirrors[0].http_access,
+        Some(HttpAccess {
+            api: HttpAccessApi::CacheV1
+        })
+    );
+}
+
+#[test]
+fn http_access_forbidden_for_kafka_destinations() {
+    let yaml = r#"
+destination:
+  type: kafka
+  bootstrap-servers: redpanda:9092
+mirrors:
+  - name: operations
+    source: { bootstrap-servers: kafka:9092 }
+    topic: ops
+    partition: 0
+    http-access:
+      api: cache-v1
+"#;
+    let err = load_from_str(yaml).expect_err("http-access on kafka must be rejected");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("http-access") && msg.contains("filesystem/s3"),
+        "got: {msg}"
+    );
+}
+
+#[test]
+fn http_access_rejects_bytes_keys() {
+    let yaml = r#"
+destination:
+  type: filesystem
+  root: /tmp/mirror
+mirrors:
+  - name: ops
+    source: { bootstrap-servers: kafka:9092 }
+    topic: ops
+    partition: 0
+    keys: { type: bytes }
+    http-access:
+      api: cache-v1
+    flush:
+      max-time-ms: 5000
+      max-bytes: 1000
+      max-offsets: 100
+"#;
+    let err = load_from_str(yaml).expect_err("http-access + bytes-keys must be rejected");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("http-access") && msg.contains("utf8"),
+        "got: {msg}"
+    );
+}
+
+#[test]
+fn http_access_works_without_compaction() {
+    // Decoupled per spec: opt-in cache without compaction:log is the
+    // KKV-equivalent append-mode setup (files grow, view is in-memory).
+    let yaml = r#"
+destination:
+  type: filesystem
+  root: /tmp/mirror
+mirrors:
+  - name: cache-only
+    source: { bootstrap-servers: kafka:9092 }
+    topic: orders
+    partition: 0
+    http-access:
+      api: cache-v1
+    flush:
+      max-time-ms: 5000
+      max-bytes: 1000
+      max-offsets: 100
+"#;
+    let cfg = load_from_str(yaml).expect("must parse");
+    assert_eq!(cfg.mirrors[0].compaction, None);
+    assert!(cfg.mirrors[0].http_access.is_some());
 }

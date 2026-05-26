@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::StreamExt;
-use mirror_core::{Record, Sink, SinkError};
+use mirror_core::{CacheState, Record, Sink, SinkError};
 use mirror_envelope::{ColumnType, Format, ParquetCompression};
 use mirror_fs::naming;
 use object_store::path::Path;
@@ -67,6 +67,10 @@ pub struct S3SinkConfig {
     /// Caller must combine `Some(Log)` with `Format::Parquet` and
     /// `keys` ∈ {`Utf8`, `Json`}.
     pub compaction: Option<CompactionMode>,
+    /// Optional shared HTTP-cache state. See
+    /// `mirror_fs::FilesystemSinkConfig::cache` for semantics; the
+    /// S3 sink behaves identically.
+    pub cache: Option<CacheBinding>,
     pub flush: FlushTriggers,
 }
 
@@ -77,6 +81,14 @@ pub enum CompactionMode {
     Log,
 }
 
+/// See `mirror_fs::CacheBinding`. Replicated here to avoid a circular
+/// dependency.
+#[derive(Clone, Debug)]
+pub struct CacheBinding {
+    pub state: Arc<CacheState>,
+    pub mirror_name: String,
+}
+
 pub struct S3Sink {
     store: Arc<dyn ObjectStore>,
     partition_prefix: Path,
@@ -85,6 +97,7 @@ pub struct S3Sink {
     keys: ColumnType,
     values: ColumnType,
     compaction: Option<CompactionMode>,
+    cache: Option<CacheBinding>,
     flush: FlushTriggers,
     durable_position: u64,
     buffer: Vec<Record>,
@@ -122,6 +135,26 @@ impl S3Sink {
                 (pos, Some(view))
             }
         };
+        // Cache bootstrap: same shape as mirror-fs — replay durable
+        // state into the shared CacheState. Compaction = read latest
+        // snapshot; append + cache = scan + replay every object.
+        if let Some(binding) = cfg.cache.as_ref() {
+            match &view {
+                Some(v) => {
+                    for r in v.values() {
+                        binding.state.apply_record(&binding.mirror_name, r);
+                    }
+                }
+                None => {
+                    let records =
+                        read_all_records_via(cfg.store.as_ref(), &partition_prefix, cfg.format)
+                            .await?;
+                    for r in records.iter() {
+                        binding.state.apply_record(&binding.mirror_name, r);
+                    }
+                }
+            }
+        }
         // See mirror-fs::FilesystemSink::open_with_clock for the
         // naive-vs-smart story.
         let next_daily_unix = cfg
@@ -136,6 +169,7 @@ impl S3Sink {
             keys: cfg.keys,
             values: cfg.values,
             compaction: cfg.compaction,
+            cache: cfg.cache,
             flush: cfg.flush,
             durable_position,
             buffer: Vec::new(),
@@ -197,22 +231,11 @@ impl S3Sink {
         let name = naming::batch_filename(from, to, self.format.extension());
         let path = child_of(&self.partition_prefix, &name);
 
-        let to_encode: Vec<Record> = match (self.compaction, self.view.as_mut()) {
-            (Some(CompactionMode::Log), Some(view)) => {
-                for r in self.buffer.drain(..) {
-                    let key_bytes = r.key.as_ref().expect("compaction write rejects null key");
-                    let key_str = std::str::from_utf8(key_bytes)
-                        .expect("compaction write rejects non-UTF-8 key")
-                        .to_string();
-                    if r.value.is_none() {
-                        view.remove(&key_str);
-                    } else {
-                        view.insert(key_str, r);
-                    }
-                }
-                report_compaction_keys(view.len());
-                view.values().cloned().collect()
-            }
+        // Per mirror-fs: in compaction mode the local view is already
+        // current (write() applies per-record). Append mode encodes
+        // the buffer.
+        let to_encode: Vec<Record> = match (self.compaction, self.view.as_ref()) {
+            (Some(CompactionMode::Log), Some(view)) => view.values().cloned().collect(),
             _ => std::mem::take(&mut self.buffer),
         };
         let bytes = mirror_envelope::encode_batch(
@@ -334,11 +357,13 @@ impl Sink for S3Sink {
                 actual: record.source_offset,
             });
         }
-        if matches!(self.compaction, Some(CompactionMode::Log)) {
+        let requires_string_key =
+            matches!(self.compaction, Some(CompactionMode::Log)) || self.cache.is_some();
+        if requires_string_key {
             match &record.key {
                 None => {
                     return Err(SinkError::Transport(format!(
-                        "compaction=log requires a non-null key; \
+                        "this mirror requires a non-null key; \
                          record at source offset {} has key=null",
                         record.source_offset
                     )));
@@ -346,13 +371,28 @@ impl Sink for S3Sink {
                 Some(k) => {
                     if std::str::from_utf8(k).is_err() {
                         return Err(SinkError::Transport(format!(
-                            "compaction=log requires a UTF-8 key; \
+                            "this mirror requires a UTF-8 key; \
                              record at source offset {} has non-UTF-8 key",
                             record.source_offset
                         )));
                     }
                 }
             }
+        }
+        if let Some(view) = self.view.as_mut() {
+            let key_bytes = record.key.as_ref().expect("checked non-null above");
+            let key_str = std::str::from_utf8(key_bytes)
+                .expect("checked UTF-8 above")
+                .to_string();
+            if record.value.is_none() {
+                view.remove(&key_str);
+            } else {
+                view.insert(key_str, record.clone());
+            }
+            report_compaction_keys(view.len());
+        }
+        if let Some(binding) = self.cache.as_ref() {
+            binding.state.apply_record(&binding.mirror_name, &record);
         }
         self.buffer_bytes += record_byte_size(&record);
         self.buffer.push(record);
@@ -525,6 +565,50 @@ async fn load_view(
         view.insert(key_str, r);
     }
     Ok(view)
+}
+
+/// Read every object under the partition prefix as records, in
+/// offset order. Used to bootstrap the shared cache view on
+/// append + cache mode (where the chain is the full event history,
+/// not a single snapshot).
+async fn read_all_records_via(
+    store: &dyn ObjectStore,
+    prefix: &Path,
+    format: Format,
+) -> Result<Vec<Record>, S3Error> {
+    let expected_ext = format.extension();
+    let mut entries: Vec<(u64, u64, Path)> = Vec::new();
+    let mut stream = store.list(Some(prefix));
+    while let Some(meta) = stream.next().await {
+        let meta = meta.map_err(|e| S3Error::Store(e.to_string()))?;
+        let name = meta
+            .location
+            .filename()
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        if name.is_empty() || name.contains(".tmp.") {
+            continue;
+        }
+        if let Some((from, to)) = naming::parse_filename(&name, expected_ext) {
+            entries.push((from, to, meta.location.clone()));
+        }
+    }
+    entries.sort_by_key(|(from, _, _)| *from);
+    let mut out = Vec::new();
+    for (_, _, path) in entries {
+        let got = store
+            .get(&path)
+            .await
+            .map_err(|e| S3Error::Store(format!("get {path}: {e}")))?;
+        let bytes = got
+            .bytes()
+            .await
+            .map_err(|e| S3Error::Store(format!("read {path}: {e}")))?;
+        let records = mirror_envelope::decode_batch(format, &bytes)
+            .map_err(|e| S3Error::CorruptChain(format!("decode {path}: {e}")))?;
+        out.extend(records);
+    }
+    Ok(out)
 }
 
 fn report_compaction_keys(n: usize) {

@@ -85,6 +85,7 @@ async fn mirrors_to_versitygw_with_offset_named_objects() {
         keys: mirror_envelope::ColumnType::Utf8,
         values: mirror_envelope::ColumnType::Utf8,
         compaction: None,
+        cache: None,
         flush,
     })
     .await
@@ -144,6 +145,7 @@ async fn mirrors_to_versitygw_with_offset_named_objects() {
         keys: mirror_envelope::ColumnType::Utf8,
         values: mirror_envelope::ColumnType::Utf8,
         compaction: None,
+        cache: None,
         flush,
     })
     .await

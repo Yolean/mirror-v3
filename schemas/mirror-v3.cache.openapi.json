@@ -1,0 +1,51 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "mirror-v3 cache",
+    "description": "Drop-in HTTP surface for Yolean/kafka-keyvalue's /cache/v1. The state is a merged in-memory `key → latest-value` view across every mirror with `http-access: { api: cache-v1 }`. Updates are per-record from the consume loop; reads return 503 until every registered mirror has caught up to its startup high-watermark.",
+    "license": {
+      "name": "Apache-2.0",
+      "identifier": "Apache-2.0"
+    },
+    "version": "1.0.0"
+  },
+  "paths": {},
+  "components": {
+    "schemas": {
+      "TopicPartitionOffsetJson": {
+        "type": "object",
+        "description": "`{topic, partition, offset}` shape serialized into the\n`x-kkv-last-seen-offsets` header. Mirrors KKV's\n`TopicPartitionOffset`, including JSON property order.",
+        "required": [
+          "offset",
+          "partition",
+          "topic"
+        ],
+        "properties": {
+          "offset": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "partition": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "topic": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  },
+  "tags": [
+    {
+      "name": "cache",
+      "description": "Read-only cache API (KKV-compatible)"
+    },
+    {
+      "name": "admin",
+      "description": "Operator endpoints"
+    }
+  ]
+}

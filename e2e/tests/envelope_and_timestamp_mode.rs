@@ -80,6 +80,7 @@ async fn parquet_roundtrip_via_kafka_native_to_filesystem() {
         keys: mirror_envelope::ColumnType::Utf8,
         values: mirror_envelope::ColumnType::Utf8,
         compaction: None,
+        cache: None,
         flush,
     })
     .expect("spawn mirror");

@@ -12,6 +12,7 @@ name = "mirror-v3"
 path = "src/main.rs"
 
 [dependencies]
+mirror-cache = { workspace = true }
 mirror-config = { workspace = true }
 mirror-core = { workspace = true }
 mirror-envelope = { workspace = true }

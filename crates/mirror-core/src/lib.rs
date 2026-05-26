@@ -18,7 +18,10 @@
 use async_trait::async_trait;
 use thiserror::Error;
 
+pub mod cache;
 pub mod mock;
+
+pub use cache::CacheState;
 
 /// Per-mirror Prometheus labels. `topic` and `partition` together
 /// uniquely identify the data stream and join cleanly with broker-

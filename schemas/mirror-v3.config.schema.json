@@ -195,6 +195,17 @@
               "type": "null"
             }
           ]
+        },
+        "http-access": {
+          "description": "Opt-in HTTP read access for this mirror's materialized view.\nOnly valid for `filesystem` / `s3` destinations. When set,\n`mirror-v3` builds an in-memory `key → latest value` map per\nrecord (independent of flush cadence) and serves it via the\ndeclared API. Multiple mirrors with the same `api` are unioned\ninto a single keyspace.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/HttpAccess"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "additionalProperties": false,
@@ -384,6 +395,29 @@
           "description": "Do not pass an explicit timestamp; the destination broker\nstamps the record itself.",
           "type": "string",
           "const": "destination"
+        }
+      ]
+    },
+    "HttpAccess": {
+      "description": "HTTP read-access block. Today the only variant is the KKV-compatible\n`/cache/v1` surface; the field is grouped so future APIs can be\nadded without re-shaping the YAML.",
+      "type": "object",
+      "properties": {
+        "api": {
+          "$ref": "#/$defs/HttpAccessApi"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "api"
+      ]
+    },
+    "HttpAccessApi": {
+      "description": "Variants of the read API surface mirror-v3 will host. Each opt-in\nmirror declares which one applies to it; today only `cache-v1`\nexists (a drop-in for `Yolean/kafka-keyvalue`'s `/cache/v1`).",
+      "oneOf": [
+        {
+          "description": "`/cache/v1/raw/{key}`, `/cache/v1/keys`, `/cache/v1/values`,\n`/cache/v1/offset/{topic}/{partition}`. See the `mirror-cache`\ncrate for behavior and the committed OpenAPI 3.1 spec in\n`schemas/mirror-v3.cache.openapi.json`.",
+          "type": "string",
+          "const": "cache-v1"
         }
       ]
     }

@@ -123,6 +123,37 @@ pub struct Mirror {
     /// Defaults to `source`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timestamp_mode: Option<TimestampMode>,
+
+    /// Opt-in HTTP read access for this mirror's materialized view.
+    /// Only valid for `filesystem` / `s3` destinations. When set,
+    /// `mirror-v3` builds an in-memory `key → latest value` map per
+    /// record (independent of flush cadence) and serves it via the
+    /// declared API. Multiple mirrors with the same `api` are unioned
+    /// into a single keyspace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http_access: Option<HttpAccess>,
+}
+
+/// HTTP read-access block. Today the only variant is the KKV-compatible
+/// `/cache/v1` surface; the field is grouped so future APIs can be
+/// added without re-shaping the YAML.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct HttpAccess {
+    pub api: HttpAccessApi,
+}
+
+/// Variants of the read API surface mirror-v3 will host. Each opt-in
+/// mirror declares which one applies to it; today only `cache-v1`
+/// exists (a drop-in for `Yolean/kafka-keyvalue`'s `/cache/v1`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum HttpAccessApi {
+    /// `/cache/v1/raw/{key}`, `/cache/v1/keys`, `/cache/v1/values`,
+    /// `/cache/v1/offset/{topic}/{partition}`. See the `mirror-cache`
+    /// crate for behavior and the committed OpenAPI 3.1 spec in
+    /// `schemas/mirror-v3.cache.openapi.json`.
+    CacheV1,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -446,6 +477,7 @@ fn validate(cfg: &Config) -> Result<(), LoadError> {
                 ("compression", m.compression.is_some()),
                 ("compaction", m.compaction.is_some()),
                 ("flush", m.flush.is_some()),
+                ("http-access", m.http_access.is_some()),
             ] {
                 if present {
                     return Err(LoadError::Validation(format!(
@@ -486,6 +518,13 @@ fn validate(cfg: &Config) -> Result<(), LoadError> {
                         m.name
                     )));
                 }
+            }
+            if m.http_access.is_some() && matches!(keys.kind, ColumnType::Bytes) {
+                return Err(LoadError::Validation(format!(
+                    "mirror {:?}: `http-access` requires `keys.type` ∈ {{utf8, json, json-parseable}}; \
+                     /cache/v1 routes keys through URL path segments",
+                    m.name
+                )));
             }
         }
     }

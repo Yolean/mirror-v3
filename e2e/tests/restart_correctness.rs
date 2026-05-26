@@ -36,6 +36,7 @@ fn spec(source: &str, root: &std::path::Path, group: &str, max_offsets: u64) -> 
         keys: mirror_envelope::ColumnType::Utf8,
         values: mirror_envelope::ColumnType::Utf8,
         compaction: None,
+        cache: None,
         flush: FlushTriggers {
             max_time: Duration::from_secs(3600),
             max_bytes: u64::MAX,

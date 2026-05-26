@@ -9,6 +9,7 @@ publish = false
 description = "End-to-end test harness for mirror-v3"
 
 [dependencies]
+mirror-cache = { workspace = true }
 mirror-core = { workspace = true }
 mirror-kafka = { workspace = true }
 mirror-envelope = { workspace = true }

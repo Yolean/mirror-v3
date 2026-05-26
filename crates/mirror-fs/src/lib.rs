@@ -24,7 +24,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use mirror_core::{Record, Sink, SinkError};
+use mirror_core::{CacheState, Record, Sink, SinkError};
 use mirror_envelope::{ColumnType, Format, ParquetCompression};
 use tokio::io::AsyncWriteExt;
 
@@ -58,7 +58,26 @@ pub struct FilesystemSinkConfig {
     /// latest value per key. Caller must combine this with
     /// `Format::Parquet` and `keys` ∈ {`Utf8`, `Json`}.
     pub compaction: Option<CompactionMode>,
+    /// Optional shared HTTP-cache state. When `Some`, every record
+    /// the sink receives is applied to the cache view from the
+    /// consume loop (per-record, decoupled from flush cadence). The
+    /// mirror is also bootstrapped against this state at `open()` —
+    /// in compaction:log mode, the latest snapshot's keys are
+    /// pre-loaded; in append mode, the entire on-disk chain is
+    /// replayed (linear in total record count).
+    pub cache: Option<CacheBinding>,
     pub flush: FlushTriggers,
+}
+
+/// Pairs a `CacheState` with the mirror name so the cache can flip
+/// the per-mirror readiness slot once its bootstrap watermark is
+/// reached. The supervisor calls
+/// [`mirror_core::CacheState::register_mirror`] before the sink is
+/// opened; this binding just hands the sink the `Arc` plus its label.
+#[derive(Clone, Debug)]
+pub struct CacheBinding {
+    pub state: Arc<CacheState>,
+    pub mirror_name: String,
 }
 
 /// Log-compaction variant. Reserved for future strategies; currently
@@ -86,18 +105,21 @@ pub struct FilesystemSink {
     keys: ColumnType,
     values: ColumnType,
     compaction: Option<CompactionMode>,
+    cache: Option<CacheBinding>,
     flush: FlushTriggers,
     /// Durable destination position: `max(to) + 1` of files on disk.
     durable_position: u64,
     /// Buffered records arrived since the last flush. In append mode
-    /// this is the next file's contents; in compaction mode it's the
-    /// delta to merge into the materialized view at flush time.
+    /// this is the next file's contents; in compaction mode it's
+    /// only used to drive flush triggers (the local `view` is the
+    /// authoritative content, and is updated per-record).
     buffer: Vec<Record>,
     buffer_bytes: u64,
     buffer_started: Option<Instant>,
     last_flush_at: Option<Instant>,
     /// Compaction-mode in-memory materialized view, sorted by key.
-    /// `None` in append mode.
+    /// `None` when `compaction` is `None` — even with cache enabled,
+    /// the cache state is held in `CacheBinding`, not here.
     view: Option<BTreeMap<String, Record>>,
     /// Absolute unix-seconds for the next daily-flush boundary, or
     /// `None` when the trigger is disabled.
@@ -134,6 +156,26 @@ impl FilesystemSink {
                 (pos, Some(view))
             }
         };
+        // Cache bootstrap: replay durable state into the shared
+        // CacheState so HTTP readers see what's already on disk.
+        // - compaction:log → fold the loaded snapshot view.
+        // - append → replay the whole chain (cost is linear in the
+        //   total record count; documented for large topics).
+        if let Some(binding) = cfg.cache.as_ref() {
+            match &view {
+                Some(v) => {
+                    for r in v.values() {
+                        binding.state.apply_record(&binding.mirror_name, r);
+                    }
+                }
+                None => {
+                    let records = read_all_records(&dir, cfg.format)?;
+                    for r in records.iter() {
+                        binding.state.apply_record(&binding.mirror_name, r);
+                    }
+                }
+            }
+        }
         // NOTE: naive — computes the next future occurrence and
         // accepts that a mirror down at the boundary silently misses
         // it for that day. The richer version (planned alongside
@@ -153,6 +195,7 @@ impl FilesystemSink {
             keys: cfg.keys,
             values: cfg.values,
             compaction: cfg.compaction,
+            cache: cfg.cache,
             flush: cfg.flush,
             durable_position,
             buffer: Vec::new(),
@@ -226,32 +269,13 @@ impl FilesystemSink {
             .dir
             .join(format!("{}.tmp.{}", final_name, uuid::Uuid::new_v4()));
 
-        // In compaction mode, merge the buffer into the view (LWW;
-        // null-value records are tombstones — they remove the key)
-        // and write the full sorted view. In append mode, write the
-        // buffer verbatim.
-        let to_encode: Vec<Record> = match (self.compaction, self.view.as_mut()) {
-            (Some(CompactionMode::Log), Some(view)) => {
-                for r in self.buffer.drain(..) {
-                    // write() has already enforced UTF-8 + non-null
-                    // key in compaction mode, so this is a clean
-                    // String conversion.
-                    let key_bytes = r.key.as_ref().expect("compaction write rejects null key");
-                    let key_str = std::str::from_utf8(key_bytes)
-                        .expect("compaction write rejects non-UTF-8 key")
-                        .to_string();
-                    if r.value.is_none() {
-                        view.remove(&key_str);
-                    } else {
-                        view.insert(key_str, r);
-                    }
-                }
-                report_compaction_keys(view.len());
-                // BTreeMap iteration is in key-sorted order, which is
-                // what we want for deterministic file content and
-                // good Parquet dictionary-encoding.
-                view.values().cloned().collect()
-            }
+        // In compaction mode the local `view` is already current
+        // (write() applied each record per-record), so we just snapshot
+        // it. BTreeMap iteration is in key-sorted order, which is what
+        // we want for deterministic file content and good Parquet
+        // dictionary-encoding. In append mode we encode the buffer.
+        let to_encode: Vec<Record> = match (self.compaction, self.view.as_ref()) {
+            (Some(CompactionMode::Log), Some(view)) => view.values().cloned().collect(),
             _ => std::mem::take(&mut self.buffer),
         };
         let bytes = mirror_envelope::encode_batch(
@@ -369,11 +393,16 @@ impl Sink for FilesystemSink {
                 actual: record.source_offset,
             });
         }
-        if matches!(self.compaction, Some(CompactionMode::Log)) {
+        // Both compaction and http-access require a non-null UTF-8 key
+        // — compaction needs to dedup by key, and http-access routes
+        // by URL path. The two paths fold into one check.
+        let requires_string_key =
+            matches!(self.compaction, Some(CompactionMode::Log)) || self.cache.is_some();
+        if requires_string_key {
             match &record.key {
                 None => {
                     return Err(SinkError::Transport(format!(
-                        "compaction=log requires a non-null key; \
+                        "this mirror requires a non-null key; \
                          record at source offset {} has key=null",
                         record.source_offset
                     )));
@@ -381,13 +410,34 @@ impl Sink for FilesystemSink {
                 Some(k) => {
                     if std::str::from_utf8(k).is_err() {
                         return Err(SinkError::Transport(format!(
-                            "compaction=log requires a UTF-8 key; \
+                            "this mirror requires a UTF-8 key; \
                              record at source offset {} has non-UTF-8 key",
                             record.source_offset
                         )));
                     }
                 }
             }
+        }
+        // Apply to the local compaction view per-record (was per-flush
+        // before — moved here so view content tracks the consume loop
+        // exactly, independent of the flush cadence).
+        if let Some(view) = self.view.as_mut() {
+            let key_bytes = record.key.as_ref().expect("checked non-null above");
+            let key_str = std::str::from_utf8(key_bytes)
+                .expect("checked UTF-8 above")
+                .to_string();
+            if record.value.is_none() {
+                view.remove(&key_str);
+            } else {
+                view.insert(key_str, record.clone());
+            }
+            report_compaction_keys(view.len());
+        }
+        // Apply to the shared cache state, also per-record. CacheState
+        // is monotonic — a future rewind feature would skip already-
+        // seen offsets here automatically.
+        if let Some(binding) = self.cache.as_ref() {
+            binding.state.apply_record(&binding.mirror_name, &record);
         }
         let bytes = record_byte_size(&record);
         self.buffer.push(record);

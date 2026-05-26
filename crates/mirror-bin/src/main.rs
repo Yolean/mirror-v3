@@ -324,6 +324,7 @@ async fn query_destination_next(mirror: &Mirror, destination: &Destination) -> R
                 keys: params.keys,
                 values: params.values,
                 compaction: compaction_to_fs(mirror.compaction),
+                cache: None,
                 flush: params.flush,
             };
             let mut sink = FilesystemSink::open(cfg).map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -353,6 +354,7 @@ async fn query_destination_next(mirror: &Mirror, destination: &Destination) -> R
                 keys: params.keys,
                 values: params.values,
                 compaction: compaction_to_s3(mirror.compaction),
+                cache: None,
                 flush: mirror_s3::FlushTriggers {
                     max_time: params.flush.max_time,
                     max_bytes: params.flush.max_bytes,
@@ -434,9 +436,63 @@ async fn run(path: PathBuf) -> Result<()> {
         }
     }
 
+    // Build a shared CacheState if any mirror opted into http-access.
+    // Capture each opt-in mirror's source-partition high-watermark *now*
+    // so the readiness gate flips only after we've consumed past
+    // whatever was already there at startup. (KKV semantics — dependents
+    // must not see a partially-rebuilt cache after a reload.)
+    let cache_state = if cfg.mirrors.iter().any(|m| m.http_access.is_some()) {
+        let state = std::sync::Arc::new(mirror_core::CacheState::new());
+        for m in &cfg.mirrors {
+            if m.http_access.is_some() {
+                let hwm = fetch_hwm_for_mirror(m).await?;
+                tracing::info!(
+                    mirror = %m.name,
+                    topic = %m.topic,
+                    partition = m.partition,
+                    bootstrap_hwm = hwm,
+                    "registering mirror with cache readiness gate"
+                );
+                state.register_mirror(&m.name, hwm);
+            }
+        }
+        Some(state)
+    } else {
+        None
+    };
+
+    // Spawn the cache HTTP server if any mirror has opt-in. Server
+    // runs until shutdown_rx flips OR /_admin/v1/shutdown is hit.
+    if let Some(state) = cache_state.as_ref() {
+        let addr = cache_listen_addr();
+        let state = std::sync::Arc::clone(state);
+        let cache_shutdown_rx = shutdown_rx.clone();
+        let cache_shutdown_tx = shutdown_tx.clone();
+        tokio::spawn(async move {
+            let signal = shutdown_signal(cache_shutdown_rx);
+            match mirror_cache::serve(addr, state, signal).await {
+                Ok(_code) => {
+                    // Admin shutdown signalled. Propagate to the
+                    // mirror loops so the whole process exits.
+                    let _ = cache_shutdown_tx.send(true);
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "cache HTTP server failed");
+                    let _ = cache_shutdown_tx.send(true);
+                }
+            }
+        });
+    }
+
     let mut handles = Vec::with_capacity(cfg.mirrors.len());
     for mirror in &cfg.mirrors {
-        let handle = spawn_mirror(mirror.clone(), cfg.destination.clone(), shutdown_rx.clone())?;
+        let binding = mirror_cache_binding(mirror, cache_state.as_ref());
+        let handle = spawn_mirror(
+            mirror.clone(),
+            cfg.destination.clone(),
+            shutdown_rx.clone(),
+            binding,
+        )?;
         handles.push((mirror.name.clone(), handle));
     }
 
@@ -450,6 +506,79 @@ async fn run(path: PathBuf) -> Result<()> {
         tracing::error!(mirror = %which, "mirror task errored; exiting process");
     }
     result
+}
+
+/// Pick the listen address for the cache HTTP server. Defaults to
+/// 0.0.0.0:8080, overridable via `MIRROR_V3_CACHE_PORT`.
+fn cache_listen_addr() -> std::net::SocketAddr {
+    let port = std::env::var("MIRROR_V3_CACHE_PORT")
+        .ok()
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or(8080);
+    std::net::SocketAddr::from(([0, 0, 0, 0], port))
+}
+
+/// Materialise a `CacheBinding` for the given mirror if it has
+/// `http-access` set and the supervisor built a shared CacheState.
+fn mirror_cache_binding(
+    mirror: &Mirror,
+    cache: Option<&std::sync::Arc<mirror_core::CacheState>>,
+) -> Option<CacheBinding> {
+    match (mirror.http_access.as_ref(), cache) {
+        (Some(_), Some(state)) => Some(CacheBinding {
+            state: std::sync::Arc::clone(state),
+            mirror_name: mirror.name.clone(),
+        }),
+        _ => None,
+    }
+}
+
+/// Per-mirror bootstrap watermark. Run in a `spawn_blocking` task
+/// because `mirror_kafka::fetch_high_watermark` uses the synchronous
+/// `BaseConsumer` API under the hood.
+async fn fetch_hwm_for_mirror(mirror: &Mirror) -> Result<u64> {
+    let bootstrap = mirror.source.bootstrap_servers.clone();
+    let topic = mirror.topic.clone();
+    let partition = mirror.partition as i32;
+    let mirror_name = mirror.name.clone();
+    let hwm = tokio::task::spawn_blocking(move || {
+        mirror_kafka::fetch_high_watermark(
+            &bootstrap,
+            &topic,
+            partition,
+            std::time::Duration::from_secs(10),
+        )
+    })
+    .await
+    .with_context(|| format!("mirror {mirror_name}: hwm task join"))?
+    .with_context(|| format!("mirror {mirror_name}: fetch high watermark"))?;
+    Ok(hwm.max(0) as u64)
+}
+
+/// Sink-side cache binding. Identical shape across the FS and S3
+/// sink crates; we keep one local type in mirror-bin and translate
+/// at the boundary to avoid making either sink crate depend on the
+/// other.
+#[derive(Clone)]
+struct CacheBinding {
+    state: std::sync::Arc<mirror_core::CacheState>,
+    mirror_name: String,
+}
+
+impl CacheBinding {
+    fn into_fs(self) -> mirror_fs::CacheBinding {
+        mirror_fs::CacheBinding {
+            state: self.state,
+            mirror_name: self.mirror_name,
+        }
+    }
+
+    fn into_s3(self) -> mirror_s3::CacheBinding {
+        mirror_s3::CacheBinding {
+            state: self.state,
+            mirror_name: self.mirror_name,
+        }
+    }
 }
 
 async fn shutdown_signal(mut rx: tokio::sync::watch::Receiver<bool>) {
@@ -487,6 +616,7 @@ fn spawn_mirror(
     mirror: Mirror,
     destination: Destination,
     shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    cache: Option<CacheBinding>,
 ) -> Result<tokio::task::JoinHandle<Result<()>>> {
     let source_cfg = KafkaSourceConfig::new(
         mirror.source.bootstrap_servers.clone(),
@@ -545,6 +675,7 @@ fn spawn_mirror(
                 keys: params.keys,
                 values: params.values,
                 compaction: compaction_to_fs(mirror.compaction),
+                cache: cache.clone().map(CacheBinding::into_fs),
                 flush: params.flush,
             };
             let sink = FilesystemSink::open(sink_cfg)
@@ -587,6 +718,7 @@ fn spawn_mirror(
                 keys: params.keys,
                 values: params.values,
                 compaction: compaction_to_s3(mirror.compaction),
+                cache: cache.clone().map(CacheBinding::into_s3),
                 flush: mirror_s3::FlushTriggers {
                     max_time: params.flush.max_time,
                     max_bytes: params.flush.max_bytes,

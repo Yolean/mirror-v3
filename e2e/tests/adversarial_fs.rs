@@ -41,6 +41,7 @@ fn spec(source: &str, root: &std::path::Path, group: &str, flush: FlushTriggers)
         keys: mirror_envelope::ColumnType::Utf8,
         values: mirror_envelope::ColumnType::Utf8,
         compaction: None,
+        cache: None,
         flush,
     }
 }
@@ -190,6 +191,7 @@ async fn two_writers_with_different_flush_triggers_are_caught() {
         keys: mirror_envelope::ColumnType::Utf8,
         values: mirror_envelope::ColumnType::Utf8,
         compaction: None,
+        cache: None,
         flush: flush_every(10),
     });
 

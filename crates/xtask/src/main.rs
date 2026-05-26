@@ -16,6 +16,10 @@ enum Cmd {
     GenSchema,
     /// Fail if the committed schema does not match the structs.
     CheckSchema,
+    /// Regenerate schemas/mirror-v3.cache.openapi.json from mirror-cache.
+    GenOpenapi,
+    /// Fail if the committed cache OpenAPI spec does not match the handlers.
+    CheckOpenapi,
 }
 
 fn schema_path() -> PathBuf {
@@ -29,11 +33,27 @@ fn schema_path() -> PathBuf {
         .join("mirror-v3.config.schema.json")
 }
 
+fn openapi_path() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("schemas")
+        .join("mirror-v3.cache.openapi.json")
+}
+
 fn render_schema() -> Result<String> {
     let schema = mirror_config::schema();
     let mut s = serde_json::to_string_pretty(&schema)?;
     s.push('\n');
     Ok(s)
+}
+
+fn render_openapi() -> String {
+    let mut s = mirror_cache::openapi_json_pretty();
+    s.push('\n');
+    s
 }
 
 fn main() -> Result<()> {
@@ -60,6 +80,30 @@ fn main() -> Result<()> {
                 std::process::exit(1);
             }
             println!("schema OK ({})", path.display());
+        }
+        Cmd::GenOpenapi => {
+            let path = openapi_path();
+            let rendered = render_openapi();
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("creating {}", parent.display()))?;
+            }
+            std::fs::write(&path, &rendered)
+                .with_context(|| format!("writing {}", path.display()))?;
+            println!("wrote {}", path.display());
+        }
+        Cmd::CheckOpenapi => {
+            let path = openapi_path();
+            let on_disk = std::fs::read_to_string(&path)
+                .with_context(|| format!("reading {}", path.display()))?;
+            let rendered = render_openapi();
+            if on_disk != rendered {
+                eprintln!(
+                    "committed cache OpenAPI is stale; run: cargo run -p xtask -- gen-openapi"
+                );
+                std::process::exit(1);
+            }
+            println!("openapi OK ({})", path.display());
         }
     }
     Ok(())

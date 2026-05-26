@@ -63,6 +63,27 @@ A minimal PodMonitor for the checkit chart points at port 9090; the standard pro
 
 `run` spawns one task per mirror, each pinned to one `(topic, partition)`. SIGINT/SIGTERM trigger a graceful shutdown that flushes any buffered records on Filesystem and S3 sinks before exiting zero. Any task failure collapses the whole process with a non-zero exit — the orchestrator (k8s) is expected to restart it.
 
+### `/cache/v1` (drop-in for `Yolean/kafka-keyvalue`)
+
+Per-mirror opt-in via `http-access: { api: cache-v1 }`. When at least one mirror has it set, `mirror-v3 run` starts a second HTTP server on `0.0.0.0:8080` (override with `MIRROR_V3_CACHE_PORT`) that exposes the KKV `/cache/v1` surface:
+
+```
+GET /cache/v1/raw/{key}                  → value bytes (application/octet-stream), 404 if absent
+GET /cache/v1/offset/{topic}/{partition} → decimal text
+GET /cache/v1/keys                       → newline-separated keys
+GET /cache/v1/values                     → newline-separated raw values
+```
+
+Reads carry `x-kkv-last-seen-offsets: <JSON>` and return **503** until every opt-in mirror has caught up to the source's high-watermark captured at startup — same readiness contract as KKV, so dependents don't transiently see an older state across reloads. The cache view updates per-record from the consume loop, decoupled from disk flush cadence (set `flush.max-time-ms` high to save bucket ops without sacrificing freshness). Updates are monotonic; if a future feature ever rewinds source consumption, the cache stays at the highest offset seen.
+
+Also exposed on the same port:
+
+- `POST /_admin/v1/shutdown` and `POST /_admin/v1/shutdown/{exitcode}` — request graceful exit.
+- `GET /openapi.json` and `GET /openapi.yaml` — auto-generated OpenAPI 3.1 spec; the committed copy is at [`schemas/mirror-v3.cache.openapi.json`](./schemas/mirror-v3.cache.openapi.json) (gated by `cargo run -p xtask -- check-openapi`).
+- `GET /docs` — Scalar UI rendering the spec.
+
+Compaction interaction: `http-access` works with **or without** `compaction: log`. In append mode the on-disk chain is the full event history and is replayed into the in-memory view on startup (cost O(total records)). With `compaction: log` the view is bootstrapped from the latest snapshot in O(distinct keys) — pick this for very large topics. See [`examples/cache-v1.yaml`](./examples/cache-v1.yaml).
+
 ## Observability
 
 The default INFO-level log stream is operator-oriented:

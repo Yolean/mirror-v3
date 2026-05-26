@@ -107,6 +107,7 @@ pub struct FsMirrorSpec {
     pub keys: mirror_envelope::ColumnType,
     pub values: mirror_envelope::ColumnType,
     pub compaction: Option<mirror_fs::CompactionMode>,
+    pub cache: Option<mirror_fs::CacheBinding>,
     pub flush: mirror_fs::FlushTriggers,
 }
 
@@ -135,6 +136,7 @@ impl FsMirrorSpec {
             keys: mirror_envelope::ColumnType::Utf8,
             values: mirror_envelope::ColumnType::Utf8,
             compaction: None,
+            cache: None,
             flush,
         }
     }
@@ -161,6 +163,7 @@ pub fn spawn_kafka_to_filesystem(spec: FsMirrorSpec) -> Result<MirrorHandle> {
         keys: spec.keys,
         values: spec.values,
         compaction: spec.compaction,
+        cache: spec.cache,
         flush: spec.flush,
     };
     let sink = FilesystemSink::open(sink_cfg).context("open FilesystemSink")?;
@@ -182,6 +185,7 @@ pub struct S3MirrorSpec {
     pub keys: mirror_envelope::ColumnType,
     pub values: mirror_envelope::ColumnType,
     pub compaction: Option<mirror_s3::CompactionMode>,
+    pub cache: Option<mirror_s3::CacheBinding>,
     pub flush: mirror_s3::FlushTriggers,
 }
 
@@ -207,6 +211,7 @@ pub async fn spawn_kafka_to_s3(spec: S3MirrorSpec) -> Result<MirrorHandle> {
         keys: spec.keys,
         values: spec.values,
         compaction: spec.compaction,
+        cache: spec.cache,
         flush: spec.flush,
     };
     let sink = S3Sink::open(sink_cfg).await.context("open S3Sink")?;

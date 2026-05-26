@@ -37,6 +37,7 @@ fn cfg(store: Arc<dyn ObjectStore>, max_offsets: u64) -> S3SinkConfig {
         keys: mirror_envelope::ColumnType::Utf8,
         values: mirror_envelope::ColumnType::Utf8,
         compaction: None,
+        cache: None,
         flush: FlushTriggers {
             max_time: Duration::from_secs(3600),
             max_bytes: u64::MAX,
@@ -149,6 +150,7 @@ async fn put_mode_create_rejects_overwrite() {
         keys: mirror_envelope::ColumnType::Utf8,
         values: mirror_envelope::ColumnType::Utf8,
         compaction: None,
+        cache: None,
         flush: FlushTriggers {
             max_time: Duration::from_secs(3600),
             max_bytes: u64::MAX,
@@ -223,6 +225,7 @@ fn cfg_compacted(store: Arc<dyn ObjectStore>, max_offsets: u64) -> S3SinkConfig 
         keys: mirror_envelope::ColumnType::Utf8,
         values: mirror_envelope::ColumnType::Utf8,
         compaction: Some(mirror_s3::CompactionMode::Log),
+        cache: None,
         flush: FlushTriggers {
             max_time: Duration::from_secs(3600),
             max_bytes: u64::MAX,

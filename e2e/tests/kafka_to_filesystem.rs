@@ -65,6 +65,7 @@ async fn mirrors_to_filesystem_with_offset_named_files() {
         keys: mirror_envelope::ColumnType::Utf8,
         values: mirror_envelope::ColumnType::Utf8,
         compaction: None,
+        cache: None,
         flush,
     })
     .expect("spawn mirror");
@@ -131,6 +132,7 @@ async fn mirrors_to_filesystem_with_offset_named_files() {
         keys: mirror_envelope::ColumnType::Utf8,
         values: mirror_envelope::ColumnType::Utf8,
         compaction: None,
+        cache: None,
         flush,
     })
     .expect("reopen");

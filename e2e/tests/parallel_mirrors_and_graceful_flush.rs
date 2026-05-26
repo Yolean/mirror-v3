@@ -72,6 +72,7 @@ async fn two_mirrors_run_in_parallel_and_flush_on_shutdown() {
         keys: mirror_envelope::ColumnType::Utf8,
         values: mirror_envelope::ColumnType::Utf8,
         compaction: None,
+        cache: None,
         flush,
     })
     .expect("spawn m0");
@@ -87,6 +88,7 @@ async fn two_mirrors_run_in_parallel_and_flush_on_shutdown() {
         keys: mirror_envelope::ColumnType::Utf8,
         values: mirror_envelope::ColumnType::Utf8,
         compaction: None,
+        cache: None,
         flush,
     })
     .expect("spawn m1");

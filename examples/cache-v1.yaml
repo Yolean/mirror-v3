@@ -1,0 +1,62 @@
+# yaml-language-server: $schema=../schemas/mirror-v3.config.schema.json
+#
+# KKV drop-in: mirror Kafka topics to disk *and* serve the latest
+# value per key over `/cache/v1` on port 8080 (override with
+# `MIRROR_V3_CACHE_PORT`).
+#
+# The mirror does both jobs from the same consume loop:
+#   1. Writes records to disk via the chosen format (Parquet here).
+#      Files grow append-style; they're durable history, not the
+#      cache view itself.
+#   2. Maintains an in-memory `key → latest value` map updated
+#      per-record (decoupled from flush cadence — set flush
+#      thresholds high to minimise bucket ops without affecting
+#      cache freshness).
+#
+# On restart, mirror-v3 replays the on-disk chain into the in-memory
+# view before flipping `/cache/v1` to ready. KKV semantics: dependents
+# never see a partially-rebuilt cache.
+#
+# For very large topics where restart replay would be slow, switch
+# to `compaction: log` — the mirror then bootstraps from the latest
+# snapshot file in O(distinct-keys) instead of O(total-records).
+
+destination:
+  type: filesystem
+  root: /var/lib/mirror-v3
+
+mirrors:
+  - name: user-states
+    source:
+      bootstrap-servers: kafka:9092
+    topic: user-states
+    partition: 0
+    format: parquet
+    compression: zstd-1
+    # Default `{ type: utf8 }` for both keys and values. `http-access`
+    # requires keys to be utf8 / json / json-parseable (URL-routable).
+    # values: { type: json-parseable }
+    http-access:
+      api: cache-v1
+    flush:
+      # Long flush window — cache freshness is independent of this;
+      # the values are live in memory the instant the consume loop
+      # sees them.
+      max-time-ms: 60000
+      max-bytes: 67108864
+      max-offsets: 10000
+
+  # `http-access` works with `compaction: log` too. Both mirrors below
+  # serve into the same /cache/v1 keyspace; their keys must not collide.
+  # - name: orders
+  #   source: { bootstrap-servers: kafka:9092 }
+  #   topic: orders
+  #   partition: 0
+  #   format: parquet
+  #   compression: zstd-1
+  #   compaction: log
+  #   http-access: { api: cache-v1 }
+  #   flush:
+  #     max-time-ms: 60000
+  #     max-bytes: 67108864
+  #     max-offsets: 10000

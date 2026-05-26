@@ -1,0 +1,28 @@
+[package]
+name = "mirror-cache"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "HTTP cache surface for mirror-v3 — drop-in for Yolean/kafka-keyvalue /cache/v1"
+
+[dependencies]
+mirror-core = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+axum = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+utoipa = { workspace = true }
+utoipa-axum = { workspace = true }
+utoipa-scalar = { workspace = true }
+base64 = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+reqwest = { workspace = true }
