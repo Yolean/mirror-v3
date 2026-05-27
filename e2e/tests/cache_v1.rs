@@ -222,8 +222,9 @@ async fn cache_v1_serves_latest_per_key_and_honours_tombstones() {
         .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
     let body = resp.text().await.unwrap();
-    let keys: Vec<&str> = body.split('\n').collect();
-    assert_eq!(keys, vec!["k1", "k3"], "got: {body:?}");
+    // Insertion order: k1 (offset 0) first, k3 (offset 2) second.
+    // Trailing newline per the /cache/v1/keys contract.
+    assert_eq!(body, "k1\nk3\n", "got: {body:?}");
 
     // /values mirrors the order.
     let resp = client
@@ -232,7 +233,7 @@ async fn cache_v1_serves_latest_per_key_and_honours_tombstones() {
         .await
         .unwrap();
     let body = resp.bytes().await.unwrap();
-    assert_eq!(body.as_ref(), b"v1-updated\nv3");
+    assert_eq!(body.as_ref(), b"v1-updated\nv3\n");
 
     // /offset returns a decimal string ≥ bootstrap_hwm - 1.
     let resp = client
