@@ -102,40 +102,40 @@ A minimal Kafka→Kafka config:
 
 ```yaml
 # yaml-language-server: $schema=./schemas/mirror-v3.config.schema.json
-destination:
-  type: kafka
-  bootstrap-servers: redpanda:9092
 mirrors:
   - name: operations
     source:
       bootstrap-servers: kafka-source:9092
     topic: operations-v1
     partition: 0
+    destinations:
+      - type: kafka
+        bootstrap-servers: redpanda:9092
 ```
+
+Each mirror declares `destinations: [...]`. With more than one destination, one source consumer fans every record to all destinations through a tee (`mirror_core::TeeSink`) — the source broker is read once per record, and each destination keeps its own end-offset gate and flush cadence. See [`examples/dual-write-fs-and-s3.yaml`](examples/dual-write-fs-and-s3.yaml) for the dual-write pattern.
 
 More examples: [`examples/`](examples/).
 
 The full schema is committed at [`schemas/mirror-v3.config.schema.json`](schemas/mirror-v3.config.schema.json). Editors with a YAML language server (VS Code's `redhat.vscode-yaml`, Neovim, etc.) pick up the `# yaml-language-server: $schema=…` comment and provide completion + validation as you type.
 
-### Field reference (Phase 0)
+### Env interpolation
 
-| Path | Type | Required | Notes |
-|---|---|---|---|
-| `destination.type` | `kafka` \| `filesystem` \| `s3` | yes | Discriminator |
-| `destination.bootstrap-servers` | string | kafka only | |
-| `destination.root` | path | filesystem only | Absolute path |
-| `destination.endpoint` | URL | s3 (optional) | Omit for AWS regional |
-| `destination.region` / `.bucket` | string | s3 only | |
-| `destination.prefix` | string | s3 optional | |
-| `destination.flush.max-time-ms` | u64 | fs/s3 only | ms between forced flushes |
-| `destination.flush.max-bytes` | u64 | fs/s3 only | buffered byte cap |
-| `destination.flush.max-offsets` | u64 | fs/s3 only | buffered offset cap |
-| `mirrors[].name` | string | yes | Logs / metrics label |
-| `mirrors[].source.bootstrap-servers` | string | yes | Source Kafka |
-| `mirrors[].source.group-id` | string | no | Informational only |
-| `mirrors[].topic` | string | yes | Source topic |
-| `mirrors[].partition` | u32 | **yes** | Source partition, no default |
-| `mirrors[].destination-name-override` | string | no | Per-mirror destination name |
+Config values can reference environment variables using the same syntax as [`Yolean/y-cluster`](https://github.com/Yolean/y-cluster)'s envsubst:
+
+```yaml
+mirrors:
+  - name: ${MIRROR_NAME:-orders}
+    source: { bootstrap-servers: ${SOURCE_BROKER} }
+    topic: ${TOPIC:-orders}
+    partition: 0
+    destinations:
+      - type: s3
+        region: ${AWS_REGION:-us-east-1}
+        bucket: ${BUCKET_PREFIX:-yolean-mirror}-${AWS_REGION:-us-east-1}
+```
+
+`${VAR}` is required (fails to start if unset), `${VAR:-default}` falls back to `default`, and `$$` escapes to a literal `$`. Substitution is single-pass — expanded values are not re-scanned. See [`examples/env-interpolation-dual-write.yaml`](examples/env-interpolation-dual-write.yaml) for the DRY pattern across duplicated destinations.
 
 ## Building
 

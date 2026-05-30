@@ -1,0 +1,46 @@
+# yaml-language-server: $schema=../schemas/mirror-v3.config.schema.json
+#
+# Env interpolation for DRY across duplicated destinations.
+#
+# $${VAR}, $${VAR:-default} and $$$$ (literal `$`) are expanded
+# against the process environment before YAML parsing. Same syntax
+# and behaviour as `Yolean/y-cluster`'s envsubst:
+#
+#   $${VAR}            required; mirror-v3 fails to start if VAR is
+#                      unset.
+#   $${VAR:-default}   optional; uses `default` when VAR is unset
+#                      (including the empty default $${VAR:-}).
+#   $$$$               literal `$` (escape; no expansion).
+#
+# Substitution is single-pass — an expanded value is not re-scanned
+# for further $${...} references. (The $$-prefixed forms in this
+# comment are themselves escaped so they render as literal text
+# rather than triggering substitution at config-load time.)
+
+mirrors:
+  - name: ${MIRROR_NAME:-orders}
+    source:
+      bootstrap-servers: ${SOURCE_BROKER:-kafka:9092}
+      group-id: ${MIRROR_NAME:-orders}-${ENV:-prod}
+    topic: ${SOURCE_TOPIC:-orders}
+    partition: 0
+    destinations:
+      # Two-region S3 dual-write. Per-destination `name` is required
+      # because both are S3 — defaulting both to mirror.name would
+      # collide.
+      - type: s3
+        name: ${MIRROR_NAME:-orders}-us
+        region: us-east-1
+        bucket: ${BUCKET_PREFIX:-yolean-mirror}-us-east-1
+        prefix: ${MIRROR_NAME:-orders}/
+      - type: s3
+        name: ${MIRROR_NAME:-orders}-eu
+        region: eu-west-1
+        bucket: ${BUCKET_PREFIX:-yolean-mirror}-eu-west-1
+        prefix: ${MIRROR_NAME:-orders}/
+    format: parquet
+    compression: zstd-1
+    flush:
+      max-time-ms: 5000
+      max-bytes: 67108864
+      max-offsets: 10000

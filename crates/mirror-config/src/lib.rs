@@ -31,6 +31,8 @@ use std::path::{Path, PathBuf};
 use schemars::{schema_for, JsonSchema, Schema};
 use serde::{Deserialize, Serialize};
 
+pub mod envsubst;
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct Config {
@@ -492,10 +494,23 @@ pub enum LoadError {
     Parse(#[from] serde_yaml::Error),
     #[error("invalid config: {0}")]
     Validation(String),
+    #[error("env interpolation: {0}")]
+    EnvSubst(#[from] envsubst::EnvSubstError),
 }
 
+/// Load and validate config from a YAML string, expanding any
+/// `${VAR}` / `${VAR:-default}` / `$$` references against the
+/// process environment first. See [`envsubst`] for the syntax.
 pub fn load_from_str(yaml: &str) -> Result<Config, LoadError> {
-    let cfg: Config = serde_yaml::from_str(yaml)?;
+    load_from_str_with_env(yaml, &envsubst::OsEnv)
+}
+
+/// Test-friendly variant of [`load_from_str`] that resolves env-subst
+/// references through a caller-supplied [`envsubst::Env`] instead of
+/// the real process environment.
+pub fn load_from_str_with_env(yaml: &str, env: &dyn envsubst::Env) -> Result<Config, LoadError> {
+    let expanded = envsubst::expand(yaml, env)?;
+    let cfg: Config = serde_yaml::from_str(&expanded)?;
     validate(&cfg)?;
     Ok(cfg)
 }
@@ -505,9 +520,10 @@ pub fn load_from_path(path: &Path) -> Result<Config, LoadError> {
         path: path.to_path_buf(),
         source,
     })?;
-    let cfg: Config = serde_yaml::from_slice(&bytes)?;
-    validate(&cfg)?;
-    Ok(cfg)
+    let yaml = std::str::from_utf8(&bytes).map_err(|e| {
+        LoadError::Validation(format!("config file {path:?} is not valid UTF-8: {e}"))
+    })?;
+    load_from_str(yaml)
 }
 
 /// Cross-field validation that can't be expressed in serde attributes.
