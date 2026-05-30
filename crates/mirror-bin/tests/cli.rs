@@ -52,15 +52,15 @@ fn status_against_unreachable_broker_exits_with_error_row() {
         &cfg,
         format!(
             r#"
-destination:
-  type: filesystem
-  root: {}
 mirrors:
   - name: probe
     source:
       bootstrap-servers: localhost:1
     topic: nope
     partition: 0
+    destinations:
+      - type: filesystem
+        root: {}
     flush:
       max-time-ms: 1000
       max-bytes: 1024
@@ -101,15 +101,15 @@ fn status_json_format_is_valid_json() {
         &cfg,
         format!(
             r#"
-destination:
-  type: filesystem
-  root: {}
 mirrors:
   - name: probe
     source:
       bootstrap-servers: localhost:1
     topic: nope
     partition: 0
+    destinations:
+      - type: filesystem
+        root: {}
     flush:
       max-time-ms: 1000
       max-bytes: 1024
@@ -139,7 +139,11 @@ mirrors:
 fn validate_rejects_invalid_config() {
     let dir = tempdir();
     let bad = dir.join("bad.yaml");
-    std::fs::write(&bad, "destination:\n  type: kafka\nmirrors: []\n").unwrap();
+    std::fs::write(
+        &bad,
+        "mirrors:\n  - name: x\n    source: { bootstrap-servers: 'k:1' }\n    topic: x\n    partition: 0\n    destinations:\n      - type: kafka\n",
+    )
+    .unwrap();
     let output = Command::new(bin_path())
         .arg("validate")
         .arg("--config")

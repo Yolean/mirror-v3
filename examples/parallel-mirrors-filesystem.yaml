@@ -11,18 +11,18 @@
 #   spec.replicas: 1
 #   spec.strategy.type: Recreate
 
-destination:
-  type: filesystem
-  root: /var/lib/mirror-v3
-
 # Per-mirror encoding. Each mirror writes under
-# `<root>/<mirror.name>/<partition>/<from>-<to>.<ext>`.
+# `<root>/<mirror.name>/<partition>/<from>-<to>.<ext>` (destination.name
+# defaults to mirror.name for the single-destination case).
 mirrors:
   - name: operations-p0
     source:
       bootstrap-servers: kafka-source:9092
     topic: operations-v1
     partition: 0
+    destinations:
+      - type: filesystem
+        root: /var/lib/mirror-v3
     # format defaults to `parquet`; use `ndjson` for jq-friendly dumps.
     # format: parquet
     # compression defaults to `zstd-1`. Other options: zstd-3, snappy, lz4, uncompressed.
@@ -57,6 +57,9 @@ mirrors:
       bootstrap-servers: kafka-source:9092
     topic: operations-v1
     partition: 1
+    destinations:
+      - type: filesystem
+        root: /var/lib/mirror-v3
     flush:
       max-time-ms: 5000
       max-bytes: 67108864

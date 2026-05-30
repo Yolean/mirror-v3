@@ -16,19 +16,18 @@
 # Anything else risks two writers producing overlapping blob ranges
 # and tripping the corrupt-chain detector on the next restart.
 
-destination:
-  type: s3
-  endpoint: http://versitygw.storage.svc.cluster.local:7070
-  region: us-east-1
-  bucket: mirror-v3
-  prefix: archive/
-
 mirrors:
   - name: orders
     source:
       bootstrap-servers: kafka-source:9092
     topic: orders
     partition: 0
+    destinations:
+      - type: s3
+        endpoint: http://versitygw.storage.svc.cluster.local:7070
+        region: us-east-1
+        bucket: mirror-v3
+        prefix: archive/
     format: parquet
     compression: zstd-1
     # `values: { type: json }` writes `value` as a Utf8 column tagged
@@ -45,6 +44,12 @@ mirrors:
       bootstrap-servers: kafka-source:9092
     topic: user-states
     partition: 0
+    destinations:
+      - type: s3
+        endpoint: http://versitygw.storage.svc.cluster.local:7070
+        region: us-east-1
+        bucket: mirror-v3
+        prefix: archive/
     format: parquet
     compression: zstd-1
     # Kafka-style log compaction. Each Parquet file is a full

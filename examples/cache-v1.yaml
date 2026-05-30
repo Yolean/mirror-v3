@@ -21,16 +21,15 @@
 # to `compaction: log` — the mirror then bootstraps from the latest
 # snapshot file in O(distinct-keys) instead of O(total-records).
 
-destination:
-  type: filesystem
-  root: /var/lib/mirror-v3
-
 mirrors:
   - name: user-states
     source:
       bootstrap-servers: kafka:9092
     topic: user-states
     partition: 0
+    destinations:
+      - type: filesystem
+        root: /var/lib/mirror-v3
     format: parquet
     compression: zstd-1
     # Default `{ type: utf8 }` for both keys and values. `http-access`
@@ -52,6 +51,9 @@ mirrors:
   #   source: { bootstrap-servers: kafka:9092 }
   #   topic: orders
   #   partition: 0
+  #   destinations:
+  #     - type: filesystem
+  #       root: /var/lib/mirror-v3
   #   format: parquet
   #   compression: zstd-1
   #   compaction: log

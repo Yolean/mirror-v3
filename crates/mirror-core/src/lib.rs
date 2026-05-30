@@ -20,8 +20,10 @@ use thiserror::Error;
 
 pub mod cache;
 pub mod mock;
+pub mod tee;
 
-pub use cache::CacheState;
+pub use cache::{CacheBinding, CacheState};
+pub use tee::TeeSink;
 
 /// Per-mirror Prometheus labels. `topic` and `partition` together
 /// uniquely identify the data stream and join cleanly with broker-

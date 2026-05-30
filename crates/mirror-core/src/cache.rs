@@ -27,7 +27,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 
 use indexmap::IndexMap;
 
@@ -38,6 +38,22 @@ use crate::Record;
 pub struct TopicPartition {
     pub topic: String,
     pub partition: u32,
+}
+
+/// Pairs a shared [`CacheState`] with the mirror's operator-chosen
+/// `name` so the run loop can route per-record updates into the
+/// right readiness slot. The supervisor (mirror-bin) materialises
+/// one binding per opt-in mirror and hands it to whichever sink
+/// (today: TeeSink at the loop level; FilesystemSink / S3Sink for
+/// bootstrap-replay on open) needs to talk to the cache.
+///
+/// Canonical home is mirror-core so the trait surface is consistent
+/// across sink crates and the run loop. `mirror-fs` and `mirror-s3`
+/// re-export this type for backwards compatibility.
+#[derive(Clone, Debug)]
+pub struct CacheBinding {
+    pub state: Arc<CacheState>,
+    pub mirror_name: String,
 }
 
 /// `{topic, partition, offset}` triple as exposed in the

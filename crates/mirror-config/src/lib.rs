@@ -7,13 +7,24 @@
 //!
 //! ## Shape
 //!
-//! - The `destination` block is **transport only**: where bytes land
-//!   (`type`, `bucket`, `endpoint`, `root`, `bootstrap-servers`, …).
-//! - Every property that shapes a file or governs a single mirror's
-//!   cadence — `format`, `compression`, `keys`, `values`, `flush`,
-//!   `compaction`, `timestamp-mode` — lives on the **mirror** entry.
-//!   A single process can run two mirrors with different encoding
-//!   profiles against the same destination.
+//! - Each [`Mirror`] declares one source `(topic, partition)` and a
+//!   non-empty list of [`Destination`]s. A mirror with more than one
+//!   destination fans the single source consumer through a tee
+//!   ([`mirror_core::TeeSink`]) with per-sink heads, so divergent
+//!   buffer/flush cadences and heterogeneous-state restart stay
+//!   correct.
+//! - Per-mirror encoding settings (`format`, `compression`, `keys`,
+//!   `values`, `compaction`, `flush`, `timestamp-mode`,
+//!   `http-access`) apply to every blob-shaped destination in the
+//!   mirror's tee. Kafka destinations ignore the blob-only settings
+//!   and honour `timestamp-mode` only. A process that needs two
+//!   destinations with different encoding profiles writes them as
+//!   two separate mirrors (each its own tee).
+//! - Destinations carry only the transport identity: where bytes
+//!   land. Per-destination `name` is optional (defaults to
+//!   `mirror.name`) and becomes the on-disk / S3-prefix subdirectory.
+//!   Kafka destinations also accept an optional `topic` (defaults to
+//!   `mirror.topic`, i.e. same-topic-name mirroring).
 
 use std::path::{Path, PathBuf};
 
@@ -23,9 +34,6 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct Config {
-    /// Shared transport. Every mirror writes through this destination.
-    pub destination: Destination,
-
     /// One mirror per (source topic, partition). Every mirror runs
     /// in its own task; failures terminate the whole process.
     pub mirrors: Vec<Mirror>,
@@ -42,40 +50,85 @@ pub enum Destination {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct KafkaDestination {
+    /// Identifier for this destination (used in logs / metrics labels
+    /// and as a tie-breaker when a mirror has multiple destinations).
+    /// Defaults to the enclosing mirror's `name`; required to be set
+    /// explicitly when a mirror has more than one destination
+    /// (otherwise two destinations would share the same identifier).
+    #[serde(default)]
+    pub name: Option<String>,
     /// `bootstrap.servers` for the destination cluster.
     pub bootstrap_servers: String,
+    /// Destination topic name. Defaults to the enclosing mirror's
+    /// `topic` (i.e. same-name mirroring to a different broker).
+    /// Override when the destination topic is named differently from
+    /// the source.
+    #[serde(default)]
+    pub topic: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct FilesystemDestination {
-    /// Absolute path to the destination root directory. Each mirror
-    /// writes under `<root>/<mirror.name>/<partition>/`.
+    /// Identifier for this destination; see [`KafkaDestination::name`].
+    /// Also the subdirectory under `root` where this destination's
+    /// files land: `<root>/<name>/<partition>/`.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Absolute path to the destination root directory.
     pub root: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct S3Destination {
-    /// S3 endpoint URL. Required for non-AWS S3 (e.g. VersityGW); omit
-    /// for AWS regional endpoints.
+    /// Identifier for this destination; see [`KafkaDestination::name`].
+    /// Also the subdirectory of the object key prefix where this
+    /// destination's objects land:
+    /// `<prefix?>/<name>/<partition>/<file>`.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// S3 endpoint URL. Required for non-AWS S3 (e.g. VersityGW);
+    /// omit for AWS regional endpoints.
     #[serde(default)]
     pub endpoint: Option<String>,
     pub region: String,
     pub bucket: String,
-    /// Key prefix prepended to all written object keys. Each mirror
-    /// writes under `<prefix?>/<mirror.name>/<partition>/<file>`.
+    /// Key prefix prepended to all written object keys.
     #[serde(default)]
     pub prefix: Option<String>,
+}
+
+impl Destination {
+    /// Effective identifier for this destination, falling back to
+    /// the enclosing mirror's `name` when none was set in YAML.
+    pub fn effective_name(&self, mirror_name: &str) -> String {
+        match self {
+            Destination::Kafka(k) => k.name.clone().unwrap_or_else(|| mirror_name.to_string()),
+            Destination::Filesystem(fs) => {
+                fs.name.clone().unwrap_or_else(|| mirror_name.to_string())
+            }
+            Destination::S3(s3) => s3.name.clone().unwrap_or_else(|| mirror_name.to_string()),
+        }
+    }
+
+    /// True when this destination type buffers in memory between
+    /// flushes (filesystem, S3) and therefore needs `flush:` /
+    /// `format:` / `compression:` settings on the mirror. False for
+    /// Kafka destinations, which commit per-record.
+    pub fn is_blob(&self) -> bool {
+        !matches!(self, Destination::Kafka(_))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct Mirror {
-    /// Identifier for the mirror. Also the on-disk / S3-prefix segment
-    /// under which this mirror's files land
-    /// (`<root>/<name>/<partition>/`). Must be unique across mirrors
-    /// inside the same process.
+    /// Identifier for the mirror. Also the default `name` for each
+    /// destination in this mirror (operators only need to set
+    /// per-destination `name` explicitly when a mirror has more than
+    /// one destination). Must be unique across mirrors in the same
+    /// process.
     pub name: String,
 
     pub source: KafkaSource,
@@ -86,20 +139,28 @@ pub struct Mirror {
     /// Source Kafka partition. Required, no default.
     pub partition: u32,
 
-    /// Envelope format for written files. Required for `filesystem` and
-    /// `s3` destinations; forbidden for `kafka` destinations.
+    /// Destinations this mirror fans into. Required; non-empty. With
+    /// more than one entry, a [`mirror_core::TeeSink`] sits between
+    /// the source consumer and the sinks, preserving each inner
+    /// sink's end-offset gate under divergent buffering and
+    /// heterogeneous-state restart.
+    pub destinations: Vec<Destination>,
+
+    /// Envelope format for written files. Required (defaults to
+    /// `parquet`) when any destination is filesystem/s3; ignored by
+    /// Kafka destinations.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub format: Option<DestinationFormat>,
 
     /// Parquet compression. Only meaningful when `format = parquet`.
-    /// Defaults to `zstd-1`. Forbidden for `kafka` destinations.
+    /// Defaults to `zstd-1`. Ignored by Kafka destinations.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compression: Option<ParquetCompression>,
 
     /// Topic schema for the record `key`. Defaults to `{ type: utf8 }`.
-    /// For Kafka mirrors this is purely a validation contract (the
-    /// record passes through unchanged); for filesystem/s3 + parquet
-    /// it also selects the column encoding. See [`ColumnType`].
+    /// For Kafka destinations this is purely a validation contract
+    /// (the record passes through unchanged); for filesystem/s3 +
+    /// parquet it also selects the column encoding. See [`ColumnType`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keys: Option<ColumnConfig>,
 
@@ -107,29 +168,28 @@ pub struct Mirror {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub values: Option<ColumnConfig>,
 
-    /// Optional log-compaction mode. When `log`, each Parquet file is a
-    /// full materialized snapshot of the latest value per key. Requires
-    /// `format = parquet`. Forbidden for `kafka` destinations.
+    /// Optional log-compaction mode. When `log`, each Parquet file
+    /// is a full materialised snapshot of the latest value per key.
+    /// Requires `format = parquet`. Forbidden when *every*
+    /// destination is Kafka.
     #[serde(default)]
     pub compaction: Option<Compaction>,
 
-    /// Flush triggers. Required for `filesystem` and `s3` destinations;
-    /// forbidden for `kafka` destinations (which never buffer).
+    /// Flush triggers for blob destinations. Required when any
+    /// destination is filesystem/s3; forbidden when every destination
+    /// is Kafka (which never buffers).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub flush: Option<FlushTriggers>,
 
-    /// Which timestamp lands on the destination record. Only meaningful
-    /// for `kafka` destinations; forbidden for `filesystem` and `s3`.
-    /// Defaults to `source`.
+    /// Which timestamp lands on Kafka destination records. Defaults
+    /// to `source`. Forbidden when no destination is Kafka.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timestamp_mode: Option<TimestampMode>,
 
     /// Opt-in HTTP read access for this mirror's materialized view.
-    /// Only valid for `filesystem` / `s3` destinations. When set,
-    /// `mirror-v3` builds an in-memory `key → latest value` map per
-    /// record (independent of flush cadence) and serves it via the
-    /// declared API. Multiple mirrors with the same `api` are unioned
-    /// into a single keyspace.
+    /// Requires at least one filesystem/s3 destination (the cache
+    /// bootstraps from durable destination state). Multiple mirrors
+    /// with the same `api` are unioned into a single keyspace.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub http_access: Option<HttpAccess>,
 }
@@ -183,7 +243,7 @@ pub struct ColumnConfig {
 /// contract the mirror enforces at encode. How the destination
 /// represents the column is destination-specific:
 ///
-/// - **Kafka mirrors**: the record is passed through as-is; the
+/// - **Kafka destinations**: the record is passed through as-is; the
 ///   declared type acts as a validation gate (non-UTF-8 input under
 ///   `utf8`/`json`/`json-parseable`, unparseable JSON under
 ///   `json-parseable` → mirror fails with the offending offset).
@@ -201,9 +261,6 @@ pub struct ColumnConfig {
 ///
 /// - **Filesystem/S3 + ndjson**: only the default (`utf8`) is
 ///   accepted today; other variants are rejected at config load.
-///
-/// The `key` and `value` columns in Parquet are always named `key`
-/// and `value`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum ColumnType {
@@ -225,10 +282,7 @@ pub enum ColumnType {
     /// UTF-8 string carrying a JSON document, *parseability-gated*.
     /// In addition to the UTF-8 check, the encoder feeds each
     /// non-null payload through `serde_json` and rejects any record
-    /// that does not parse, with the offending source offset. The
-    /// parser uses `serde::de::IgnoredAny` so no `serde_json::Value`
-    /// tree is allocated — the cost is one structure walk per
-    /// payload. Same on-disk shape as `json`.
+    /// that does not parse, with the offending source offset.
     JsonParseable,
 }
 
@@ -323,10 +377,6 @@ pub struct FlushTriggers {
 pub struct DailyFlush {
     /// UTC wall-clock time of day, `HH:MM` or `HH:MM:SS`.
     pub at_utc: String,
-    // Future: jitter-ms, debounce-ms, and a smarter restart
-    // schedule that consults the destination's most recent blob
-    // (mtime / last record timestamp) to decide whether the
-    // boundary was already honored across a process bounce.
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -462,7 +512,6 @@ pub fn load_from_path(path: &Path) -> Result<Config, LoadError> {
 
 /// Cross-field validation that can't be expressed in serde attributes.
 fn validate(cfg: &Config) -> Result<(), LoadError> {
-    let is_kafka = matches!(cfg.destination, Destination::Kafka(_));
     let mut seen_names: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for m in &cfg.mirrors {
         if !seen_names.insert(&m.name) {
@@ -471,62 +520,112 @@ fn validate(cfg: &Config) -> Result<(), LoadError> {
                 m.name
             )));
         }
-        if is_kafka {
-            for (field, present) in [
-                ("format", m.format.is_some()),
-                ("compression", m.compression.is_some()),
-                ("compaction", m.compaction.is_some()),
-                ("flush", m.flush.is_some()),
-                ("http-access", m.http_access.is_some()),
-            ] {
-                if present {
-                    return Err(LoadError::Validation(format!(
-                        "mirror {:?}: `{field}` is only valid for filesystem/s3 destinations",
-                        m.name
-                    )));
-                }
-            }
-        } else {
-            if m.timestamp_mode.is_some() {
+        validate_mirror(m)?;
+    }
+    Ok(())
+}
+
+fn validate_mirror(m: &Mirror) -> Result<(), LoadError> {
+    if m.destinations.is_empty() {
+        return Err(LoadError::Validation(format!(
+            "mirror {:?}: `destinations` must contain at least one entry",
+            m.name
+        )));
+    }
+    // Per-destination identifiers: explicit `name` is required when a
+    // mirror has more than one destination (otherwise the default
+    // `mirror.name` would collide). With exactly one destination,
+    // the default is unambiguous and `name` is optional.
+    let multi = m.destinations.len() > 1;
+    let mut seen_dest_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (i, d) in m.destinations.iter().enumerate() {
+        if multi && raw_destination_name(d).is_none() {
+            return Err(LoadError::Validation(format!(
+                "mirror {:?}: destination[{i}] requires an explicit `name` \
+                 (mirrors with multiple destinations cannot share the default \
+                 `name = mirror.name`)",
+                m.name
+            )));
+        }
+        let effective = d.effective_name(&m.name);
+        if !seen_dest_names.insert(effective.clone()) {
+            return Err(LoadError::Validation(format!(
+                "mirror {:?}: destination name {:?} appears more than once",
+                m.name, effective
+            )));
+        }
+    }
+    let has_blob = m.destinations.iter().any(|d| d.is_blob());
+    let has_kafka = m.destinations.iter().any(|d| !d.is_blob());
+
+    // Encoding/flush settings: required when any blob destination is
+    // present; rejected when every destination is Kafka.
+    if !has_blob {
+        for (field, present) in [
+            ("format", m.format.is_some()),
+            ("compression", m.compression.is_some()),
+            ("compaction", m.compaction.is_some()),
+            ("flush", m.flush.is_some()),
+            ("http-access", m.http_access.is_some()),
+        ] {
+            if present {
                 return Err(LoadError::Validation(format!(
-                    "mirror {:?}: `timestamp-mode` is only valid for kafka destinations",
-                    m.name
-                )));
-            }
-            if m.flush.is_none() {
-                return Err(LoadError::Validation(format!(
-                    "mirror {:?}: `flush` is required for filesystem/s3 destinations",
-                    m.name
-                )));
-            }
-            let format = m.format.unwrap_or_default();
-            let keys = m.keys.unwrap_or_default();
-            let values = m.values.unwrap_or_default();
-            if matches!(format, DestinationFormat::Ndjson) {
-                if !matches!(keys.kind, ColumnType::Utf8)
-                    || !matches!(values.kind, ColumnType::Utf8)
-                {
-                    return Err(LoadError::Validation(format!(
-                        "mirror {:?}: ndjson does not honour `keys`/`values` types; \
-                         remove them or switch to `format: parquet`",
-                        m.name
-                    )));
-                }
-                if m.compaction.is_some() {
-                    return Err(LoadError::Validation(format!(
-                        "mirror {:?}: `compaction` requires `format: parquet`",
-                        m.name
-                    )));
-                }
-            }
-            if m.http_access.is_some() && matches!(keys.kind, ColumnType::Bytes) {
-                return Err(LoadError::Validation(format!(
-                    "mirror {:?}: `http-access` requires `keys.type` ∈ {{utf8, json, json-parseable}}; \
-                     /cache/v1 routes keys through URL path segments",
+                    "mirror {:?}: `{field}` is only valid when at least one destination is \
+                     filesystem/s3",
                     m.name
                 )));
             }
         }
     }
+
+    if !has_kafka && m.timestamp_mode.is_some() {
+        return Err(LoadError::Validation(format!(
+            "mirror {:?}: `timestamp-mode` only affects Kafka destinations; \
+             this mirror has none",
+            m.name
+        )));
+    }
+
+    if has_blob {
+        if m.flush.is_none() {
+            return Err(LoadError::Validation(format!(
+                "mirror {:?}: `flush` is required when any destination is filesystem/s3",
+                m.name
+            )));
+        }
+        let format = m.format.unwrap_or_default();
+        let keys = m.keys.unwrap_or_default();
+        let values = m.values.unwrap_or_default();
+        if matches!(format, DestinationFormat::Ndjson) {
+            if !matches!(keys.kind, ColumnType::Utf8) || !matches!(values.kind, ColumnType::Utf8) {
+                return Err(LoadError::Validation(format!(
+                    "mirror {:?}: ndjson does not honour `keys`/`values` types; \
+                     remove them or switch to `format: parquet`",
+                    m.name
+                )));
+            }
+            if m.compaction.is_some() {
+                return Err(LoadError::Validation(format!(
+                    "mirror {:?}: `compaction` requires `format: parquet`",
+                    m.name
+                )));
+            }
+        }
+        if m.http_access.is_some() && matches!(keys.kind, ColumnType::Bytes) {
+            return Err(LoadError::Validation(format!(
+                "mirror {:?}: `http-access` requires `keys.type` ∈ {{utf8, json, json-parseable}}; \
+                 /cache/v1 routes keys through URL path segments",
+                m.name
+            )));
+        }
+    }
     Ok(())
+}
+
+fn raw_destination_name(d: &Destination) -> Option<&str> {
+    match d {
+        Destination::Kafka(k) => k.name.as_deref(),
+        Destination::Filesystem(fs) => fs.name.as_deref(),
+        Destination::S3(s3) => s3.name.as_deref(),
+    }
 }

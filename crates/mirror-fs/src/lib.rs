@@ -24,7 +24,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use mirror_core::{CacheState, Record, Sink, SinkError};
+use mirror_core::{Record, Sink, SinkError};
 use mirror_envelope::{ColumnType, Format, ParquetCompression};
 use tokio::io::AsyncWriteExt;
 
@@ -69,16 +69,14 @@ pub struct FilesystemSinkConfig {
     pub flush: FlushTriggers,
 }
 
-/// Pairs a `CacheState` with the mirror name so the cache can flip
-/// the per-mirror readiness slot once its bootstrap watermark is
-/// reached. The supervisor calls
-/// [`mirror_core::CacheState::register_mirror`] before the sink is
-/// opened; this binding just hands the sink the `Arc` plus its label.
-#[derive(Clone, Debug)]
-pub struct CacheBinding {
-    pub state: Arc<CacheState>,
-    pub mirror_name: String,
-}
+/// Re-export of the canonical cache binding from `mirror-core`. When
+/// set on a `FilesystemSinkConfig`, the sink uses it on `open` to
+/// replay the durable destination state into the shared cache so
+/// HTTP readers see what's already on disk. The per-record `write()`
+/// path no longer touches the cache — that's the tee level's job
+/// ([`mirror_core::TeeSink`]) so a single record never gets applied
+/// twice when the same mirror feeds multiple destinations.
+pub use mirror_core::CacheBinding;
 
 /// Log-compaction variant. Reserved for future strategies; currently
 /// only `Log` (Kafka-style, key-based, last-writer-wins) is defined.
@@ -105,7 +103,6 @@ pub struct FilesystemSink {
     keys: ColumnType,
     values: ColumnType,
     compaction: Option<CompactionMode>,
-    cache: Option<CacheBinding>,
     flush: FlushTriggers,
     /// Durable destination position: `max(to) + 1` of files on disk.
     durable_position: u64,
@@ -195,7 +192,6 @@ impl FilesystemSink {
             keys: cfg.keys,
             values: cfg.values,
             compaction: cfg.compaction,
-            cache: cfg.cache,
             flush: cfg.flush,
             durable_position,
             buffer: Vec::new(),
@@ -397,12 +393,12 @@ impl Sink for FilesystemSink {
                 actual: record.source_offset,
             });
         }
-        // Both compaction and http-access require a non-null UTF-8 key
-        // — compaction needs to dedup by key, and http-access routes
-        // by URL path. The two paths fold into one check.
-        let requires_string_key =
-            matches!(self.compaction, Some(CompactionMode::Log)) || self.cache.is_some();
-        if requires_string_key {
+        // Compaction needs a non-null UTF-8 key to dedup by. The
+        // http-access cache also wants string keys, but its key check
+        // now lives at the tee level alongside its `apply_record` call
+        // (see `mirror_core::TeeSink::write`) so the sink only has to
+        // reason about its own requirements.
+        if matches!(self.compaction, Some(CompactionMode::Log)) {
             match &record.key {
                 None => {
                     return Err(SinkError::Transport(format!(
@@ -436,12 +432,6 @@ impl Sink for FilesystemSink {
                 view.insert(key_str, record.clone());
             }
             report_compaction_keys(view.len());
-        }
-        // Apply to the shared cache state, also per-record. CacheState
-        // is monotonic — a future rewind feature would skip already-
-        // seen offsets here automatically.
-        if let Some(binding) = self.cache.as_ref() {
-            binding.state.apply_record(&binding.mirror_name, &record);
         }
         let bytes = record_byte_size(&record);
         self.buffer.push(record);

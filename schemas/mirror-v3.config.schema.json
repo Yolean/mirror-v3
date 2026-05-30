@@ -3,10 +3,6 @@
   "title": "Config",
   "type": "object",
   "properties": {
-    "destination": {
-      "description": "Shared transport. Every mirror writes through this destination.",
-      "$ref": "#/$defs/Destination"
-    },
     "mirrors": {
       "description": "One mirror per (source topic, partition). Every mirror runs\nin its own task; failures terminate the whole process.",
       "type": "array",
@@ -17,92 +13,14 @@
   },
   "additionalProperties": false,
   "required": [
-    "destination",
     "mirrors"
   ],
   "$defs": {
-    "Destination": {
-      "oneOf": [
-        {
-          "type": "object",
-          "properties": {
-            "bootstrap-servers": {
-              "description": "`bootstrap.servers` for the destination cluster.",
-              "type": "string"
-            },
-            "type": {
-              "type": "string",
-              "const": "kafka"
-            }
-          },
-          "additionalProperties": false,
-          "required": [
-            "type",
-            "bootstrap-servers"
-          ]
-        },
-        {
-          "type": "object",
-          "properties": {
-            "root": {
-              "description": "Absolute path to the destination root directory. Each mirror\nwrites under `<root>/<mirror.name>/<partition>/`.",
-              "type": "string"
-            },
-            "type": {
-              "type": "string",
-              "const": "filesystem"
-            }
-          },
-          "additionalProperties": false,
-          "required": [
-            "type",
-            "root"
-          ]
-        },
-        {
-          "type": "object",
-          "properties": {
-            "endpoint": {
-              "description": "S3 endpoint URL. Required for non-AWS S3 (e.g. VersityGW); omit\nfor AWS regional endpoints.",
-              "type": [
-                "string",
-                "null"
-              ],
-              "default": null
-            },
-            "region": {
-              "type": "string"
-            },
-            "bucket": {
-              "type": "string"
-            },
-            "prefix": {
-              "description": "Key prefix prepended to all written object keys. Each mirror\nwrites under `<prefix?>/<mirror.name>/<partition>/<file>`.",
-              "type": [
-                "string",
-                "null"
-              ],
-              "default": null
-            },
-            "type": {
-              "type": "string",
-              "const": "s3"
-            }
-          },
-          "additionalProperties": false,
-          "required": [
-            "type",
-            "region",
-            "bucket"
-          ]
-        }
-      ]
-    },
     "Mirror": {
       "type": "object",
       "properties": {
         "name": {
-          "description": "Identifier for the mirror. Also the on-disk / S3-prefix segment\nunder which this mirror's files land\n(`<root>/<name>/<partition>/`). Must be unique across mirrors\ninside the same process.",
+          "description": "Identifier for the mirror. Also the default `name` for each\ndestination in this mirror (operators only need to set\nper-destination `name` explicitly when a mirror has more than\none destination). Must be unique across mirrors in the same\nprocess.",
           "type": "string"
         },
         "source": {
@@ -118,8 +36,15 @@
           "format": "uint32",
           "minimum": 0
         },
+        "destinations": {
+          "description": "Destinations this mirror fans into. Required; non-empty. With\nmore than one entry, a [`mirror_core::TeeSink`] sits between\nthe source consumer and the sinks, preserving each inner\nsink's end-offset gate under divergent buffering and\nheterogeneous-state restart.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Destination"
+          }
+        },
         "format": {
-          "description": "Envelope format for written files. Required for `filesystem` and\n`s3` destinations; forbidden for `kafka` destinations.",
+          "description": "Envelope format for written files. Required (defaults to\n`parquet`) when any destination is filesystem/s3; ignored by\nKafka destinations.",
           "anyOf": [
             {
               "$ref": "#/$defs/DestinationFormat"
@@ -130,7 +55,7 @@
           ]
         },
         "compression": {
-          "description": "Parquet compression. Only meaningful when `format = parquet`.\nDefaults to `zstd-1`. Forbidden for `kafka` destinations.",
+          "description": "Parquet compression. Only meaningful when `format = parquet`.\nDefaults to `zstd-1`. Ignored by Kafka destinations.",
           "anyOf": [
             {
               "$ref": "#/$defs/ParquetCompression"
@@ -141,7 +66,7 @@
           ]
         },
         "keys": {
-          "description": "Topic schema for the record `key`. Defaults to `{ type: utf8 }`.\nFor Kafka mirrors this is purely a validation contract (the\nrecord passes through unchanged); for filesystem/s3 + parquet\nit also selects the column encoding. See [`ColumnType`].",
+          "description": "Topic schema for the record `key`. Defaults to `{ type: utf8 }`.\nFor Kafka destinations this is purely a validation contract\n(the record passes through unchanged); for filesystem/s3 +\nparquet it also selects the column encoding. See [`ColumnType`].",
           "anyOf": [
             {
               "$ref": "#/$defs/ColumnConfig"
@@ -163,7 +88,7 @@
           ]
         },
         "compaction": {
-          "description": "Optional log-compaction mode. When `log`, each Parquet file is a\nfull materialized snapshot of the latest value per key. Requires\n`format = parquet`. Forbidden for `kafka` destinations.",
+          "description": "Optional log-compaction mode. When `log`, each Parquet file\nis a full materialised snapshot of the latest value per key.\nRequires `format = parquet`. Forbidden when *every*\ndestination is Kafka.",
           "anyOf": [
             {
               "$ref": "#/$defs/Compaction"
@@ -175,7 +100,7 @@
           "default": null
         },
         "flush": {
-          "description": "Flush triggers. Required for `filesystem` and `s3` destinations;\nforbidden for `kafka` destinations (which never buffer).",
+          "description": "Flush triggers for blob destinations. Required when any\ndestination is filesystem/s3; forbidden when every destination\nis Kafka (which never buffers).",
           "anyOf": [
             {
               "$ref": "#/$defs/FlushTriggers"
@@ -186,7 +111,7 @@
           ]
         },
         "timestamp-mode": {
-          "description": "Which timestamp lands on the destination record. Only meaningful\nfor `kafka` destinations; forbidden for `filesystem` and `s3`.\nDefaults to `source`.",
+          "description": "Which timestamp lands on Kafka destination records. Defaults\nto `source`. Forbidden when no destination is Kafka.",
           "anyOf": [
             {
               "$ref": "#/$defs/TimestampMode"
@@ -197,7 +122,7 @@
           ]
         },
         "http-access": {
-          "description": "Opt-in HTTP read access for this mirror's materialized view.\nOnly valid for `filesystem` / `s3` destinations. When set,\n`mirror-v3` builds an in-memory `key → latest value` map per\nrecord (independent of flush cadence) and serves it via the\ndeclared API. Multiple mirrors with the same `api` are unioned\ninto a single keyspace.",
+          "description": "Opt-in HTTP read access for this mirror's materialized view.\nRequires at least one filesystem/s3 destination (the cache\nbootstraps from durable destination state). Multiple mirrors\nwith the same `api` are unioned into a single keyspace.",
           "anyOf": [
             {
               "$ref": "#/$defs/HttpAccess"
@@ -213,7 +138,8 @@
         "name",
         "source",
         "topic",
-        "partition"
+        "partition",
+        "destinations"
       ]
     },
     "KafkaSource": {
@@ -234,6 +160,115 @@
       "additionalProperties": false,
       "required": [
         "bootstrap-servers"
+      ]
+    },
+    "Destination": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "name": {
+              "description": "Identifier for this destination (used in logs / metrics labels\nand as a tie-breaker when a mirror has multiple destinations).\nDefaults to the enclosing mirror's `name`; required to be set\nexplicitly when a mirror has more than one destination\n(otherwise two destinations would share the same identifier).",
+              "type": [
+                "string",
+                "null"
+              ],
+              "default": null
+            },
+            "bootstrap-servers": {
+              "description": "`bootstrap.servers` for the destination cluster.",
+              "type": "string"
+            },
+            "topic": {
+              "description": "Destination topic name. Defaults to the enclosing mirror's\n`topic` (i.e. same-name mirroring to a different broker).\nOverride when the destination topic is named differently from\nthe source.",
+              "type": [
+                "string",
+                "null"
+              ],
+              "default": null
+            },
+            "type": {
+              "type": "string",
+              "const": "kafka"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "bootstrap-servers"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "name": {
+              "description": "Identifier for this destination; see [`KafkaDestination::name`].\nAlso the subdirectory under `root` where this destination's\nfiles land: `<root>/<name>/<partition>/`.",
+              "type": [
+                "string",
+                "null"
+              ],
+              "default": null
+            },
+            "root": {
+              "description": "Absolute path to the destination root directory.",
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "filesystem"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "root"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "name": {
+              "description": "Identifier for this destination; see [`KafkaDestination::name`].\nAlso the subdirectory of the object key prefix where this\ndestination's objects land:\n`<prefix?>/<name>/<partition>/<file>`.",
+              "type": [
+                "string",
+                "null"
+              ],
+              "default": null
+            },
+            "endpoint": {
+              "description": "S3 endpoint URL. Required for non-AWS S3 (e.g. VersityGW);\nomit for AWS regional endpoints.",
+              "type": [
+                "string",
+                "null"
+              ],
+              "default": null
+            },
+            "region": {
+              "type": "string"
+            },
+            "bucket": {
+              "type": "string"
+            },
+            "prefix": {
+              "description": "Key prefix prepended to all written object keys.",
+              "type": [
+                "string",
+                "null"
+              ],
+              "default": null
+            },
+            "type": {
+              "type": "string",
+              "const": "s3"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "region",
+            "bucket"
+          ]
+        }
       ]
     },
     "DestinationFormat": {
@@ -293,7 +328,7 @@
       "additionalProperties": false
     },
     "ColumnType": {
-      "description": "Topic-schema declaration for a record column (`key` or `value`).\n\nThe variant describes *what the data is* and the validation\ncontract the mirror enforces at encode. How the destination\nrepresents the column is destination-specific:\n\n- **Kafka mirrors**: the record is passed through as-is; the\n  declared type acts as a validation gate (non-UTF-8 input under\n  `utf8`/`json`/`json-parseable`, unparseable JSON under\n  `json-parseable` → mirror fails with the offending offset).\n- **Filesystem/S3 + parquet**: every variant lands as `Utf8`.\n  `bytes` is base64-encoded; `utf8`/`json`/`json-parseable` are\n  stored verbatim. Extension metadata tags the field for\n  downstream consumers:\n\n  | Variant           | Parquet | Field metadata                          |\n  | ----------------- | ------- | --------------------------------------- |\n  | `bytes`           | `Utf8`  | `ARROW:extension:name = mirror_v3.bytes_base64` |\n  | `utf8`            | `Utf8`  | (none)                                  |\n  | `json`            | `Utf8`  | `ARROW:extension:name = arrow.json`     |\n  | `json-parseable`  | `Utf8`  | `ARROW:extension:name = arrow.json`     |\n\n- **Filesystem/S3 + ndjson**: only the default (`utf8`) is\n  accepted today; other variants are rejected at config load.\n\nThe `key` and `value` columns in Parquet are always named `key`\nand `value`.",
+      "description": "Topic-schema declaration for a record column (`key` or `value`).\n\nThe variant describes *what the data is* and the validation\ncontract the mirror enforces at encode. How the destination\nrepresents the column is destination-specific:\n\n- **Kafka destinations**: the record is passed through as-is; the\n  declared type acts as a validation gate (non-UTF-8 input under\n  `utf8`/`json`/`json-parseable`, unparseable JSON under\n  `json-parseable` → mirror fails with the offending offset).\n- **Filesystem/S3 + parquet**: every variant lands as `Utf8`.\n  `bytes` is base64-encoded; `utf8`/`json`/`json-parseable` are\n  stored verbatim. Extension metadata tags the field for\n  downstream consumers:\n\n  | Variant           | Parquet | Field metadata                          |\n  | ----------------- | ------- | --------------------------------------- |\n  | `bytes`           | `Utf8`  | `ARROW:extension:name = mirror_v3.bytes_base64` |\n  | `utf8`            | `Utf8`  | (none)                                  |\n  | `json`            | `Utf8`  | `ARROW:extension:name = arrow.json`     |\n  | `json-parseable`  | `Utf8`  | `ARROW:extension:name = arrow.json`     |\n\n- **Filesystem/S3 + ndjson**: only the default (`utf8`) is\n  accepted today; other variants are rejected at config load.",
       "oneOf": [
         {
           "description": "Arbitrary bytes. No validation. For Kafka destinations the\nrecord passes through unchanged; for Parquet destinations the\nbytes are base64-encoded into a `Utf8` column (storage\ndetail). Use for protobuf-keyed topics or other binary\npayloads.",
@@ -311,7 +346,7 @@
           "const": "json"
         },
         {
-          "description": "UTF-8 string carrying a JSON document, *parseability-gated*.\nIn addition to the UTF-8 check, the encoder feeds each\nnon-null payload through `serde_json` and rejects any record\nthat does not parse, with the offending source offset. The\nparser uses `serde::de::IgnoredAny` so no `serde_json::Value`\ntree is allocated — the cost is one structure walk per\npayload. Same on-disk shape as `json`.",
+          "description": "UTF-8 string carrying a JSON document, *parseability-gated*.\nIn addition to the UTF-8 check, the encoder feeds each\nnon-null payload through `serde_json` and rejects any record\nthat does not parse, with the offending source offset.",
           "type": "string",
           "const": "json-parseable"
         }

@@ -1,0 +1,47 @@
+# yaml-language-server: $schema=../schemas/mirror-v3.config.schema.json
+#
+# Dual-write: one source consumer fans every record to TWO destinations
+# (local filesystem archive + offsite S3 archive) via a single tee
+# (`mirror_core::TeeSink`). The source broker is read once per record.
+#
+# Why a tee instead of two separate mirrors against the same topic:
+#
+#   - Source-broker read amplification stays 1× (vs 2× with two
+#     independent mirrors).
+#   - Each inner destination keeps its own end-offset gate and
+#     flush cadence. On restart the tee reads from `min(heads)` and
+#     filters per-sink, so divergent durable positions (e.g. FS up
+#     to offset N, S3 up to N - 10 because mid-batch) recover
+#     cleanly.
+#   - The shared-fate cost: if one inner sink stalls indefinitely,
+#     `min(heads)` doesn't advance and the consumer lags. If
+#     failure isolation between destinations matters more than the
+#     1× read economy, run two separate mirrors instead.
+#
+# `name` is required on each destination when there's more than one
+# (otherwise both would default to the mirror's `name` and the tee
+# couldn't distinguish them in logs).
+
+mirrors:
+  - name: orders
+    source:
+      bootstrap-servers: kafka-source:9092
+    topic: orders
+    partition: 0
+    destinations:
+      - type: filesystem
+        name: local-archive
+        root: /var/lib/mirror-v3
+      - type: s3
+        name: offsite-archive
+        region: us-east-1
+        bucket: mirror-v3-offsite
+        prefix: orders/
+    # Shared encoding for all blob destinations in this mirror's tee.
+    format: parquet
+    compression: zstd-1
+    values: { type: json }
+    flush:
+      max-time-ms: 5000
+      max-bytes: 67108864
+      max-offsets: 10000

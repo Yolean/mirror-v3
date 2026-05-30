@@ -128,11 +128,19 @@ fn init_tracing() {
 fn run_validate(path: PathBuf) -> Result<()> {
     let cfg = mirror_config::load_from_path(&path)
         .with_context(|| format!("loading {}", path.display()))?;
+    let total_destinations: usize = cfg.mirrors.iter().map(|m| m.destinations.len()).sum();
     println!(
-        "OK: {} mirror(s), destination type = {}",
-        cfg.mirrors.len(),
-        destination_type(&cfg.destination)
+        "OK: {} mirror(s), {total_destinations} destination(s) total",
+        cfg.mirrors.len()
     );
+    for m in &cfg.mirrors {
+        let kinds: Vec<&str> = m.destinations.iter().map(|d| destination_type(d)).collect();
+        println!(
+            "  mirror {:?}: destinations = [{}]",
+            m.name,
+            kinds.join(", ")
+        );
+    }
     Ok(())
 }
 
@@ -260,9 +268,11 @@ impl StatusRow {
 async fn run_status(path: PathBuf, format: StatusFormat) -> Result<bool> {
     let cfg = mirror_config::load_from_path(&path)
         .with_context(|| format!("loading {}", path.display()))?;
-    let mut rows = Vec::with_capacity(cfg.mirrors.len());
+    let mut rows = Vec::new();
     for mirror in &cfg.mirrors {
-        rows.push(compute_status_row(mirror, &cfg.destination).await);
+        for dest in &mirror.destinations {
+            rows.push(compute_status_row(mirror, dest).await);
+        }
     }
     let any_errors = rows.iter().any(|r| r.error.is_some());
     match format {
@@ -273,8 +283,14 @@ async fn run_status(path: PathBuf, format: StatusFormat) -> Result<bool> {
 }
 
 async fn compute_status_row(mirror: &Mirror, destination: &Destination) -> StatusRow {
+    let dest_name = destination.effective_name(&mirror.name);
+    let row_name = if dest_name == mirror.name {
+        mirror.name.clone()
+    } else {
+        format!("{}.{dest_name}", mirror.name)
+    };
     let mut row = StatusRow {
-        name: mirror.name.clone(),
+        name: row_name,
         source_high: None,
         dest_next: None,
         error: None,
@@ -311,13 +327,12 @@ async fn compute_status_row(mirror: &Mirror, destination: &Destination) -> Statu
 
 async fn query_destination_next(mirror: &Mirror, destination: &Destination) -> Result<u64> {
     use mirror_core::Sink;
+    let dest_name = destination.effective_name(&mirror.name);
     match destination {
         Destination::Kafka(k) => {
-            let cfg = KafkaSinkConfig::new(
-                k.bootstrap_servers.clone(),
-                mirror.name.clone(),
-                mirror.partition as i32,
-            );
+            let topic = k.topic.clone().unwrap_or_else(|| mirror.topic.clone());
+            let cfg =
+                KafkaSinkConfig::new(k.bootstrap_servers.clone(), topic, mirror.partition as i32);
             let mut sink = KafkaSink::open(cfg).map_err(|e| anyhow::anyhow!("{e}"))?;
             sink.next_expected_offset()
                 .await
@@ -327,7 +342,7 @@ async fn query_destination_next(mirror: &Mirror, destination: &Destination) -> R
             let params = resolve_blob_params(mirror)?;
             let cfg = FilesystemSinkConfig {
                 root: fs.root.clone(),
-                destination_name: mirror.name.clone(),
+                destination_name: dest_name,
                 partition: mirror.partition,
                 format: params.format,
                 compression: params.compression,
@@ -357,7 +372,7 @@ async fn query_destination_next(mirror: &Mirror, destination: &Destination) -> R
             let cfg = S3SinkConfig {
                 store: Arc::new(store),
                 prefix: s3.prefix.as_deref().map(object_store::path::Path::from),
-                destination_name: mirror.name.clone(),
+                destination_name: dest_name,
                 partition: mirror.partition,
                 format: params.format,
                 compression: params.compression,
@@ -411,10 +426,11 @@ fn print_status_table(rows: &[StatusRow]) {
 async fn run(path: PathBuf) -> Result<()> {
     let cfg = mirror_config::load_from_path(&path)
         .with_context(|| format!("loading {}", path.display()))?;
+    let total_destinations: usize = cfg.mirrors.iter().map(|m| m.destinations.len()).sum();
     tracing::info!(
         config = %path.display(),
         mirrors = cfg.mirrors.len(),
-        destination = destination_type(&cfg.destination),
+        destinations = total_destinations,
         "starting mirror-v3"
     );
     install_metrics_exporter();
@@ -497,12 +513,7 @@ async fn run(path: PathBuf) -> Result<()> {
     let mut handles = Vec::with_capacity(cfg.mirrors.len());
     for mirror in &cfg.mirrors {
         let binding = mirror_cache_binding(mirror, cache_state.as_ref());
-        let handle = spawn_mirror(
-            mirror.clone(),
-            cfg.destination.clone(),
-            shutdown_rx.clone(),
-            binding,
-        )?;
+        let handle = spawn_mirror(mirror.clone(), shutdown_rx.clone(), binding).await?;
         handles.push((mirror.name.clone(), handle));
     }
 
@@ -533,9 +544,9 @@ fn cache_listen_addr() -> std::net::SocketAddr {
 fn mirror_cache_binding(
     mirror: &Mirror,
     cache: Option<&std::sync::Arc<mirror_core::CacheState>>,
-) -> Option<CacheBinding> {
+) -> Option<mirror_core::CacheBinding> {
     match (mirror.http_access.as_ref(), cache) {
-        (Some(_), Some(state)) => Some(CacheBinding {
+        (Some(_), Some(state)) => Some(mirror_core::CacheBinding {
             state: std::sync::Arc::clone(state),
             mirror_name: mirror.name.clone(),
         }),
@@ -563,32 +574,6 @@ async fn fetch_hwm_for_mirror(mirror: &Mirror) -> Result<u64> {
     .with_context(|| format!("mirror {mirror_name}: hwm task join"))?
     .with_context(|| format!("mirror {mirror_name}: fetch high watermark"))?;
     Ok(hwm.max(0) as u64)
-}
-
-/// Sink-side cache binding. Identical shape across the FS and S3
-/// sink crates; we keep one local type in mirror-bin and translate
-/// at the boundary to avoid making either sink crate depend on the
-/// other.
-#[derive(Clone)]
-struct CacheBinding {
-    state: std::sync::Arc<mirror_core::CacheState>,
-    mirror_name: String,
-}
-
-impl CacheBinding {
-    fn into_fs(self) -> mirror_fs::CacheBinding {
-        mirror_fs::CacheBinding {
-            state: self.state,
-            mirror_name: self.mirror_name,
-        }
-    }
-
-    fn into_s3(self) -> mirror_s3::CacheBinding {
-        mirror_s3::CacheBinding {
-            state: self.state,
-            mirror_name: self.mirror_name,
-        }
-    }
 }
 
 async fn shutdown_signal(mut rx: tokio::sync::watch::Receiver<bool>) {
@@ -622,11 +607,10 @@ fn install_metrics_exporter() {
     }
 }
 
-fn spawn_mirror(
+async fn spawn_mirror(
     mirror: Mirror,
-    destination: Destination,
     shutdown_rx: tokio::sync::watch::Receiver<bool>,
-    cache: Option<CacheBinding>,
+    cache: Option<mirror_core::CacheBinding>,
 ) -> Result<tokio::task::JoinHandle<Result<()>>> {
     let source_cfg = KafkaSourceConfig::new(
         mirror.source.bootstrap_servers.clone(),
@@ -648,65 +632,99 @@ fn spawn_mirror(
     };
     let compaction = compaction_label(mirror.compaction);
 
-    match destination {
+    // Build one inner Sink per destination, then wrap them in a tee.
+    // The single-destination case routes through a length-1 tee too —
+    // this keeps the cache binding's per-record fanout on a single
+    // code path.
+    let mut inners: Vec<(String, Box<dyn mirror_core::Sink>)> =
+        Vec::with_capacity(mirror.destinations.len());
+    let mut dest_descriptions: Vec<String> = Vec::with_capacity(mirror.destinations.len());
+    for dest in &mirror.destinations {
+        let inner_name = dest.effective_name(&mirror.name);
+        let kind = destination_type(dest);
+        dest_descriptions.push(format!("{inner_name}({kind})"));
+        let sink: Box<dyn mirror_core::Sink> =
+            open_inner_sink(dest, &mirror, &inner_name, cache.as_ref()).await?;
+        inners.push((inner_name, sink));
+    }
+    let tee = mirror_core::TeeSink::open(inners, cache.clone())
+        .await
+        .map_err(|e| anyhow::anyhow!("opening tee for mirror {name}: {e}"))?;
+
+    let destinations_log = dest_descriptions.join(",");
+    Ok(tokio::spawn(async move {
+        tracing::info!(
+            mirror = %name,
+            destinations = %destinations_log,
+            compaction,
+            "loop start"
+        );
+        let result = MIRROR_LABELS
+            .scope(
+                labels,
+                run_mirror(source, tee, shutdown_signal(shutdown_rx)),
+            )
+            .await;
+        match result {
+            Ok(()) => Ok(()),
+            Err(e) => Err(anyhow::anyhow!("mirror {name}: {e}")),
+        }
+    }))
+}
+
+async fn open_inner_sink(
+    dest: &Destination,
+    mirror: &Mirror,
+    inner_name: &str,
+    cache_for_bootstrap: Option<&mirror_core::CacheBinding>,
+) -> Result<Box<dyn mirror_core::Sink>> {
+    match dest {
         Destination::Kafka(k) => {
-            let mut sink_cfg = KafkaSinkConfig::new(
-                k.bootstrap_servers,
-                mirror.name.clone(),
-                mirror.partition as i32,
-            );
+            let topic = k.topic.clone().unwrap_or_else(|| mirror.topic.clone());
+            let mut sink_cfg =
+                KafkaSinkConfig::new(k.bootstrap_servers.clone(), topic, mirror.partition as i32);
             sink_cfg.timestamp_mode =
                 timestamp_mode_to_kafka(mirror.timestamp_mode.unwrap_or_default());
             sink_cfg.keys = column_type_to_envelope(mirror.keys.unwrap_or_default().kind);
             sink_cfg.values = column_type_to_envelope(mirror.values.unwrap_or_default().kind);
-            let sink = KafkaSink::open(sink_cfg)
-                .with_context(|| format!("opening sink for mirror {name}"))?;
-            Ok(tokio::spawn(async move {
-                tracing::info!(mirror = %name, destination = "kafka", compaction, "loop start");
-                let result = MIRROR_LABELS
-                    .scope(
-                        labels,
-                        run_mirror(source, sink, shutdown_signal(shutdown_rx)),
-                    )
-                    .await;
-                match result {
-                    Ok(()) => Ok(()),
-                    Err(e) => Err(anyhow::anyhow!("mirror {name}: {e}")),
-                }
-            }))
+            let sink = KafkaSink::open(sink_cfg).with_context(|| {
+                format!(
+                    "opening kafka sink for mirror {} destination {inner_name}",
+                    mirror.name
+                )
+            })?;
+            Ok(Box::new(sink))
         }
         Destination::Filesystem(fs) => {
-            let params = resolve_blob_params(&mirror)?;
+            let params = resolve_blob_params(mirror)?;
+            // Cache bootstrap-replay happens at sink-open time in
+            // each blob sink. The tee's `cache` binding is what
+            // matters for the per-record path; passing the binding
+            // to every inner blob sink seeds the cache from durable
+            // state on restart. CacheState is monotonic so multiple
+            // inner sinks bootstrapping the same binding is safe.
             let sink_cfg = FilesystemSinkConfig {
-                root: fs.root,
-                destination_name: mirror.name.clone(),
+                root: fs.root.clone(),
+                destination_name: inner_name.to_string(),
                 partition: mirror.partition,
                 format: params.format,
                 compression: params.compression,
                 keys: params.keys,
                 values: params.values,
                 compaction: compaction_to_fs(mirror.compaction),
-                cache: cache.clone().map(CacheBinding::into_fs),
+                cache: cache_for_bootstrap.cloned(),
                 flush: params.flush,
             };
-            let sink = FilesystemSink::open(sink_cfg)
-                .with_context(|| format!("opening sink for mirror {name}"))?;
-            Ok(tokio::spawn(async move {
-                tracing::info!(mirror = %name, destination = "filesystem", compaction, "loop start");
-                let result = MIRROR_LABELS
-                    .scope(
-                        labels,
-                        run_mirror(source, sink, shutdown_signal(shutdown_rx)),
-                    )
-                    .await;
-                match result {
-                    Ok(()) => Ok(()),
-                    Err(e) => Err(anyhow::anyhow!("mirror {name}: {e}")),
-                }
-            }))
+            let sink = FilesystemSink::open(sink_cfg).with_context(|| {
+                format!(
+                    "opening fs sink for mirror {} destination {inner_name}",
+                    mirror.name
+                )
+            })?;
+            Ok(Box::new(sink))
         }
         Destination::S3(s3) => {
-            let params = resolve_blob_params(&mirror)?;
+            let params = resolve_blob_params(mirror)?;
             let mut builder = object_store::aws::AmazonS3Builder::from_env()
                 .with_region(&s3.region)
                 .with_bucket_name(&s3.bucket);
@@ -716,20 +734,23 @@ fn spawn_mirror(
                     builder = builder.with_allow_http(true);
                 }
             }
-            let store = builder
-                .build()
-                .with_context(|| format!("building S3 store for mirror {name}"))?;
+            let store = builder.build().with_context(|| {
+                format!(
+                    "building S3 store for mirror {} destination {inner_name}",
+                    mirror.name
+                )
+            })?;
             let sink_cfg = S3SinkConfig {
                 store: Arc::new(store),
                 prefix: s3.prefix.as_deref().map(object_store::path::Path::from),
-                destination_name: mirror.name.clone(),
+                destination_name: inner_name.to_string(),
                 partition: mirror.partition,
                 format: params.format,
                 compression: params.compression,
                 keys: params.keys,
                 values: params.values,
                 compaction: compaction_to_s3(mirror.compaction),
-                cache: cache.clone().map(CacheBinding::into_s3),
+                cache: cache_for_bootstrap.cloned(),
                 flush: mirror_s3::FlushTriggers {
                     max_time: params.flush.max_time,
                     max_bytes: params.flush.max_bytes,
@@ -737,23 +758,13 @@ fn spawn_mirror(
                     daily_at_utc_seconds: params.flush.daily_at_utc_seconds,
                 },
             };
-            Ok(tokio::spawn(async move {
-                tracing::info!(mirror = %name, destination = "s3", compaction, "loop start");
-                let result = MIRROR_LABELS
-                    .scope(labels, async move {
-                        let sink = S3Sink::open(sink_cfg).await.map_err(|e| {
-                            mirror_core::MirrorError::Sink(mirror_core::SinkError::Transport(
-                                format!("open S3 sink: {e}"),
-                            ))
-                        })?;
-                        run_mirror(source, sink, shutdown_signal(shutdown_rx)).await
-                    })
-                    .await;
-                match result {
-                    Ok(()) => Ok(()),
-                    Err(e) => Err(anyhow::anyhow!("mirror {name}: {e}")),
-                }
-            }))
+            let sink = S3Sink::open(sink_cfg).await.with_context(|| {
+                format!(
+                    "opening s3 sink for mirror {} destination {inner_name}",
+                    mirror.name
+                )
+            })?;
+            Ok(Box::new(sink))
         }
     }
 }

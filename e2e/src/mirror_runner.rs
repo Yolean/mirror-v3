@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use mirror_core::{run_mirror, MirrorError};
+use mirror_core::{run_mirror, MirrorError, TeeSink};
 use mirror_fs::{FilesystemSink, FilesystemSinkConfig};
 use mirror_kafka::{KafkaSink, KafkaSinkConfig, KafkaSource, KafkaSourceConfig};
 use mirror_s3::{S3Sink, S3SinkConfig};
@@ -154,6 +154,9 @@ pub fn spawn_kafka_to_filesystem(spec: FsMirrorSpec) -> Result<MirrorHandle> {
         c
     };
     let source = KafkaSource::open(src_cfg).context("open KafkaSource")?;
+    let dest_name = spec.destination_name.clone();
+    let cache_for_bootstrap = spec.cache.clone();
+    let cache_for_tee = spec.cache.clone();
     let sink_cfg = FilesystemSinkConfig {
         root: spec.root,
         destination_name: spec.destination_name,
@@ -163,12 +166,135 @@ pub fn spawn_kafka_to_filesystem(spec: FsMirrorSpec) -> Result<MirrorHandle> {
         keys: spec.keys,
         values: spec.values,
         compaction: spec.compaction,
-        cache: spec.cache,
+        cache: cache_for_bootstrap,
         flush: spec.flush,
     };
     let sink = FilesystemSink::open(sink_cfg).context("open FilesystemSink")?;
     let (shutdown, signal) = shutdown_pair();
-    let handle = tokio::spawn(async move { run_mirror(source, sink, signal).await });
+    let handle = tokio::spawn(async move {
+        // Even the single-destination path routes through a length-1
+        // TeeSink so the per-record cache-binding apply is owned at
+        // the tee level (matches mirror-bin's production path).
+        let tee = TeeSink::open(
+            vec![(dest_name, Box::new(sink) as Box<dyn mirror_core::Sink>)],
+            cache_for_tee,
+        )
+        .await
+        .map_err(MirrorError::Sink)?;
+        run_mirror(source, tee, signal).await
+    });
+    Ok(MirrorHandle { handle, shutdown })
+}
+
+/// Inner-sink description for [`spawn_kafka_to_tee`]. Mirrors the
+/// production-side per-destination configuration in `mirror-bin`.
+pub enum TeeInnerSpec {
+    Filesystem(FsInnerSpec),
+    S3(S3InnerSpec),
+    Kafka(KafkaInnerSpec),
+}
+
+pub struct FsInnerSpec {
+    pub name: String,
+    pub root: PathBuf,
+    pub format: mirror_envelope::Format,
+    pub compression: mirror_envelope::ParquetCompression,
+    pub keys: mirror_envelope::ColumnType,
+    pub values: mirror_envelope::ColumnType,
+    pub compaction: Option<mirror_fs::CompactionMode>,
+    pub flush: mirror_fs::FlushTriggers,
+}
+
+pub struct S3InnerSpec {
+    pub name: String,
+    pub store: Arc<dyn ObjectStore>,
+    pub prefix: Option<object_store::path::Path>,
+    pub format: mirror_envelope::Format,
+    pub compression: mirror_envelope::ParquetCompression,
+    pub keys: mirror_envelope::ColumnType,
+    pub values: mirror_envelope::ColumnType,
+    pub compaction: Option<mirror_s3::CompactionMode>,
+    pub flush: mirror_s3::FlushTriggers,
+}
+
+pub struct KafkaInnerSpec {
+    pub name: String,
+    pub bootstrap_servers: String,
+    pub topic: String,
+}
+
+pub struct TeeMirrorSpec {
+    pub source_bootstrap: String,
+    pub source_topic: String,
+    pub partition: i32,
+    pub group_id: String,
+    pub destinations: Vec<TeeInnerSpec>,
+    pub cache: Option<mirror_core::CacheBinding>,
+}
+
+pub async fn spawn_kafka_to_tee(spec: TeeMirrorSpec) -> Result<MirrorHandle> {
+    let src_cfg = {
+        let mut c = KafkaSourceConfig::new(
+            spec.source_bootstrap,
+            spec.group_id,
+            spec.source_topic,
+            spec.partition,
+        );
+        c.poll_timeout = Duration::from_millis(500);
+        c
+    };
+    let source = KafkaSource::open(src_cfg).context("open KafkaSource")?;
+
+    let cache_for_bootstrap = spec.cache.clone();
+    let mut inners: Vec<(String, Box<dyn mirror_core::Sink>)> =
+        Vec::with_capacity(spec.destinations.len());
+    for inner in spec.destinations {
+        match inner {
+            TeeInnerSpec::Filesystem(fs) => {
+                let cfg = FilesystemSinkConfig {
+                    root: fs.root,
+                    destination_name: fs.name.clone(),
+                    partition: spec.partition as u32,
+                    format: fs.format,
+                    compression: fs.compression,
+                    keys: fs.keys,
+                    values: fs.values,
+                    compaction: fs.compaction,
+                    cache: cache_for_bootstrap.clone(),
+                    flush: fs.flush,
+                };
+                let sink = FilesystemSink::open(cfg).context("open FilesystemSink")?;
+                inners.push((fs.name, Box::new(sink)));
+            }
+            TeeInnerSpec::S3(s3) => {
+                let cfg = S3SinkConfig {
+                    store: s3.store,
+                    prefix: s3.prefix,
+                    destination_name: s3.name.clone(),
+                    partition: spec.partition as u32,
+                    format: s3.format,
+                    compression: s3.compression,
+                    keys: s3.keys,
+                    values: s3.values,
+                    compaction: s3.compaction,
+                    cache: cache_for_bootstrap.clone(),
+                    flush: s3.flush,
+                };
+                let sink = S3Sink::open(cfg).await.context("open S3Sink")?;
+                inners.push((s3.name, Box::new(sink)));
+            }
+            TeeInnerSpec::Kafka(k) => {
+                let cfg = KafkaSinkConfig::new(k.bootstrap_servers, k.topic, spec.partition);
+                let sink = KafkaSink::open(cfg).context("open KafkaSink")?;
+                inners.push((k.name, Box::new(sink)));
+            }
+        }
+    }
+    let tee = TeeSink::open(inners, spec.cache.clone())
+        .await
+        .map_err(|e| anyhow::anyhow!("open TeeSink: {e}"))?;
+    let (shutdown, signal) = shutdown_pair();
+    let handle = tokio::spawn(async move { run_mirror(source, tee, signal).await });
     Ok(MirrorHandle { handle, shutdown })
 }
 
@@ -201,6 +327,9 @@ pub async fn spawn_kafka_to_s3(spec: S3MirrorSpec) -> Result<MirrorHandle> {
         c
     };
     let source = KafkaSource::open(src_cfg).context("open KafkaSource")?;
+    let dest_name = spec.destination_name.clone();
+    let cache_for_bootstrap = spec.cache.clone();
+    let cache_for_tee = spec.cache.clone();
     let sink_cfg = S3SinkConfig {
         store: spec.store,
         prefix: spec.prefix,
@@ -211,11 +340,19 @@ pub async fn spawn_kafka_to_s3(spec: S3MirrorSpec) -> Result<MirrorHandle> {
         keys: spec.keys,
         values: spec.values,
         compaction: spec.compaction,
-        cache: spec.cache,
+        cache: cache_for_bootstrap,
         flush: spec.flush,
     };
     let sink = S3Sink::open(sink_cfg).await.context("open S3Sink")?;
     let (shutdown, signal) = shutdown_pair();
-    let handle = tokio::spawn(async move { run_mirror(source, sink, signal).await });
+    let handle = tokio::spawn(async move {
+        let tee = TeeSink::open(
+            vec![(dest_name, Box::new(sink) as Box<dyn mirror_core::Sink>)],
+            cache_for_tee,
+        )
+        .await
+        .map_err(MirrorError::Sink)?;
+        run_mirror(source, tee, signal).await
+    });
     Ok(MirrorHandle { handle, shutdown })
 }

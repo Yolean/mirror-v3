@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::StreamExt;
-use mirror_core::{CacheState, Record, Sink, SinkError};
+use mirror_core::{Record, Sink, SinkError};
 use mirror_envelope::{ColumnType, Format, ParquetCompression};
 use mirror_fs::naming;
 use object_store::path::Path;
@@ -81,13 +81,9 @@ pub enum CompactionMode {
     Log,
 }
 
-/// See `mirror_fs::CacheBinding`. Replicated here to avoid a circular
-/// dependency.
-#[derive(Clone, Debug)]
-pub struct CacheBinding {
-    pub state: Arc<CacheState>,
-    pub mirror_name: String,
-}
+/// Re-export of the canonical cache binding from `mirror-core`. See
+/// `mirror_fs::CacheBinding` for the symmetric FS-side comment.
+pub use mirror_core::CacheBinding;
 
 pub struct S3Sink {
     store: Arc<dyn ObjectStore>,
@@ -97,7 +93,6 @@ pub struct S3Sink {
     keys: ColumnType,
     values: ColumnType,
     compaction: Option<CompactionMode>,
-    cache: Option<CacheBinding>,
     flush: FlushTriggers,
     durable_position: u64,
     buffer: Vec<Record>,
@@ -169,7 +164,6 @@ impl S3Sink {
             keys: cfg.keys,
             values: cfg.values,
             compaction: cfg.compaction,
-            cache: cfg.cache,
             flush: cfg.flush,
             durable_position,
             buffer: Vec::new(),
@@ -361,9 +355,10 @@ impl Sink for S3Sink {
                 actual: record.source_offset,
             });
         }
-        let requires_string_key =
-            matches!(self.compaction, Some(CompactionMode::Log)) || self.cache.is_some();
-        if requires_string_key {
+        // Compaction needs a non-null UTF-8 key to dedup by. The
+        // http-access cache check now lives at the tee level (see
+        // `mirror_core::TeeSink::write`).
+        if matches!(self.compaction, Some(CompactionMode::Log)) {
             match &record.key {
                 None => {
                     return Err(SinkError::Transport(format!(
@@ -394,9 +389,6 @@ impl Sink for S3Sink {
                 view.insert(key_str, record.clone());
             }
             report_compaction_keys(view.len());
-        }
-        if let Some(binding) = self.cache.as_ref() {
-            binding.state.apply_record(&binding.mirror_name, &record);
         }
         self.buffer_bytes += record_byte_size(&record);
         self.buffer.push(record);

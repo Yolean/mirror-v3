@@ -3,14 +3,14 @@
 # Parity example: one mirror, Kafka source -> Kafka destination,
 # matching the behaviour of the legacy Java worker.
 #
+# Destination defaults: the Kafka destination's topic defaults to
+# `mirror.topic` (same-name mirroring to a different broker).
+# Override with `topic: <name>` on the destination to rename.
+#
 # !! Deployment requirement !!
 # Single-writer per (topic, partition). Deploy with:
 #   spec.replicas: 1
 #   spec.strategy.type: Recreate
-
-destination:
-  type: kafka
-  bootstrap-servers: redpanda.kafka-v3.svc.cluster.local:9092
 
 mirrors:
   - name: operations
@@ -18,3 +18,6 @@ mirrors:
       bootstrap-servers: kafka-v2-read-bootstrap:9092
     topic: operations-v1
     partition: 0
+    destinations:
+      - type: kafka
+        bootstrap-servers: redpanda.kafka-v3.svc.cluster.local:9092
