@@ -182,6 +182,16 @@ fn compaction_to_s3(c: Option<mirror_config::Compaction>) -> Option<mirror_s3::C
     c.map(|mirror_config::Compaction::Log| mirror_s3::CompactionMode::Log)
 }
 
+/// Human label for the mirror's compaction mode, used in logs so an
+/// operator can tell from `kubectl logs` which mode a given mirror
+/// is running in.
+fn compaction_label(c: Option<mirror_config::Compaction>) -> &'static str {
+    match c {
+        None => "append",
+        Some(mirror_config::Compaction::Log) => "log",
+    }
+}
+
 fn timestamp_mode_to_kafka(m: mirror_config::TimestampMode) -> mirror_kafka::TimestampMode {
     match m {
         mirror_config::TimestampMode::Source => mirror_kafka::TimestampMode::Source,
@@ -636,6 +646,7 @@ fn spawn_mirror(
         topic: mirror.topic.clone(),
         partition: mirror.partition,
     };
+    let compaction = compaction_label(mirror.compaction);
 
     match destination {
         Destination::Kafka(k) => {
@@ -651,7 +662,7 @@ fn spawn_mirror(
             let sink = KafkaSink::open(sink_cfg)
                 .with_context(|| format!("opening sink for mirror {name}"))?;
             Ok(tokio::spawn(async move {
-                tracing::info!(mirror = %name, "loop start");
+                tracing::info!(mirror = %name, destination = "kafka", compaction, "loop start");
                 let result = MIRROR_LABELS
                     .scope(
                         labels,
@@ -681,7 +692,7 @@ fn spawn_mirror(
             let sink = FilesystemSink::open(sink_cfg)
                 .with_context(|| format!("opening sink for mirror {name}"))?;
             Ok(tokio::spawn(async move {
-                tracing::info!(mirror = %name, "loop start");
+                tracing::info!(mirror = %name, destination = "filesystem", compaction, "loop start");
                 let result = MIRROR_LABELS
                     .scope(
                         labels,
@@ -727,7 +738,7 @@ fn spawn_mirror(
                 },
             };
             Ok(tokio::spawn(async move {
-                tracing::info!(mirror = %name, "loop start");
+                tracing::info!(mirror = %name, destination = "s3", compaction, "loop start");
                 let result = MIRROR_LABELS
                     .scope(labels, async move {
                         let sink = S3Sink::open(sink_cfg).await.map_err(|e| {

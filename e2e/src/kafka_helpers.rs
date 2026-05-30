@@ -29,6 +29,77 @@ pub async fn create_topic(bootstrap: &str, topic: &str, partitions: i32) -> Resu
     Ok(())
 }
 
+/// Create a topic with the combined `cleanup.policy=compact,delete`.
+///
+/// This is the operator-intent stand-in for a production compacted
+/// topic *and* the only policy on which Redpanda (and Kafka) accept
+/// manual `DeleteRecords` calls: `cleanup.policy=compact` alone
+/// raises `PolicyViolation` on delete-records, since the broker's
+/// segment-reclaim flow is meant to be the only thing that advances
+/// the low watermark. The combined policy preserves the
+/// compaction semantics we want to model (latest value per key,
+/// tombstone-removable) while letting the test deterministically
+/// advance the low watermark via [`trim_records_before`] without
+/// waiting on the broker's own compaction loop.
+pub async fn create_compacted_topic(bootstrap: &str, topic: &str, partitions: i32) -> Result<()> {
+    let admin: AdminClient<DefaultClientContext> = ClientConfig::new()
+        .set("bootstrap.servers", bootstrap)
+        .create()
+        .context("admin client")?;
+    let new_topic = NewTopic::new(topic, partitions, TopicReplication::Fixed(1))
+        .set("cleanup.policy", "compact,delete");
+    let results = admin
+        .create_topics(&[new_topic], &AdminOptions::new())
+        .await
+        .context("create_topics call")?;
+    for result in results {
+        result.map_err(|(t, e)| anyhow!("create topic {t}: {e:?}"))?;
+    }
+    Ok(())
+}
+
+/// Advance the partition's low watermark by deleting all records
+/// with `source_offset < before_offset`. Returns the new low
+/// watermark as reported by the broker after deletion. This is the
+/// deterministic stand-in for "broker-side compaction has removed
+/// earlier records": from the mirror consumer's point of view the
+/// effect is identical (seek to 0 → broker delivers the new earliest
+/// available offset).
+pub async fn trim_records_before(
+    bootstrap: &str,
+    topic: &str,
+    partition: i32,
+    before_offset: i64,
+) -> Result<i64> {
+    let admin: AdminClient<DefaultClientContext> = ClientConfig::new()
+        .set("bootstrap.servers", bootstrap)
+        .create()
+        .context("admin client")?;
+    let mut tpl = TopicPartitionList::new();
+    tpl.add_partition_offset(
+        topic,
+        partition,
+        rdkafka::topic_partition_list::Offset::Offset(before_offset),
+    )
+    .context("tpl add")?;
+    let result = admin
+        .delete_records(&tpl, &AdminOptions::new())
+        .await
+        .context("delete_records call")?;
+    // result is a TPL with each partition's post-deletion low watermark
+    // (or an error). We expect exactly one partition in the response.
+    let elem = result
+        .find_partition(topic, partition)
+        .ok_or_else(|| anyhow!("delete_records returned no entry for {topic}-{partition}"))?;
+    elem.error()
+        .map_err(|e| anyhow!("delete_records partition error: {e}"))?;
+    let new_low = match elem.offset() {
+        rdkafka::topic_partition_list::Offset::Offset(o) => o,
+        other => return Err(anyhow!("unexpected post-delete offset: {other:?}")),
+    };
+    Ok(new_low)
+}
+
 pub async fn produce_records(
     bootstrap: &str,
     topic: &str,

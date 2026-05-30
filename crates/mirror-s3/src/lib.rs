@@ -339,7 +339,11 @@ impl Sink for S3Sink {
                 pos
             }
         };
-        if on_remote != self.durable_position {
+        // Drift = remote advanced PAST our in-memory view (out-of-band
+        // write). The reverse is normal immediately after
+        // `align_to_source_low_watermark` (durable advanced but the
+        // first snapshot blob hasn't been PUT yet); see mirror-fs.
+        if on_remote > self.durable_position {
             return Err(SinkError::UnexpectedPosition {
                 expected: self.durable_position,
                 actual: on_remote,
@@ -407,6 +411,32 @@ impl Sink for S3Sink {
 
     async fn flush(&mut self) -> Result<(), SinkError> {
         self.flush_now().await
+    }
+
+    fn allows_compacted_source(&self) -> bool {
+        matches!(self.compaction, Some(CompactionMode::Log))
+    }
+
+    async fn align_to_source_low_watermark(&mut self, low_watermark: u64) -> Result<(), SinkError> {
+        // Mirrors `mirror_fs::FilesystemSink::align_to_source_low_watermark`.
+        // The S3 compaction-mode chain (scan_validate_compacted) allows
+        // gaps, so advancing `durable_position` past the prior value
+        // is correct for blob naming.
+        if !matches!(self.compaction, Some(CompactionMode::Log)) {
+            return Err(SinkError::Transport(
+                "align_to_source_low_watermark called on non-compaction sink".into(),
+            ));
+        }
+        if !self.buffer.is_empty() || low_watermark < self.durable_position {
+            return Err(SinkError::Transport(format!(
+                "align_to_source_low_watermark called in inconsistent state: buffer={} durable={} low_watermark={}",
+                self.buffer.len(),
+                self.durable_position,
+                low_watermark,
+            )));
+        }
+        self.durable_position = low_watermark;
+        Ok(())
     }
 }
 

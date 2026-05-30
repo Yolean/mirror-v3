@@ -36,17 +36,39 @@ pub fn fetch_high_watermark(
     partition: i32,
     timeout: Duration,
 ) -> Result<i64, KafkaError> {
-    use rdkafka::consumer::Consumer;
+    let (_low, high) = fetch_watermarks(bootstrap, topic, partition, timeout)?;
+    Ok(high)
+}
+
+/// Fetch the low watermark for `(topic, partition)` against
+/// `bootstrap` — the earliest offset still retained by the broker.
+/// Greater than zero on compacted or `delete-records`-trimmed
+/// partitions. Sync call — wrap in spawn_blocking for async contexts.
+pub fn fetch_low_watermark(
+    bootstrap: &str,
+    topic: &str,
+    partition: i32,
+    timeout: Duration,
+) -> Result<i64, KafkaError> {
+    let (low, _high) = fetch_watermarks(bootstrap, topic, partition, timeout)?;
+    Ok(low)
+}
+
+fn fetch_watermarks(
+    bootstrap: &str,
+    topic: &str,
+    partition: i32,
+    timeout: Duration,
+) -> Result<(i64, i64), KafkaError> {
     let consumer: BaseConsumer = ClientConfig::new()
         .set("bootstrap.servers", bootstrap)
         .set("group.id", "mirror-v3-status-noop")
         .set("enable.auto.commit", "false")
         .create()
         .map_err(|e| KafkaError::Init(e.to_string()))?;
-    let (_low, high) = consumer
+    consumer
         .fetch_watermarks(topic, partition, Timeout::After(timeout))
-        .map_err(|e| KafkaError::Init(format!("fetch_watermarks: {e}")))?;
-    Ok(high)
+        .map_err(|e| KafkaError::Init(format!("fetch_watermarks: {e}")))
 }
 
 #[derive(Debug, Clone)]
@@ -137,6 +159,21 @@ impl Source for KafkaSource {
             Ok(Err(e)) => Err(SourceError::Transport(e.to_string())),
             Err(_elapsed) => Ok(None),
         }
+    }
+
+    async fn low_watermark(&mut self) -> Result<u64, SourceError> {
+        // Synchronous metadata fetch; bounded by `DEFAULT_WATERMARK_TIMEOUT`
+        // and only called at startup, so we don't go through
+        // spawn_blocking.
+        let (low, _high) = self
+            .consumer
+            .fetch_watermarks(
+                &self.topic,
+                self.partition,
+                Timeout::After(DEFAULT_WATERMARK_TIMEOUT),
+            )
+            .map_err(|e| SourceError::Transport(format!("fetch_watermarks: {e}")))?;
+        Ok(low.max(0) as u64)
     }
 }
 

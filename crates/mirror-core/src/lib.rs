@@ -177,6 +177,16 @@ pub trait Source: Send {
     /// record. `Ok(None)` means the window elapsed without one — the
     /// loop will use that as a heartbeat to revalidate the sink.
     async fn poll_one(&mut self) -> Result<Option<Record>, SourceError>;
+
+    /// Earliest offset still retained by the source (Kafka "low
+    /// watermark"). On a compacted or `delete-records`-trimmed topic
+    /// this can be greater than zero. The run loop consults this at
+    /// startup to decide whether seeking to the sink's
+    /// `next_expected_offset()` is feasible. Default `Ok(0)` is the
+    /// safe choice for tests and any source that doesn't trim.
+    async fn low_watermark(&mut self) -> Result<u64, SourceError> {
+        Ok(0)
+    }
 }
 
 /// A destination for exactly-once mirroring. The sink owns the truth
@@ -197,6 +207,42 @@ pub trait Sink: Send {
     /// shutdown. Default is a no-op for sinks that don't buffer
     /// (e.g. Kafka, where every write is durable on return).
     async fn flush(&mut self) -> Result<(), SinkError> {
+        Ok(())
+    }
+
+    /// Whether this sink can correctly resume from a source whose
+    /// earliest available offset is greater than the sink's
+    /// `next_expected_offset()`. True for compaction:log destinations,
+    /// where the destination is a key→latest-value snapshot and
+    /// missing earlier offsets are harmless (their keys are either
+    /// already represented in the snapshot or have been superseded
+    /// by later writes). False for append-mode destinations, where
+    /// missing earlier offsets mean an incomplete chain and the
+    /// bootstrap must fail loudly.
+    fn allows_compacted_source(&self) -> bool {
+        false
+    }
+
+    /// Called by the run loop after the bootstrap branch has decided
+    /// to skip from this sink's `next_expected_offset()` to the
+    /// source's `low_watermark` — i.e. when [`Self::allows_compacted_source`]
+    /// returned true and the source has been compacted past the sink's
+    /// current durable position. The sink must advance its internal
+    /// "next expected offset" to `low_watermark` so that:
+    ///   1. the next [`Self::next_expected_offset`] call returns
+    ///      `low_watermark` (idle-drift check stays consistent);
+    ///   2. [`Self::write`] accepts the next incoming record at
+    ///      `low_watermark` (the per-record gate stays consistent);
+    ///   3. blob/file naming reflects `low_watermark` as the new
+    ///      starting offset for the snapshot range.
+    ///
+    /// Only ever called when both invariants hold:
+    /// `allows_compacted_source() == true` and the loop's first call
+    /// to `next_expected_offset()` returned a value strictly less than
+    /// `low_watermark`. Default impl is a no-op (sinks that don't
+    /// override `allows_compacted_source` never see this call).
+    async fn align_to_source_low_watermark(&mut self, low_watermark: u64) -> Result<(), SinkError> {
+        let _ = low_watermark;
         Ok(())
     }
 }
@@ -231,6 +277,24 @@ pub enum MirrorError {
     /// a topic reset.
     #[error("destination drift while idle: expected next-offset {expected}, found {actual}")]
     DestinationDrift { expected: u64, actual: u64 },
+    /// Source's earliest available offset is greater than the sink's
+    /// next-expected-offset, and the sink is not willing to skip
+    /// records (i.e. it's not a compaction:log destination). This
+    /// fires at bootstrap on a compacted or delete-records-trimmed
+    /// source topic when the mirror is configured for append mode —
+    /// it would leave a gap in the destination chain, which append
+    /// mode forbids.
+    #[error(
+        "source has been compacted past start offset: sink wants {start}, broker's earliest is {low_watermark}. \
+         Either set `compaction: log` on this mirror (destination becomes a key→latest-value snapshot, \
+         missing earlier offsets are harmless), or seed the destination from a backup that covers up to \
+         offset {low_watermark_minus_one}."
+    )]
+    SourceCompactedBelowExpected {
+        start: u64,
+        low_watermark: u64,
+        low_watermark_minus_one: u64,
+    },
 }
 
 /// How often the loop emits an INFO-level "heartbeat" log line. This
@@ -282,10 +346,45 @@ where
     K: Sink,
     F: std::future::Future<Output = ()> + Send,
 {
-    let start = sink.next_expected_offset().await?;
-    tracing::info!(start_offset = start, "starting mirror");
-    source.seek(start).await?;
-    let mut expected = start;
+    let sink_start = sink.next_expected_offset().await?;
+    let low_watermark = source.low_watermark().await?;
+    let compaction_mode = if sink.allows_compacted_source() {
+        "log"
+    } else {
+        "append"
+    };
+    let expected = if sink_start < low_watermark {
+        if sink.allows_compacted_source() {
+            tracing::warn!(
+                start_offset = sink_start,
+                low_watermark,
+                compaction = compaction_mode,
+                "source has been compacted past start_offset; resuming from broker's earliest available offset"
+            );
+            // Align the sink's internal "next expected" with the
+            // low watermark so the per-record gate and idle-drift
+            // checks stay consistent from here on.
+            sink.align_to_source_low_watermark(low_watermark).await?;
+            low_watermark
+        } else {
+            return Err(MirrorError::SourceCompactedBelowExpected {
+                start: sink_start,
+                low_watermark,
+                low_watermark_minus_one: low_watermark.saturating_sub(1),
+            });
+        }
+    } else {
+        sink_start
+    };
+    tracing::info!(
+        start_offset = expected,
+        sink_next_expected = sink_start,
+        source_low_watermark = low_watermark,
+        compaction = compaction_mode,
+        "starting mirror"
+    );
+    source.seek(expected).await?;
+    let mut expected = expected;
     let mut last_heartbeat_offset = expected;
     // Initial /metrics state for this mirror:
     //   - `_offset_verified` carries the destination's startup

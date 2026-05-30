@@ -148,6 +148,90 @@ fn empty_destination_starts_at_zero_and_processes_first_record() {
 }
 
 #[test]
+fn compacted_source_with_compaction_log_advances_to_low_watermark() {
+    // Sink is empty (start = 0) and reports it tolerates a compacted
+    // source. The broker has trimmed offsets 0..460, so the earliest
+    // available offset is 461. The loop must seek to 461 and accept
+    // record 461 as the first record (rather than tripping
+    // SourceOffsetMismatch on "expected 0, got 461").
+    let source = MockSource::new([
+        MockSourceEvent::Record(rec(461)),
+        MockSourceEvent::Error("stop".into()),
+    ])
+    .with_low_watermark(461);
+    let sink = MockSink::starting_at(461).with_allows_compacted_source(true);
+    let inspector = WriteInspector::wrap(sink);
+    let handle = inspector.handle();
+
+    let result = drive(run_mirror(source, handle, never()));
+    assert!(
+        matches!(result, Err(MirrorError::Source(_))),
+        "got: {result:?}"
+    );
+    let writes = inspector.into_writes();
+    assert_eq!(
+        writes.iter().map(|r| r.source_offset).collect::<Vec<_>>(),
+        vec![461],
+        "the broker's earliest record must be accepted, not rejected"
+    );
+}
+
+#[test]
+fn compacted_source_without_compaction_fails_with_helpful_error() {
+    // Same setup as above except the sink reports it does NOT tolerate
+    // a compacted source (append mode). The loop must abort at
+    // bootstrap with SourceCompactedBelowExpected — never even calling
+    // poll_one, because the gap would leave a permanent hole in the
+    // destination chain.
+    let source = MockSource::new([
+        // If the loop ever polls, it would falsely succeed; make the
+        // first poll a clear error so the assertion below is unambiguous.
+        MockSourceEvent::Record(rec(461)),
+    ])
+    .with_low_watermark(461);
+    let sink = MockSink::starting_at(0); // default: allows_compacted_source = false
+
+    let result = drive(run_mirror(source, sink, never()));
+    match result {
+        Err(MirrorError::SourceCompactedBelowExpected {
+            start,
+            low_watermark,
+            low_watermark_minus_one,
+        }) => {
+            assert_eq!(start, 0);
+            assert_eq!(low_watermark, 461);
+            assert_eq!(low_watermark_minus_one, 460);
+        }
+        other => panic!("expected SourceCompactedBelowExpected, got {other:?}"),
+    }
+}
+
+#[test]
+fn non_compacted_source_uses_sink_start_offset_unchanged() {
+    // Low watermark = 0, sink starts at 7. The bootstrap branch must
+    // NOT advance expected — the loop runs from 7 as today.
+    let source = MockSource::new([
+        MockSourceEvent::Record(rec(7)),
+        MockSourceEvent::Error("stop".into()),
+    ])
+    .with_low_watermark(0);
+    let sink = MockSink::starting_at(7);
+    let inspector = WriteInspector::wrap(sink);
+    let handle = inspector.handle();
+
+    let result = drive(run_mirror(source, handle, never()));
+    assert!(
+        matches!(result, Err(MirrorError::Source(_))),
+        "got: {result:?}"
+    );
+    let writes = inspector.into_writes();
+    assert_eq!(
+        writes.iter().map(|r| r.source_offset).collect::<Vec<_>>(),
+        vec![7]
+    );
+}
+
+#[test]
 fn graceful_shutdown_calls_flush_and_returns_ok() {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;

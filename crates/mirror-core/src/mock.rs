@@ -14,6 +14,7 @@ use crate::{Record, Sink, SinkError, Source, SourceError, TimestampType};
 pub struct MockSource {
     events: VecDeque<MockSourceEvent>,
     pub seeks: Vec<u64>,
+    pub low_watermark: u64,
 }
 
 pub enum MockSourceEvent {
@@ -32,7 +33,15 @@ impl MockSource {
         Self {
             events: events.into_iter().collect(),
             seeks: Vec::new(),
+            low_watermark: 0,
         }
+    }
+
+    /// Configure the value returned by [`Source::low_watermark`]. Used
+    /// by tests that simulate a compacted or trimmed source topic.
+    pub fn with_low_watermark(mut self, low_watermark: u64) -> Self {
+        self.low_watermark = low_watermark;
+        self
     }
 }
 
@@ -54,6 +63,10 @@ impl Source for MockSource {
                 unreachable!()
             }
         }
+    }
+
+    async fn low_watermark(&mut self) -> Result<u64, SourceError> {
+        Ok(self.low_watermark)
     }
 }
 
@@ -83,6 +96,10 @@ pub struct MockSink {
     pub write_error: Option<SinkError>,
     /// Starting position used when `position_program` is empty.
     pub running_position: u64,
+    /// Value returned by [`Sink::allows_compacted_source`]. Defaults
+    /// to false (append-mode behaviour) and is set true by tests
+    /// simulating a compaction:log destination.
+    pub allows_compacted_source: bool,
 }
 
 impl MockSink {
@@ -92,6 +109,7 @@ impl MockSink {
             writes: Vec::new(),
             write_error: None,
             running_position: offset,
+            allows_compacted_source: false,
         }
     }
 
@@ -102,6 +120,15 @@ impl MockSink {
 
     pub fn with_write_error(mut self, err: SinkError) -> Self {
         self.write_error = Some(err);
+        self
+    }
+
+    /// Configure the boolean returned by
+    /// [`Sink::allows_compacted_source`]. The realistic value follows
+    /// the destination's compaction mode (true for compaction:log,
+    /// false for append).
+    pub fn with_allows_compacted_source(mut self, allows: bool) -> Self {
+        self.allows_compacted_source = allows;
         self
     }
 }
@@ -128,6 +155,17 @@ impl Sink for MockSink {
         }
         self.running_position += 1;
         self.writes.push(record);
+        Ok(())
+    }
+
+    fn allows_compacted_source(&self) -> bool {
+        self.allows_compacted_source
+    }
+
+    async fn align_to_source_low_watermark(&mut self, low_watermark: u64) -> Result<(), SinkError> {
+        // Mirror the real sinks: advance the in-memory position so
+        // the next `write()` accepts a record at `low_watermark`.
+        self.running_position = low_watermark;
         Ok(())
     }
 }

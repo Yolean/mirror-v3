@@ -375,7 +375,11 @@ impl Sink for FilesystemSink {
                 pos
             }
         };
-        if on_disk != self.durable_position {
+        // Drift = disk advanced PAST our in-memory view (out-of-band
+        // write). The reverse (in-memory ahead of disk) is normal
+        // immediately after `align_to_source_low_watermark` and stays
+        // until the first flush, so we tolerate it.
+        if on_disk > self.durable_position {
             return Err(SinkError::UnexpectedPosition {
                 expected: self.durable_position,
                 actual: on_disk,
@@ -453,6 +457,37 @@ impl Sink for FilesystemSink {
 
     async fn flush(&mut self) -> Result<(), SinkError> {
         self.flush_now().await
+    }
+
+    fn allows_compacted_source(&self) -> bool {
+        matches!(self.compaction, Some(CompactionMode::Log))
+    }
+
+    async fn align_to_source_low_watermark(&mut self, low_watermark: u64) -> Result<(), SinkError> {
+        // The loop only calls this when `allows_compacted_source`
+        // returned true (i.e. we're in compaction:log mode) and the
+        // sink's prior `next_expected_offset` was strictly less than
+        // `low_watermark`. Refuse silently surprising calls.
+        if !matches!(self.compaction, Some(CompactionMode::Log)) {
+            return Err(SinkError::Transport(
+                "align_to_source_low_watermark called on non-compaction sink".into(),
+            ));
+        }
+        if !self.buffer.is_empty() || low_watermark < self.durable_position {
+            return Err(SinkError::Transport(format!(
+                "align_to_source_low_watermark called in inconsistent state: buffer={} durable={} low_watermark={}",
+                self.buffer.len(),
+                self.durable_position,
+                low_watermark,
+            )));
+        }
+        // Advance the sink's view of "where the next snapshot starts"
+        // to the broker's low watermark. The compaction-mode chain
+        // explicitly allows gaps (see `scan_validate_compacted`), so
+        // the next flushed snapshot's filename will be `low_watermark-to.ext`
+        // and the on-disk gap from the prior `durable_position` is fine.
+        self.durable_position = low_watermark;
+        Ok(())
     }
 }
 
