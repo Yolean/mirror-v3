@@ -99,6 +99,7 @@ impl KafkaSourceConfig {
 
 pub struct KafkaSource {
     consumer: StreamConsumer,
+    bootstrap_servers: String,
     topic: String,
     partition: i32,
     poll_timeout: Duration,
@@ -120,6 +121,7 @@ impl KafkaSource {
             .map_err(|e| KafkaError::Init(e.to_string()))?;
         Ok(Self {
             consumer,
+            bootstrap_servers: cfg.bootstrap_servers,
             topic: cfg.topic,
             partition: cfg.partition,
             poll_timeout: cfg.poll_timeout,
@@ -162,17 +164,33 @@ impl Source for KafkaSource {
     }
 
     async fn low_watermark(&mut self) -> Result<u64, SourceError> {
-        // Synchronous metadata fetch; bounded by `DEFAULT_WATERMARK_TIMEOUT`
-        // and only called at startup, so we don't go through
-        // spawn_blocking.
-        let (low, _high) = self
-            .consumer
-            .fetch_watermarks(
-                &self.topic,
-                self.partition,
-                Timeout::After(DEFAULT_WATERMARK_TIMEOUT),
-            )
-            .map_err(|e| SourceError::Transport(format!("fetch_watermarks: {e}")))?;
+        // Issue a fresh `BaseConsumer`-backed watermark query via
+        // `spawn_blocking`. Calling `fetch_watermarks` directly on
+        // the `StreamConsumer` was unreliable in production: the
+        // StreamConsumer's internal poll thread may not yet have
+        // connected to the broker or fetched topic metadata by the
+        // time bootstrap calls this, in which case librdkafka
+        // returns Ok((0, 0)) (the "unknown" sentinel mapped to 0)
+        // immediately. The mirror would then seek(0), the broker
+        // would deliver its actual earliest offset (e.g. 461 on a
+        // trimmed/compacted topic), and the bootstrap branch in
+        // `mirror_core::run_mirror_with_heartbeat` would never
+        // trigger because `0 < 0` is false.
+        //
+        // `fetch_low_watermark` matches the proven pattern used by
+        // `KafkaSink::fetch_high_watermark` and the cache-readiness
+        // gate in mirror-bin: a fresh `BaseConsumer` whose own
+        // poll loop drives the metadata fetch synchronously inside
+        // the call.
+        let bootstrap = self.bootstrap_servers.clone();
+        let topic = self.topic.clone();
+        let partition = self.partition;
+        let low = tokio::task::spawn_blocking(move || {
+            fetch_low_watermark(&bootstrap, &topic, partition, DEFAULT_WATERMARK_TIMEOUT)
+        })
+        .await
+        .map_err(|e| SourceError::Transport(format!("low_watermark join: {e}")))?
+        .map_err(|e| SourceError::Transport(format!("fetch_low_watermark: {e}")))?;
         Ok(low.max(0) as u64)
     }
 }
