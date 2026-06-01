@@ -129,14 +129,24 @@ fn run_validate(path: PathBuf) -> Result<()> {
     let cfg = mirror_config::load_from_path(&path)
         .with_context(|| format!("loading {}", path.display()))?;
     let total_destinations: usize = cfg.mirrors.iter().map(|m| m.destinations.len()).sum();
-    println!(
-        "OK: {} mirror(s), {total_destinations} destination(s) total",
-        cfg.mirrors.len()
-    );
+    let disabled = cfg.mirrors.iter().filter(|m| !m.is_enabled()).count();
+    if disabled == 0 {
+        println!(
+            "OK: {} mirror(s), {total_destinations} destination(s) total",
+            cfg.mirrors.len()
+        );
+    } else {
+        println!(
+            "OK: {} mirror(s) ({} enabled, {disabled} disabled), {total_destinations} destination(s) total",
+            cfg.mirrors.len(),
+            cfg.mirrors.len() - disabled,
+        );
+    }
     for m in &cfg.mirrors {
         let kinds: Vec<&str> = m.destinations.iter().map(|d| destination_type(d)).collect();
+        let enabled_tag = if m.is_enabled() { "" } else { " [DISABLED]" };
         println!(
-            "  mirror {:?}: destinations = [{}]",
+            "  mirror {:?}{enabled_tag}: destinations = [{}]",
             m.name,
             kinds.join(", ")
         );
@@ -426,10 +436,32 @@ fn print_status_table(rows: &[StatusRow]) {
 async fn run(path: PathBuf) -> Result<()> {
     let cfg = mirror_config::load_from_path(&path)
         .with_context(|| format!("loading {}", path.display()))?;
-    let total_destinations: usize = cfg.mirrors.iter().map(|m| m.destinations.len()).sum();
+
+    // Drop disabled mirrors before anything else so the cache state,
+    // readiness gate and spawn loop only see what we'll actually run.
+    // Disabled mirrors are validated identically to enabled ones, so
+    // flipping `enabled: false` → `true` won't surface latent bugs.
+    let total_mirrors = cfg.mirrors.len();
+    let enabled_mirrors: Vec<&mirror_config::Mirror> =
+        cfg.mirrors.iter().filter(|m| m.is_enabled()).collect();
+    for m in &cfg.mirrors {
+        if !m.is_enabled() {
+            tracing::info!(mirror = %m.name, "mirror disabled via `enabled: false`; not spawning");
+        }
+    }
+    if enabled_mirrors.is_empty() {
+        anyhow::bail!(
+            "all {} mirror(s) are disabled (enabled: false); nothing to do — \
+             enable at least one mirror or scale this deployment to zero replicas",
+            total_mirrors
+        );
+    }
+
+    let total_destinations: usize = enabled_mirrors.iter().map(|m| m.destinations.len()).sum();
     tracing::info!(
         config = %path.display(),
-        mirrors = cfg.mirrors.len(),
+        mirrors_enabled = enabled_mirrors.len(),
+        mirrors_total = total_mirrors,
         destinations = total_destinations,
         "starting mirror-v3"
     );
@@ -462,14 +494,17 @@ async fn run(path: PathBuf) -> Result<()> {
         }
     }
 
-    // Build a shared CacheState if any mirror opted into http-access.
-    // Capture each opt-in mirror's source-partition high-watermark *now*
-    // so the readiness gate flips only after we've consumed past
-    // whatever was already there at startup. (KKV semantics — dependents
-    // must not see a partially-rebuilt cache after a reload.)
-    let cache_state = if cfg.mirrors.iter().any(|m| m.http_access.is_some()) {
+    // Build a shared CacheState if any *enabled* mirror opted into
+    // http-access. Capture each opt-in mirror's source-partition
+    // high-watermark *now* so the readiness gate flips only after
+    // we've consumed past whatever was already there at startup. (KKV
+    // semantics — dependents must not see a partially-rebuilt cache
+    // after a reload.) Disabled mirrors never register, otherwise
+    // their slot would never flip ready and the whole cache would
+    // sit at 503 forever.
+    let cache_state = if enabled_mirrors.iter().any(|m| m.http_access.is_some()) {
         let state = std::sync::Arc::new(mirror_core::CacheState::new());
-        for m in &cfg.mirrors {
+        for m in &enabled_mirrors {
             if m.http_access.is_some() {
                 let hwm = fetch_hwm_for_mirror(m).await?;
                 tracing::info!(
@@ -510,10 +545,10 @@ async fn run(path: PathBuf) -> Result<()> {
         });
     }
 
-    let mut handles = Vec::with_capacity(cfg.mirrors.len());
-    for mirror in &cfg.mirrors {
+    let mut handles = Vec::with_capacity(enabled_mirrors.len());
+    for mirror in &enabled_mirrors {
         let binding = mirror_cache_binding(mirror, cache_state.as_ref());
-        let handle = spawn_mirror(mirror.clone(), shutdown_rx.clone(), binding).await?;
+        let handle = spawn_mirror((*mirror).clone(), shutdown_rx.clone(), binding).await?;
         handles.push((mirror.name.clone(), handle));
     }
 

@@ -44,12 +44,15 @@ fn parses_minimal_kafka_config() {
                 flush: None,
                 timestamp_mode: None,
                 http_access: None,
+                enabled: None,
             }],
         }
     );
     // Kafka destination defaults: name → mirror.name, topic → mirror.topic
     let dest = &cfg.mirrors[0].destinations[0];
     assert_eq!(dest.effective_name(&cfg.mirrors[0].name), "operations");
+    // Defaults: enabled is None in YAML, is_enabled() reports true.
+    assert!(cfg.mirrors[0].is_enabled());
 }
 
 #[test]

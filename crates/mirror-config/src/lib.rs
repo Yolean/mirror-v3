@@ -194,6 +194,38 @@ pub struct Mirror {
     /// with the same `api` are unioned into a single keyspace.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub http_access: Option<HttpAccess>,
+
+    /// Whether mirror-v3 should actually spawn this mirror at
+    /// startup. Defaults to `true`. Plain YAML boolean only —
+    /// `true` / `false` (and the YAML-1.2 case variants
+    /// `True`/`False`/`TRUE`/`FALSE`). The YAML-1.1 truthy/falsy
+    /// strings (`yes`/`no`/`on`/`off`) are deliberately NOT
+    /// accepted; operators who want to flip a mirror via env
+    /// interpolation should write the env value as `true` or
+    /// `false`:
+    ///
+    /// ```yaml
+    /// - name: requests
+    ///   enabled: ${REQUESTS_ENABLED:-false}
+    ///   ...
+    /// ```
+    ///
+    /// Disabled mirrors are validated the same as enabled ones (so
+    /// flipping `false` → `true` won't surface latent config bugs)
+    /// but are not spawned, do not register with the cache-v1
+    /// readiness gate, and do not contribute to source-broker reads.
+    /// If *every* mirror in a process is disabled, startup fails
+    /// loudly so a misconfigured deployment doesn't silently idle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+}
+
+impl Mirror {
+    /// Whether this mirror is enabled (default `true` when the
+    /// `enabled` field is omitted in YAML).
+    pub fn is_enabled(&self) -> bool {
+        self.enabled.unwrap_or(true)
+    }
 }
 
 /// HTTP read-access block. Today the only variant is the KKV-compatible

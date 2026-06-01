@@ -131,6 +131,13 @@
               "type": "null"
             }
           ]
+        },
+        "enabled": {
+          "description": "Whether mirror-v3 should actually spawn this mirror at\nstartup. Defaults to `true`. Plain YAML boolean only —\n`true` / `false` (and the YAML-1.2 case variants\n`True`/`False`/`TRUE`/`FALSE`). The YAML-1.1 truthy/falsy\nstrings (`yes`/`no`/`on`/`off`) are deliberately NOT\naccepted; operators who want to flip a mirror via env\ninterpolation should write the env value as `true` or\n`false`:\n\n```yaml\n- name: requests\n  enabled: ${REQUESTS_ENABLED:-false}\n  ...\n```\n\nDisabled mirrors are validated the same as enabled ones (so\nflipping `false` → `true` won't surface latent config bugs)\nbut are not spawned, do not register with the cache-v1\nreadiness gate, and do not contribute to source-broker reads.\nIf *every* mirror in a process is disabled, startup fails\nloudly so a misconfigured deployment doesn't silently idle.",
+          "type": [
+            "boolean",
+            "null"
+          ]
         }
       },
       "additionalProperties": false,
