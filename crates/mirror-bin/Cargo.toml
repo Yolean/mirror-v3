@@ -19,10 +19,12 @@ mirror-envelope = { workspace = true }
 mirror-kafka = { workspace = true }
 mirror-fs = { workspace = true }
 mirror-s3 = { workspace = true }
+mirror-notify-kkv = { workspace = true }
 object_store = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
 tokio = { workspace = true }
+async-trait = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 serde = { workspace = true }

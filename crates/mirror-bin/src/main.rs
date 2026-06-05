@@ -5,7 +5,10 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use mirror_config::{Destination, Mirror};
-use mirror_core::{run_mirror, MetricLabels, MIRROR_LABELS};
+use mirror_core::{
+    heartbeat_interval_from_env, run_mirror_with_notifier, MetricLabels, NoOpNotifier, Record,
+    Sink, SinkError, MIRROR_LABELS,
+};
 use mirror_fs::{FilesystemSink, FilesystemSinkConfig};
 use mirror_kafka::{KafkaSink, KafkaSinkConfig, KafkaSource, KafkaSourceConfig};
 use mirror_s3::{S3Sink, S3SinkConfig};
@@ -671,23 +674,57 @@ async fn spawn_mirror(
     // Build one inner Sink per destination, then wrap them in a tee.
     // The single-destination case routes through a length-1 tee too —
     // this keeps the cache binding's per-record fanout on a single
-    // code path.
-    let mut inners: Vec<(String, Box<dyn mirror_core::Sink>)> =
-        Vec::with_capacity(mirror.destinations.len());
+    // code path. A *notify-only* mirror (no destinations + a notify
+    // block, validated upstream) wraps a single in-memory
+    // [`NotifyOnlySink`] in the tee so the rest of the run loop —
+    // bootstrap, low-watermark alignment, idle-drift checks — keeps
+    // its existing shape.
+    let mut inners: Vec<(String, Box<dyn Sink>)> = Vec::with_capacity(
+        // +1 reserved for the notify-only path; harmless when
+        // destinations is non-empty.
+        mirror.destinations.len().max(1),
+    );
     let mut dest_descriptions: Vec<String> = Vec::with_capacity(mirror.destinations.len());
     for dest in &mirror.destinations {
         let inner_name = dest.effective_name(&mirror.name);
         let kind = destination_type(dest);
         dest_descriptions.push(format!("{inner_name}({kind})"));
-        let sink: Box<dyn mirror_core::Sink> =
+        let sink: Box<dyn Sink> =
             open_inner_sink(dest, &mirror, &inner_name, cache.as_ref()).await?;
         inners.push((inner_name, sink));
+    }
+    if inners.is_empty() {
+        // Notify-only mirror: spec says "On every startup the source
+        // seeks to the broker's low watermark". `NotifyOnlySink`
+        // declares `allows_compacted_source = true` so the run loop's
+        // bootstrap branch aligns the (in-memory) head to
+        // `low_watermark`. The notifier sees every record from there
+        // forward.
+        inners.push((
+            "notify-only".to_string(),
+            Box::new(NotifyOnlySink::default()) as Box<dyn Sink>,
+        ));
+        dest_descriptions.push("notify-only".to_string());
     }
     let tee = mirror_core::TeeSink::open(inners, cache.clone())
         .await
         .map_err(|e| anyhow::anyhow!("opening tee for mirror {name}: {e}"))?;
 
+    // Build the notifier from `mirror.notify` if present, else fall
+    // back to the no-op notifier. The two branches monomorphise
+    // `run_mirror_with_notifier` against different `N` types — no
+    // boxing needed.
+    let notifier_opt = build_notifier(&mirror).await?;
+
     let destinations_log = dest_descriptions.join(",");
+    let notify_log = match &mirror.notify {
+        Some(n) => {
+            let targets: Vec<&str> = n.targets.iter().map(|t| t.url.as_str()).collect();
+            format!(" notify=kkv-v1[{}]", targets.join(","))
+        }
+        None => String::new(),
+    };
+
     // Single span carries `mirror = <name>` onto every event emitted
     // from the spawned task — including the mirror-core logs
     // (`starting mirror`, `heartbeat`, etc.) that don't otherwise have
@@ -699,14 +736,38 @@ async fn spawn_mirror(
             tracing::info!(
                 destinations = %destinations_log,
                 compaction,
+                notify = %notify_log,
                 "loop start"
             );
-            let result = MIRROR_LABELS
-                .scope(
-                    labels,
-                    run_mirror(source, tee, shutdown_signal(shutdown_rx)),
-                )
-                .await;
+            let heartbeat = heartbeat_interval_from_env();
+            let shutdown = shutdown_signal(shutdown_rx);
+            // Match-on-notifier so the generic `N: Notifier`
+            // monomorphises with the right concrete type per branch
+            // without a `Box<dyn Notifier>` allocation.
+            let result = match notifier_opt {
+                Some(n) => {
+                    MIRROR_LABELS
+                        .scope(
+                            labels,
+                            run_mirror_with_notifier(source, tee, n, shutdown, heartbeat),
+                        )
+                        .await
+                }
+                None => {
+                    MIRROR_LABELS
+                        .scope(
+                            labels,
+                            run_mirror_with_notifier(
+                                source,
+                                tee,
+                                NoOpNotifier,
+                                shutdown,
+                                heartbeat,
+                            ),
+                        )
+                        .await
+                }
+            };
             match result {
                 Ok(()) => Ok(()),
                 Err(e) => Err(anyhow::anyhow!("mirror {name}: {e}")),
@@ -714,6 +775,65 @@ async fn spawn_mirror(
         }
         .instrument(span),
     ))
+}
+
+/// Construct the `KkvV1Notifier` for a mirror, or `None` if the
+/// mirror has no `notify:` block. Failures bubble up so the
+/// supervisor refuses to spawn a mirror whose webhook surface can't
+/// possibly work, instead of crashing on the first record.
+async fn build_notifier(mirror: &Mirror) -> Result<Option<mirror_notify_kkv::KkvV1Notifier>> {
+    let Some(notify) = mirror.notify.as_ref() else {
+        return Ok(None);
+    };
+    // Only kkv-v1 exists today; validator rejects other api: values.
+    let notifier = mirror_notify_kkv::KkvV1Notifier::from_config(
+        notify,
+        mirror.topic.clone(),
+        mirror.partition as i32,
+    )
+    .with_context(|| format!("building notify dispatcher for mirror {}", mirror.name))?;
+    Ok(Some(notifier))
+}
+
+/// In-memory sink for `destinations: []` notify-only mirrors. Holds
+/// only its own "next expected offset" and accepts any record at or
+/// above it. `allows_compacted_source = true` so the run loop's
+/// bootstrap branch can align the head to the broker's low
+/// watermark — matching the spec's "seeks to low watermark on every
+/// startup" behaviour for notify-only mirrors.
+#[derive(Debug, Default)]
+struct NotifyOnlySink {
+    position: u64,
+}
+
+#[async_trait::async_trait]
+impl Sink for NotifyOnlySink {
+    async fn next_expected_offset(&mut self) -> Result<u64, SinkError> {
+        Ok(self.position)
+    }
+
+    async fn write(&mut self, record: Record) -> Result<(), SinkError> {
+        if record.source_offset < self.position {
+            return Err(SinkError::UnexpectedPosition {
+                expected: self.position,
+                actual: record.source_offset,
+            });
+        }
+        // Accept forward gaps under compaction:log; bump position to
+        // `record.source_offset + 1`. Matches the loosened write
+        // contract in `mirror-fs` / `mirror-s3` for compacted sources.
+        self.position = record.source_offset + 1;
+        Ok(())
+    }
+
+    fn allows_compacted_source(&self) -> bool {
+        true
+    }
+
+    async fn align_to_source_low_watermark(&mut self, low_watermark: u64) -> Result<(), SinkError> {
+        self.position = low_watermark;
+        Ok(())
+    }
 }
 
 async fn open_inner_sink(

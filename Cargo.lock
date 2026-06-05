@@ -1741,6 +1741,7 @@ name = "mirror-bin"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "clap",
  "metrics",
  "metrics-exporter-prometheus",
@@ -1750,6 +1751,7 @@ dependencies = [
  "mirror-envelope",
  "mirror-fs",
  "mirror-kafka",
+ "mirror-notify-kkv",
  "mirror-s3",
  "object_store",
  "serde",
