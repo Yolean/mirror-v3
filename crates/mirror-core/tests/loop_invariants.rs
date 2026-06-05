@@ -63,8 +63,9 @@ fn processes_records_in_order() {
 }
 
 #[test]
-fn errors_on_source_offset_gap() {
-    // Source skips from 10 directly to 12 — must be rejected.
+fn errors_on_source_offset_gap_in_append_mode() {
+    // Source skips from 10 directly to 12 — must be rejected in
+    // append mode (sink does NOT allow_compacted_source).
     let source = MockSource::new([
         MockSourceEvent::Record(rec(10)),
         MockSourceEvent::Record(rec(12)),
@@ -73,12 +74,100 @@ fn errors_on_source_offset_gap() {
 
     let result = drive(run_mirror(source, sink, never()));
     match result {
-        Err(MirrorError::SourceOffsetMismatch { expected, actual }) => {
+        Err(MirrorError::SourceGapAboveExpected { expected, got }) => {
             assert_eq!(expected, 11);
-            assert_eq!(actual, 12);
+            assert_eq!(got, 12);
         }
-        other => panic!("expected SourceOffsetMismatch, got {other:?}"),
+        other => panic!("expected SourceGapAboveExpected, got {other:?}"),
     }
+}
+
+#[test]
+fn errors_on_source_going_backwards() {
+    // Source delivers 10 then 9. Always a hard error, in any
+    // compaction mode — destination chain can't un-commit.
+    let source = MockSource::new([
+        MockSourceEvent::Record(rec(10)),
+        MockSourceEvent::Record(rec(9)),
+    ]);
+    let sink = MockSink::starting_at(10).with_allows_compacted_source(true);
+
+    let result = drive(run_mirror(source, sink, never()));
+    match result {
+        Err(MirrorError::SourceWentBackwards { expected, got }) => {
+            assert_eq!(expected, 11);
+            assert_eq!(got, 9);
+        }
+        other => panic!("expected SourceWentBackwards, got {other:?}"),
+    }
+}
+
+#[test]
+fn compaction_log_accepts_gap_from_compact_only_topic() {
+    // The scenario the upstream c2e64c11 bootstrap branch misses:
+    // `cleanup.policy=compact` leaves LogStartOffset = 0 so the
+    // broker reports low_watermark = 0, the bootstrap pre-align is
+    // a no-op, the loop seeks(0), and then the broker delivers a
+    // record at offset 461 (the earliest deliverable record after
+    // key dedup). Under compaction:log, the gap is legitimate — the
+    // loop must align the sink to the delivered offset and accept
+    // the record.
+    let source = MockSource::new([
+        MockSourceEvent::Record(rec(461)),
+        MockSourceEvent::Error("stop".into()),
+    ])
+    .with_low_watermark(0); // broker reports 0 for compact-only topic
+    let sink = MockSink::starting_at(0).with_allows_compacted_source(true);
+    let inspector = WriteInspector::wrap(sink);
+    let handle = inspector.handle();
+
+    let result = drive(run_mirror(source, handle, never()));
+    assert!(
+        matches!(result, Err(MirrorError::Source(_))),
+        "loop should exit on the source error after the aligned write, got: {result:?}"
+    );
+    let writes = inspector.into_writes();
+    assert_eq!(
+        writes.iter().map(|r| r.source_offset).collect::<Vec<_>>(),
+        vec![461],
+        "the delivered record at offset 461 must be accepted under compaction:log \
+         even though the bootstrap branch didn't pre-align (low_watermark was 0)"
+    );
+}
+
+#[test]
+fn compaction_log_accepts_repeated_gaps_mid_stream() {
+    // Production repro: after the first aligned write at offset 461,
+    // the broker delivers offset 466 (gap of 4 — keys 462..465 were
+    // dominated by later records and dropped by compaction). The buffer
+    // is no longer empty so the old code's mid-stream
+    // `align_to_source_low_watermark` call tripped the sink's
+    // empty-buffer invariant. The fix moves gap acceptance into the
+    // sink's `write` (loosened under compaction:log); the run loop
+    // just bumps `expected` and writes.
+    let source = MockSource::new([
+        MockSourceEvent::Record(rec(461)),
+        MockSourceEvent::Record(rec(466)),
+        MockSourceEvent::Record(rec(470)),
+        MockSourceEvent::Error("stop".into()),
+    ])
+    .with_low_watermark(0);
+    let sink = MockSink::starting_at(0).with_allows_compacted_source(true);
+    let inspector = WriteInspector::wrap(sink);
+    let handle = inspector.handle();
+
+    let result = drive(run_mirror(source, handle, never()));
+    assert!(
+        matches!(result, Err(MirrorError::Source(_))),
+        "loop should exit on the source error after the gapped writes, got: {result:?}"
+    );
+    let writes = inspector.into_writes();
+    assert_eq!(
+        writes.iter().map(|r| r.source_offset).collect::<Vec<_>>(),
+        vec![461, 466, 470],
+        "all delivered records must be accepted under compaction:log; \
+         gaps between them are legitimate upstream compaction"
+    );
 }
 
 #[test]
@@ -150,10 +239,14 @@ fn empty_destination_starts_at_zero_and_processes_first_record() {
 #[test]
 fn compacted_source_with_compaction_log_advances_to_low_watermark() {
     // Sink is empty (start = 0) and reports it tolerates a compacted
-    // source. The broker has trimmed offsets 0..460, so the earliest
-    // available offset is 461. The loop must seek to 461 and accept
-    // record 461 as the first record (rather than tripping
-    // SourceOffsetMismatch on "expected 0, got 461").
+    // source. The broker has trimmed offsets 0..460 (delete-records
+    // case — low_watermark reports the advanced value), so the
+    // earliest available offset is 461. The loop's bootstrap branch
+    // must seek to 461 and accept record 461 as the first record
+    // (rather than tripping SourceGapAboveExpected on "expected 0, got
+    // 461"). Cf. `compaction_log_accepts_gap_from_compact_only_topic`
+    // which covers the cleanup.policy=compact case where low_watermark
+    // stays 0 and the alignment happens at first delivery instead.
     let source = MockSource::new([
         MockSourceEvent::Record(rec(461)),
         MockSourceEvent::Error("stop".into()),
@@ -281,6 +374,7 @@ use std::sync::{Arc, Mutex};
 struct WriteInspector {
     writes: Arc<Mutex<Vec<Record>>>,
     position: Arc<Mutex<u64>>,
+    allows_compacted_source: bool,
 }
 
 impl WriteInspector {
@@ -288,12 +382,14 @@ impl WriteInspector {
         Self {
             writes: Arc::new(Mutex::new(sink.writes)),
             position: Arc::new(Mutex::new(sink.running_position)),
+            allows_compacted_source: sink.allows_compacted_source,
         }
     }
     fn handle(&self) -> InspectorSink {
         InspectorSink {
             writes: Arc::clone(&self.writes),
             position: Arc::clone(&self.position),
+            allows_compacted_source: self.allows_compacted_source,
         }
     }
     fn into_writes(self) -> Vec<Record> {
@@ -307,6 +403,7 @@ impl WriteInspector {
 struct InspectorSink {
     writes: Arc<Mutex<Vec<Record>>>,
     position: Arc<Mutex<u64>>,
+    allows_compacted_source: bool,
 }
 
 #[async_trait::async_trait]
@@ -316,14 +413,32 @@ impl mirror_core::Sink for InspectorSink {
     }
     async fn write(&mut self, record: Record) -> Result<(), SinkError> {
         let mut pos = self.position.lock().unwrap();
-        if record.source_offset != *pos {
+        if record.source_offset < *pos {
             return Err(SinkError::UnexpectedPosition {
                 expected: *pos,
                 actual: record.source_offset,
             });
         }
-        *pos += 1;
+        if !self.allows_compacted_source && record.source_offset != *pos {
+            return Err(SinkError::UnexpectedPosition {
+                expected: *pos,
+                actual: record.source_offset,
+            });
+        }
+        // Mirrors mirror-fs / mirror-s3 semantics: append mode is
+        // strict, compaction:log accepts forward gaps and bumps the
+        // tracker to the delivered offset + 1.
+        *pos = record.source_offset + 1;
         self.writes.lock().unwrap().push(record);
+        Ok(())
+    }
+    fn allows_compacted_source(&self) -> bool {
+        self.allows_compacted_source
+    }
+    async fn align_to_source_low_watermark(&mut self, low_watermark: u64) -> Result<(), SinkError> {
+        // Same semantics as MockSink's impl: bump running position so
+        // the next write() at `low_watermark` succeeds.
+        *self.position.lock().unwrap() = low_watermark;
         Ok(())
     }
 }

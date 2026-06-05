@@ -7,6 +7,11 @@
 //! `SourceOffsetMismatch` after polling — would leave operators
 //! debugging a gap in the destination chain that mirror-v3 knew
 //! about all along.
+//!
+//! Naming note: the "old `SourceOffsetMismatch`" referenced in the
+//! body of this file has since been split into `SourceWentBackwards`
+//! and `SourceGapAboveExpected`; the latter is the variant that
+//! would fire here today if the bootstrap branch didn't pre-empt it.
 
 use std::time::Duration;
 

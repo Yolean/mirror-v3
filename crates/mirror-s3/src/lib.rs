@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::StreamExt;
-use mirror_core::{Record, Sink, SinkError};
+use mirror_core::{FlushTrigger, Record, Sink, SinkError};
 use mirror_envelope::{ColumnType, Format, ParquetCompression};
 use mirror_fs::naming;
 use object_store::path::Path;
@@ -185,7 +185,7 @@ impl S3Sink {
             return Ok(());
         }
         if !self.buffer.is_empty() {
-            self.flush_locked().await?;
+            self.flush_locked(FlushTrigger::Daily).await?;
         }
         let mut t = next;
         let now = (self.clock)();
@@ -200,26 +200,61 @@ impl S3Sink {
         if self.buffer.is_empty() {
             return Ok(());
         }
-        self.flush_locked().await
+        self.flush_locked(FlushTrigger::Explicit).await
     }
 
-    fn should_flush(&self) -> bool {
-        if self.buffer.is_empty() {
-            return false;
+    /// Lowest source-offset the sink will accept on the next `write`.
+    /// Append mode: `durable_position + buffer.len()` (contiguous chain).
+    /// Compaction:log: `last_buffered.source_offset + 1` (or
+    /// `durable_position` when the buffer is empty), so the buffer may
+    /// carry gaps in its source-offset sequence — see mirror-fs.
+    fn buffered_head(&self) -> u64 {
+        match self.compaction {
+            Some(CompactionMode::Log) => self
+                .buffer
+                .last()
+                .map(|r| r.source_offset + 1)
+                .unwrap_or(self.durable_position),
+            _ => self.durable_position + self.buffer.len() as u64,
         }
-        self.buffer.len() as u64 >= self.flush.max_offsets
-            || self.buffer_bytes >= self.flush.max_bytes
-            || self
-                .buffer_started
-                .map(|t| t.elapsed() >= self.flush.max_time)
-                .unwrap_or(false)
     }
 
-    async fn flush_locked(&mut self) -> Result<(), SinkError> {
+    fn should_flush(&self) -> Option<FlushTrigger> {
+        if self.buffer.is_empty() {
+            return None;
+        }
+        if self.buffer.len() as u64 >= self.flush.max_offsets {
+            return Some(FlushTrigger::MaxOffsets);
+        }
+        if self.buffer_bytes >= self.flush.max_bytes {
+            return Some(FlushTrigger::MaxBytes);
+        }
+        if self
+            .buffer_started
+            .map(|t| t.elapsed() >= self.flush.max_time)
+            .unwrap_or(false)
+        {
+            return Some(FlushTrigger::MaxTime);
+        }
+        None
+    }
+
+    async fn flush_locked(&mut self, trigger: FlushTrigger) -> Result<(), SinkError> {
         debug_assert!(!self.buffer.is_empty());
         let flush_started = Instant::now();
         let from = self.durable_position;
-        let to = self.durable_position + self.buffer.len() as u64 - 1;
+        let to = match self.compaction {
+            // Under compaction:log the buffer may contain gaps in its
+            // source-offset sequence; the snapshot covers everything
+            // from `durable_position` through the highest-seen offset.
+            // See mirror-fs flush_locked for the same reasoning.
+            Some(CompactionMode::Log) => self
+                .buffer
+                .last()
+                .map(|r| r.source_offset)
+                .expect("buffer non-empty by debug_assert above"),
+            _ => self.durable_position + self.buffer.len() as u64 - 1,
+        };
         let count = self.buffer.len();
         let buffered_bytes = self.buffer_bytes;
         let name = naming::batch_filename(from, to, self.format.extension());
@@ -308,6 +343,7 @@ impl S3Sink {
             encoded_bytes,
             elapsed_ms,
             interval_ms,
+            trigger = trigger.as_str(),
             "flushed batch"
         );
         Ok(())
@@ -343,13 +379,25 @@ impl Sink for S3Sink {
                 actual: on_remote,
             });
         }
-        Ok(self.durable_position + self.buffer.len() as u64)
+        Ok(self.buffered_head())
     }
 
     async fn write(&mut self, record: Record) -> Result<(), SinkError> {
         self.tick_daily().await?;
-        let expected = self.durable_position + self.buffer.len() as u64;
-        if record.source_offset != expected {
+        let expected = self.buffered_head();
+        // Backwards is always a hard error.
+        if record.source_offset < expected {
+            return Err(SinkError::UnexpectedPosition {
+                expected,
+                actual: record.source_offset,
+            });
+        }
+        // Append mode rejects forward gaps too; compaction:log accepts
+        // them (the snapshot only stores latest-per-key, so the
+        // upstream-compacted intermediate offsets are legitimately
+        // absent). See mirror-fs::write for the same logic.
+        if !matches!(self.compaction, Some(CompactionMode::Log)) && record.source_offset != expected
+        {
             return Err(SinkError::UnexpectedPosition {
                 expected,
                 actual: record.source_offset,
@@ -395,8 +443,8 @@ impl Sink for S3Sink {
         if self.buffer_started.is_none() {
             self.buffer_started = Some(Instant::now());
         }
-        if self.should_flush() {
-            self.flush_locked().await?;
+        if let Some(trigger) = self.should_flush() {
+            self.flush_locked(trigger).await?;
         }
         Ok(())
     }
