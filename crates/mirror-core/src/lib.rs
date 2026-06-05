@@ -310,6 +310,51 @@ pub trait Sink: Send {
     }
 }
 
+/// Per-mirror observer of records as they flow through the loop.
+/// Used to drive the opt-in `api: kkv-v1` outbound webhook surface
+/// (see `WEBHOOKS.md`) without coupling the run loop to HTTP.
+///
+/// Contract:
+/// - `on_record` is called **after** `sink.write(record)` succeeds.
+///   The loop has already validated the source-offset gate, so the
+///   record is guaranteed to be at the destination's authoritative
+///   next-offset. A `NotifyError` returned here aborts the loop and
+///   surfaces as [`MirrorError::Notify`] — same fail-fast contract as
+///   [`SinkError`].
+/// - `shutdown` is called once on graceful exit, after the final
+///   `sink.flush`. Implementations should drain any buffered webhook
+///   batches synchronously before returning.
+///
+/// Implementations live outside `mirror-core` so this crate stays
+/// HTTP-free. The default impl (no-op) is used by every mirror that
+/// doesn't opt into a `notify:` block in config.
+#[async_trait]
+pub trait Notifier: Send {
+    /// Observe a record that was just successfully written to the
+    /// destination chain. `record` carries the same fields the sink
+    /// saw; implementations should clone what they need and return
+    /// promptly so they don't block the consume loop.
+    async fn on_record(&mut self, record: &Record) -> Result<(), NotifyError> {
+        let _ = record;
+        Ok(())
+    }
+
+    /// Called once on graceful shutdown, after the final `sink.flush`.
+    /// Implementations with debounce/buffer state should flush it here.
+    async fn shutdown(&mut self) -> Result<(), NotifyError> {
+        Ok(())
+    }
+}
+
+/// Zero-cost [`Notifier`] used by every mirror that doesn't configure
+/// a `notify:` block. Keeps the run loop's signature generic without
+/// forcing every caller to plumb a real notifier.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NoOpNotifier;
+
+#[async_trait]
+impl Notifier for NoOpNotifier {}
+
 #[derive(Debug, Error)]
 pub enum SourceError {
     #[error("source transport: {0}")]
@@ -324,12 +369,29 @@ pub enum SinkError {
     Transport(String),
 }
 
+/// Error produced by a [`Notifier`]. `Transport` carries a single
+/// underlying failure (timeout, connrefused, http status…); `Exhausted`
+/// signals that the retry budget was spent without success — the
+/// `final` action in the `notify.outcomes.*` config table (`fail` for
+/// this variant) decides whether the run loop should propagate the
+/// error up. The notifier itself encodes that decision: an `accept` /
+/// `skip` outcome simply returns `Ok(())` and never surfaces here.
+#[derive(Debug, Error)]
+pub enum NotifyError {
+    #[error("notify transport: {0}")]
+    Transport(String),
+    #[error("notify retries exhausted after {attempts} attempt(s): {last_error}")]
+    Exhausted { attempts: u32, last_error: String },
+}
+
 #[derive(Debug, Error)]
 pub enum MirrorError {
     #[error(transparent)]
     Source(#[from] SourceError),
     #[error(transparent)]
     Sink(#[from] SinkError),
+    #[error(transparent)]
+    Notify(#[from] NotifyError),
     /// Source delivered an offset *below* `expected`. Always a hard
     /// error: a Kafka client bug, a producer that rewound, or a
     /// destination chain that has somehow advanced past the broker.
@@ -400,7 +462,9 @@ pub fn heartbeat_interval_from_env() -> std::time::Duration {
 ///
 /// Heartbeat interval is read from the environment; pass a fixed
 /// interval via [`run_mirror_with_heartbeat`] if you need explicit
-/// control (e.g. tests that want to disable heartbeats).
+/// control (e.g. tests that want to disable heartbeats). Callers that
+/// need to observe records (e.g. webhook fan-out) use
+/// [`run_mirror_with_notifier`].
 pub async fn run_mirror<S, K, F>(source: S, sink: K, shutdown: F) -> Result<(), MirrorError>
 where
     S: Source,
@@ -411,14 +475,37 @@ where
 }
 
 pub async fn run_mirror_with_heartbeat<S, K, F>(
-    mut source: S,
-    mut sink: K,
+    source: S,
+    sink: K,
     shutdown: F,
     heartbeat_interval: std::time::Duration,
 ) -> Result<(), MirrorError>
 where
     S: Source,
     K: Sink,
+    F: std::future::Future<Output = ()> + Send,
+{
+    run_mirror_with_notifier(source, sink, NoOpNotifier, shutdown, heartbeat_interval).await
+}
+
+/// Same as [`run_mirror_with_heartbeat`] but with a caller-supplied
+/// [`Notifier`]. The loop calls `notifier.on_record(&record)` after
+/// every successful `sink.write`, and `notifier.shutdown()` once after
+/// the final `sink.flush` on graceful exit. `NotifyError`s propagate
+/// as [`MirrorError::Notify`] and abort the loop — the notifier itself
+/// is responsible for distinguishing "retryable, eventually accept"
+/// from "fail loudly" per the `notify.outcomes.*` table.
+pub async fn run_mirror_with_notifier<S, K, N, F>(
+    mut source: S,
+    mut sink: K,
+    mut notifier: N,
+    shutdown: F,
+    heartbeat_interval: std::time::Duration,
+) -> Result<(), MirrorError>
+where
+    S: Source,
+    K: Sink,
+    N: Notifier,
     F: std::future::Future<Output = ()> + Send,
 {
     let sink_start = sink.next_expected_offset().await?;
@@ -500,6 +587,7 @@ where
             _ = &mut shutdown => {
                 tracing::info!("shutdown requested; flushing sink");
                 sink.flush().await?;
+                notifier.shutdown().await?;
                 return Ok(());
             }
             _ = async {
@@ -583,6 +671,12 @@ where
                                 });
                             }
                         }
+                        // Clone the record so the notifier can observe
+                        // it after the sink has consumed ownership.
+                        // One clone per accepted record is dwarfed by
+                        // the sink I/O cost; if profiling ever flags
+                        // it, add a `Notifier::wants_records` gate.
+                        let record_for_notify = record.clone();
                         sink.write(record).await?;
                         expected = expected
                             .checked_add(1)
@@ -602,6 +696,11 @@ where
                             "partition" => partition.clone(),
                         )
                         .increment(1);
+                        // Notifier observes only after the destination
+                        // chain has accepted the record. A failure
+                        // here aborts the loop and surfaces as
+                        // `MirrorError::Notify`.
+                        notifier.on_record(&record_for_notify).await?;
                     }
                     None => {
                         let current = sink.next_expected_offset().await?;
