@@ -233,3 +233,54 @@ async fn offsets_header_contents_match_snapshot() {
     assert_eq!(parsed[1]["partition"], 1);
     assert_eq!(parsed[1]["offset"], 3);
 }
+
+#[tokio::test]
+async fn q_health_ready_returns_503_until_caught_up_then_200() {
+    // Drop-in for the Yolean/kafka-keyvalue Quarkus binary's
+    // `/q/health/ready` SmallRye-Health endpoint. The
+    // `@yolean/kafka-keyvalue` Node client's `onReady()` polls it
+    // every 3 s; consumer pods that don't see a `200` never become
+    // Ready themselves. Same readiness gate as `/cache/v1`.
+    let cache = Arc::new(CacheState::new());
+    cache.register_mirror("userstate", 2); // needs offsets 0..=1
+    let app = router_with(Arc::clone(&cache));
+
+    let resp = app
+        .clone()
+        .oneshot(Request::get("/q/health/ready").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    cache.apply_record("userstate", &rec("userstate", 0, 0, "k0", Some(b"v0")));
+    cache.apply_record("userstate", &rec("userstate", 0, 1, "k1", Some(b"v1")));
+
+    let resp = app
+        .oneshot(Request::get("/q/health/ready").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    // Empty body — Quarkus's SmallRye-Health returns a JSON document,
+    // but the kkv Node client only checks the status code, so we
+    // keep the body empty (200 implies ready, no further parsing).
+    assert!(body_bytes(resp).await.is_empty());
+}
+
+#[tokio::test]
+async fn q_health_ready_is_not_in_openapi_spec() {
+    // Compat shim, intentionally undocumented — public surface is
+    // `/cache/v1` and `/_admin/v1` only.
+    let cache = Arc::new(CacheState::new());
+    cache.register_mirror("m", 0);
+    let app = router_with(Arc::clone(&cache));
+    let resp = app
+        .oneshot(Request::get("/openapi.json").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = String::from_utf8(body_bytes(resp).await).unwrap();
+    assert!(
+        !body.contains("/q/health/ready"),
+        "/q/health/ready must stay off the OpenAPI spec; got: {body}"
+    );
+}

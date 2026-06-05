@@ -8,14 +8,22 @@
 //!
 //! The server also exposes:
 //!
+//! - `GET /q/health/ready` — drop-in compat alias for the legacy
+//!   Quarkus kkv health endpoint. Returns `200 OK` with an empty
+//!   body once `CacheState::is_ready()`, `503 Service Unavailable`
+//!   otherwise. Kept off the OpenAPI spec because it's purely a
+//!   compat shim for the existing `@yolean/kafka-keyvalue` Node
+//!   client, whose `onReady()` polls
+//!   `KKV_CACHE_HOST_READINESS_ENDPOINT` (default `/q/health/ready`).
 //! - `POST /_admin/v1/shutdown` and `POST /_admin/v1/shutdown/{exitcode}` — operator hooks.
 //! - `GET /openapi.json` and `GET /openapi.yaml` — auto-generated OpenAPI 3.1 spec.
 //! - `GET /docs` — Scalar UI rendering the spec.
 //!
-//! Readiness: every endpoint under `/cache/v1` returns `503 Service
-//! Unavailable` until `CacheState::is_ready()` flips to `true`
-//! (every registered mirror has caught up to its bootstrap
-//! high-watermark). The flag is sticky — once ready, always ready.
+//! Readiness: every endpoint under `/cache/v1` (and the
+//! `/q/health/ready` alias) returns `503 Service Unavailable` until
+//! `CacheState::is_ready()` flips to `true` (every registered mirror
+//! has caught up to its bootstrap high-watermark). The flag is
+//! sticky — once ready, always ready.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -101,6 +109,11 @@ pub fn openapi_doc() -> utoipa::openapi::OpenApi {
 /// `shutdown_tx` is consumed by `POST /_admin/v1/shutdown[/{exitcode}]`
 /// to signal the supervisor that a clean exit is requested.
 pub fn build_router(cache: Arc<CacheState>, shutdown_tx: oneshot::Sender<i32>) -> axum::Router {
+    // Hold an extra clone for the /q/health/ready closure below.
+    // The main `state.cache` is moved into the OpenAPI router via
+    // `open_api_router(state)`, so we can't reach it from outside
+    // afterwards.
+    let cache_for_ready = Arc::clone(&cache);
     let state = AppState {
         cache,
         shutdown_tx: Arc::new(tokio::sync::Mutex::new(Some(shutdown_tx))),
@@ -124,6 +137,34 @@ pub fn build_router(cache: Arc<CacheState>, shutdown_tx: oneshot::Sender<i32>) -
                     yaml,
                 )
                     .into_response()
+            }),
+        )
+        // Drop-in for the Yolean/kafka-keyvalue Quarkus binary's
+        // `/q/health/ready` SmallRye-Health endpoint. The default
+        // value of `KKV_CACHE_HOST_READINESS_ENDPOINT` in the
+        // `@yolean/kafka-keyvalue` Node client is `/q/health/ready`;
+        // that client's `onReady()` polls it every 3 s and gates
+        // downstream consumer-pod readiness on a `200`. Returning
+        // the same `200`/`503` shape here makes mirror-v3 a true
+        // drop-in: existing consumers work unmodified, no
+        // `KKV_CACHE_HOST_READINESS_ENDPOINT` override needed.
+        //
+        // Kept off the OpenAPI spec — it's purely a compat shim for
+        // an existing client, not a public surface mirror-v3 wants
+        // to commit to. The Quarkus `/q/...` path namespace is
+        // unlikely to collide with anything else mirror-v3 might
+        // want to add.
+        .route(
+            "/q/health/ready",
+            axum::routing::get(move || {
+                let cache = Arc::clone(&cache_for_ready);
+                async move {
+                    if cache.is_ready() {
+                        StatusCode::OK.into_response()
+                    } else {
+                        StatusCode::SERVICE_UNAVAILABLE.into_response()
+                    }
+                }
             }),
         )
         .merge(axum::Router::from(Scalar::with_url("/docs", api)))
