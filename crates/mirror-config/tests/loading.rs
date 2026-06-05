@@ -45,6 +45,7 @@ fn parses_minimal_kafka_config() {
                 timestamp_mode: None,
                 http_access: None,
                 enabled: None,
+                notify: None,
             }],
         }
     );
