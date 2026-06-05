@@ -20,14 +20,16 @@
 //!     timer task. Errors from the timer-task drain are surfaced on
 //!     the next `on_record` / `shutdown` call.
 
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use futures::future::join_all;
 use indexmap::IndexMap;
 use mirror_config::{
-    FinalAction, NotifyApi, NotifyOutcome, NotifyOutcomes, NotifyRetry, NotifyTarget,
+    FanOut, FinalAction, NotifyApi, NotifyOutcome, NotifyOutcomes, NotifyRetry, NotifyTarget,
 };
 use mirror_core::{current_labels, Notifier, NotifyError, Record};
 use reqwest::Client;
@@ -38,7 +40,18 @@ use tokio::task::JoinHandle;
 use url::Url;
 
 mod buffer;
+mod resolver;
+
 use buffer::{Buffer, DrainedBatch};
+pub use resolver::{DnsAResolver, SystemDnsResolver};
+
+/// How long a `fan-out: dns-a` resolution is reused before a
+/// re-resolve. The legacy kkv had no caching (it watched K8s
+/// Endpoints continuously); for the DNS-A replacement path we cache
+/// for 30s — matches the spec's "default 30 s if no TTL is
+/// published". Failure invalidates the cache early (per spec) so
+/// scale-down recovery doesn't wait the full window.
+const DNS_A_CACHE_TTL: Duration = Duration::from_secs(30);
 
 /// Default path component when a target's URL has no explicit path.
 /// Matches the legacy `@yolean/kafka-keyvalue` Node client's
@@ -67,10 +80,10 @@ pub enum BuildError {
     ClientBuild(String),
 }
 
-/// Per-target dispatcher state. One target = one `Endpoint`. Phase 3a
-/// is fan-out: none only; the fan-out: dns-a path will allocate
-/// multiple `Endpoint`s per target (one per resolved address) in a
-/// later phase.
+/// Per-target dispatcher state. One target = one `Endpoint`. The
+/// `fan_out` mode decides whether dispatch goes to the URL's host
+/// (resolved transparently by reqwest) or to every A/AAAA record the
+/// configured resolver returns (one POST per address).
 #[derive(Debug)]
 struct Endpoint {
     /// Fully-resolved URL the POST goes to. `kkv-v1` default path is
@@ -78,8 +91,39 @@ struct Endpoint {
     /// allocation-free.
     url: Url,
     /// Pre-rendered `target_host` metric label (`url.host_str()`).
+    /// For fan-out: dns-a this is the *configured* hostname; the
+    /// per-address dispatch uses the resolved IP as its
+    /// `target_host` label instead.
     target_host: String,
     client: Client,
+    fan_out: FanOutMode,
+}
+
+/// Per-endpoint fan-out behaviour. `None` is the default,
+/// single-address path; `DnsA` resolves the URL's host to all
+/// A/AAAA records and POSTs every address concurrently.
+#[derive(Debug)]
+enum FanOutMode {
+    /// Single POST to the URL as-is. reqwest handles DNS internally.
+    None,
+    /// Resolve `host:port` via [`DnsAResolver`], dispatch one POST
+    /// per returned address. Resolutions cached for
+    /// [`DNS_A_CACHE_TTL`] and invalidated on any per-address
+    /// failure (matches the spec's "re-resolve on any failure"
+    /// recommendation).
+    DnsA(DnsAState),
+}
+
+/// Cached resolver state for one `fan-out: dns-a` endpoint.
+#[derive(Debug)]
+struct DnsAState {
+    /// Hostname we resolve.
+    host: String,
+    /// Port carried by every resolved `SocketAddr` (production: the
+    /// URL's port or scheme default; tests: whatever the stub
+    /// resolver returns).
+    port: u16,
+    cached: TokioMutex<Option<(Vec<SocketAddr>, Instant)>>,
 }
 
 /// Stateless dispatcher: takes a built batch payload, runs it through
@@ -92,6 +136,7 @@ struct Inner {
     retry: NotifyRetry,
     topic: String,
     partition: i32,
+    resolver: Arc<dyn DnsAResolver>,
 }
 
 /// Shared notifier state. `buffer` holds the in-progress batch;
@@ -133,6 +178,20 @@ impl KkvV1Notifier {
         topic: String,
         partition: i32,
     ) -> Result<Self, BuildError> {
+        Self::from_config_with_resolver(notify, topic, partition, Arc::new(SystemDnsResolver))
+    }
+
+    /// Same as [`Self::from_config`] but with a caller-supplied DNS
+    /// resolver. Tests use this to inject a stub that returns canned
+    /// `SocketAddr`s, exercising the `fan-out: dns-a` dispatch path
+    /// against multiple axum servers without depending on the system
+    /// resolver or `/etc/hosts`.
+    pub fn from_config_with_resolver(
+        notify: &mirror_config::Notify,
+        topic: String,
+        partition: i32,
+        resolver: Arc<dyn DnsAResolver>,
+    ) -> Result<Self, BuildError> {
         assert_eq!(notify.api, NotifyApi::KkvV1, "only kkv-v1 supported today");
         if notify.targets.is_empty() {
             return Err(BuildError::NoTargets);
@@ -140,9 +199,9 @@ impl KkvV1Notifier {
 
         let timeout = Duration::from_millis(notify.timeout_ms);
         // One client per notifier; reqwest's connection pool handles
-        // keep-alive across requests to the same host. A future
-        // multi-target / fan-out: dns-a path may want per-endpoint
-        // clients for size-bounding the pool.
+        // keep-alive across requests to the same host. The fan-out:
+        // dns-a path shares this client too — per-IP rewritten URLs
+        // each get their own connection pool entry inside reqwest.
         let client = Client::builder()
             .timeout(timeout)
             // No global redirect-following — 3xx is a documented
@@ -178,6 +237,7 @@ impl KkvV1Notifier {
             retry: notify.retry,
             topic,
             partition,
+            resolver,
         });
         let state = Arc::new(NotifierState {
             buffer: TokioMutex::new(Buffer::default()),
@@ -224,19 +284,108 @@ impl Inner {
     }
 
     /// POST a single batch payload to every configured endpoint
-    /// serially. A future fan-out implementation will parallelize
-    /// across resolved addresses.
+    /// serially. Per-endpoint fan-out is internal to
+    /// [`Self::dispatch_endpoint`].
     async fn dispatch_batch(&self, payload: &KkvV1Payload<'_>) -> Result<(), NotifyError> {
         for endpoint in &self.endpoints {
-            self.dispatch_one(endpoint, payload).await?;
+            self.dispatch_endpoint(endpoint, payload).await?;
         }
         Ok(())
     }
 
-    /// Resolve outcome → retry/final-action for a single endpoint.
-    async fn dispatch_one(
-        self: &Inner,
+    /// One endpoint = one configured `notify.targets[]` entry.
+    /// Dispatch behaviour branches on the endpoint's fan-out mode:
+    /// `none` POSTs to the URL as-is (one address, reqwest does DNS
+    /// internally); `dns-a` resolves the URL's host via
+    /// [`DnsAResolver`] and POSTs to every returned address
+    /// concurrently. Per the spec, any per-address outcome that
+    /// resolves to `final: fail` fails the whole batch.
+    async fn dispatch_endpoint(
+        &self,
         endpoint: &Endpoint,
+        payload: &KkvV1Payload<'_>,
+    ) -> Result<(), NotifyError> {
+        match &endpoint.fan_out {
+            FanOutMode::None => {
+                self.dispatch_to_address(
+                    &endpoint.client,
+                    endpoint.url.clone(),
+                    &endpoint.target_host,
+                    payload,
+                )
+                .await
+            }
+            FanOutMode::DnsA(state) => self.dispatch_dns_a(endpoint, state, payload).await,
+        }
+    }
+
+    /// Fan-out dispatch: resolve, then concurrent POSTs per address.
+    /// First per-address error wins (subsequent results are still
+    /// awaited so we don't leak in-flight requests).
+    async fn dispatch_dns_a(
+        &self,
+        endpoint: &Endpoint,
+        state: &DnsAState,
+        payload: &KkvV1Payload<'_>,
+    ) -> Result<(), NotifyError> {
+        let addrs = state.resolve_or_cached(self.resolver.as_ref()).await?;
+        if addrs.is_empty() {
+            return Err(NotifyError::Transport(format!(
+                "dns-a resolution of {} returned 0 addresses",
+                state.host
+            )));
+        }
+        let futures = addrs.iter().map(|sa| {
+            let mut per_addr_url = endpoint.url.clone();
+            // Set host to the IP literal; set port to the resolved
+            // socket's port (matches the URL's port in production,
+            // but lets test stubs aim at arbitrary axum servers).
+            // Both setters return `Result<(), …>` for malformed
+            // inputs; IPs and small ports never fail here so unwrap
+            // is justified.
+            per_addr_url
+                .set_ip_host(sa.ip())
+                .expect("set_ip_host on a valid URL always succeeds for an IpAddr");
+            per_addr_url
+                .set_port(Some(sa.port()))
+                .expect("set_port on a valid URL with an http(s) scheme succeeds");
+            let host_label = sa.to_string();
+            async move {
+                self.dispatch_to_address(&endpoint.client, per_addr_url, &host_label, payload)
+                    .await
+            }
+        });
+        let results = join_all(futures).await;
+        let mut first_err: Option<NotifyError> = None;
+        for r in results {
+            if let Err(e) = r {
+                first_err.get_or_insert(e);
+            }
+        }
+        match first_err {
+            Some(e) => {
+                // Per-spec: "Re-resolve when the cache TTL expires
+                // OR when an address fails repeatedly." Failure
+                // invalidates the cached set immediately so the next
+                // dispatch (after the supervisor restarts the
+                // mirror) picks up any K8s scale-down that happened
+                // mid-batch.
+                state.invalidate_cache().await;
+                Err(e)
+            }
+            None => Ok(()),
+        }
+    }
+
+    /// Run the per-attempt retry / outcome / final-action loop
+    /// against ONE address. Used by both `fan-out: none` (with the
+    /// endpoint's URL/host) and `fan-out: dns-a` (with a per-address
+    /// rewritten URL and the IP literal as the metric label).
+    async fn dispatch_to_address(
+        self: &Inner,
+        client: &Client,
+        url: Url,
+        target_host: &str,
         payload: &KkvV1Payload<'_>,
     ) -> Result<(), NotifyError> {
         let body = serde_json::to_vec(payload).map_err(|e| {
@@ -258,14 +407,13 @@ impl Inner {
                 "mirror_v3_notify_inflight_retry",
                 "topic" => topic_l.clone(),
                 "partition" => partition_l.clone(),
-                "target_host" => endpoint.target_host.clone(),
+                "target_host" => target_host.to_string(),
             )
             .set(attempt as f64);
 
             let start = std::time::Instant::now();
-            let result = endpoint
-                .client
-                .post(endpoint.url.clone())
+            let result = client
+                .post(url.clone())
                 .header("content-type", "application/json")
                 .header("x-kkv-topic", &self.topic)
                 .header("x-kkv-offsets", &offsets_header)
@@ -277,7 +425,7 @@ impl Inner {
                 "mirror_v3_notify_post_duration_seconds",
                 "topic" => topic_l.clone(),
                 "partition" => partition_l.clone(),
-                "target_host" => endpoint.target_host.clone(),
+                "target_host" => target_host.to_string(),
             )
             .record(start.elapsed().as_secs_f64());
 
@@ -285,7 +433,7 @@ impl Inner {
             let policy = self.outcomes.for_outcome(outcome);
 
             tracing::debug!(
-                target = %endpoint.url,
+                target = %url,
                 attempt,
                 max_attempts = self.retry.max_attempts,
                 ?outcome,
@@ -300,7 +448,7 @@ impl Inner {
                     "mirror_v3_notify_inflight_retry",
                     "topic" => topic_l.clone(),
                     "partition" => partition_l.clone(),
-                    "target_host" => endpoint.target_host.clone(),
+                    "target_host" => target_host.to_string(),
                 )
                 .set(0.0);
                 metrics::counter!(
@@ -315,7 +463,7 @@ impl Inner {
 
             if policy.retry && attempt < self.retry.max_attempts {
                 tracing::warn!(
-                    target = %endpoint.url,
+                    target = %url,
                     attempt,
                     max_attempts = self.retry.max_attempts,
                     reason = %last_error,
@@ -331,7 +479,8 @@ impl Inner {
             // the retry budget. Apply the final action.
             return self
                 .apply_final_action(
-                    endpoint,
+                    &url,
+                    target_host,
                     outcome,
                     policy,
                     attempt,
@@ -343,7 +492,8 @@ impl Inner {
 
     async fn apply_final_action(
         self: &Inner,
-        endpoint: &Endpoint,
+        url: &Url,
+        target_host: &str,
         outcome: Outcome,
         policy: NotifyOutcome,
         attempts: u32,
@@ -356,14 +506,14 @@ impl Inner {
             "mirror_v3_notify_inflight_retry",
             "topic" => topic_l.clone(),
             "partition" => partition_l.clone(),
-            "target_host" => endpoint.target_host.clone(),
+            "target_host" => target_host.to_string(),
         )
         .set(0.0);
 
         match policy.final_ {
             FinalAction::Accept => {
                 tracing::info!(
-                    target = %endpoint.url,
+                    target = %url,
                     ?outcome,
                     attempts,
                     "notify outcome resolved to accept (treated as delivered)"
@@ -379,7 +529,7 @@ impl Inner {
             }
             FinalAction::Skip => {
                 tracing::warn!(
-                    target = %endpoint.url,
+                    target = %url,
                     ?outcome,
                     attempts,
                     reason = %last_error,
@@ -396,7 +546,7 @@ impl Inner {
             }
             FinalAction::Fail => {
                 tracing::error!(
-                    target = %endpoint.url,
+                    target = %url,
                     ?outcome,
                     attempts,
                     reason = %last_error,
@@ -415,6 +565,36 @@ impl Inner {
                 })
             }
         }
+    }
+}
+
+impl DnsAState {
+    async fn resolve_or_cached(
+        &self,
+        resolver: &dyn DnsAResolver,
+    ) -> Result<Vec<SocketAddr>, NotifyError> {
+        {
+            let cached = self.cached.lock().await;
+            if let Some((addrs, at)) = cached.as_ref() {
+                if at.elapsed() < DNS_A_CACHE_TTL {
+                    return Ok(addrs.clone());
+                }
+            }
+        }
+        let addrs = resolver.resolve(&self.host, self.port).await.map_err(|e| {
+            NotifyError::Transport(format!("dns-a resolution failed for {}: {e}", self.host))
+        })?;
+        // Dedupe in case the resolver returned the same SocketAddr
+        // twice (lookup_host can yield both IPv4 + IPv4-mapped IPv6,
+        // for example). Preserve order.
+        let mut seen = std::collections::HashSet::new();
+        let unique: Vec<SocketAddr> = addrs.into_iter().filter(|a| seen.insert(*a)).collect();
+        *self.cached.lock().await = Some((unique.clone(), Instant::now()));
+        Ok(unique)
+    }
+
+    async fn invalidate_cache(&self) {
+        *self.cached.lock().await = None;
     }
 }
 
@@ -583,10 +763,32 @@ fn build_endpoint(target: &NotifyTarget, client: Client) -> Result<Endpoint, Bui
         url.set_path(p);
     }
     let target_host = url.host_str().unwrap_or("").to_string();
+    let fan_out = match target.fan_out {
+        FanOut::None => FanOutMode::None,
+        FanOut::DnsA => {
+            // Port comes from the URL; `port_or_known_default` falls
+            // back to 80/443 per scheme. This is the port the
+            // resolver appends to every A/AAAA address it returns —
+            // matches the K8s headless-Service expectation (all pods
+            // listen on the same port).
+            let port =
+                url.port_or_known_default()
+                    .ok_or_else(|| BuildError::UnsupportedScheme {
+                        url: target.url.clone(),
+                        scheme: url.scheme().to_string(),
+                    })?;
+            FanOutMode::DnsA(DnsAState {
+                host: target_host.clone(),
+                port,
+                cached: TokioMutex::new(None),
+            })
+        }
+    };
     Ok(Endpoint {
         url,
         target_host,
         client,
+        fan_out,
     })
 }
 
