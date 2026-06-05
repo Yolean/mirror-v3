@@ -18,6 +18,7 @@ pub mod docker;
 pub mod fault;
 pub mod kafka_helpers;
 pub mod mirror_runner;
+pub mod webhook_receiver;
 
 use async_trait::async_trait;
 
