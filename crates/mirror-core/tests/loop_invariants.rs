@@ -435,10 +435,7 @@ impl mirror_core::Sink for InspectorSink {
     fn allows_compacted_source(&self) -> bool {
         self.allows_compacted_source
     }
-    async fn align_to_source_low_watermark(
-        &mut self,
-        low_watermark: u64,
-    ) -> Result<(), SinkError> {
+    async fn align_to_source_low_watermark(&mut self, low_watermark: u64) -> Result<(), SinkError> {
         // Same semantics as MockSink's impl: bump running position so
         // the next write() at `low_watermark` succeeds.
         *self.position.lock().unwrap() = low_watermark;

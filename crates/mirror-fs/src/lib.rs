@@ -436,8 +436,7 @@ impl Sink for FilesystemSink {
         // are legitimate — the upstream may have compacted the
         // intermediate offsets out and the snapshot only stores
         // latest-per-key.
-        if !matches!(self.compaction, Some(CompactionMode::Log))
-            && record.source_offset != expected
+        if !matches!(self.compaction, Some(CompactionMode::Log)) && record.source_offset != expected
         {
             return Err(SinkError::UnexpectedPosition {
                 expected,

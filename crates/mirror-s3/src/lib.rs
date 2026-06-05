@@ -396,8 +396,7 @@ impl Sink for S3Sink {
         // them (the snapshot only stores latest-per-key, so the
         // upstream-compacted intermediate offsets are legitimately
         // absent). See mirror-fs::write for the same logic.
-        if !matches!(self.compaction, Some(CompactionMode::Log))
-            && record.source_offset != expected
+        if !matches!(self.compaction, Some(CompactionMode::Log)) && record.source_offset != expected
         {
             return Err(SinkError::UnexpectedPosition {
                 expected,
