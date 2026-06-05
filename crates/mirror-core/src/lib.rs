@@ -225,24 +225,35 @@ pub trait Sink: Send {
         false
     }
 
-    /// Called by the run loop after the bootstrap branch has decided
-    /// to skip from this sink's `next_expected_offset()` to the
-    /// source's `low_watermark` — i.e. when [`Self::allows_compacted_source`]
-    /// returned true and the source has been compacted past the sink's
-    /// current durable position. The sink must advance its internal
-    /// "next expected offset" to `low_watermark` so that:
-    ///   1. the next [`Self::next_expected_offset`] call returns
-    ///      `low_watermark` (idle-drift check stays consistent);
-    ///   2. [`Self::write`] accepts the next incoming record at
-    ///      `low_watermark` (the per-record gate stays consistent);
-    ///   3. blob/file naming reflects `low_watermark` as the new
+    /// Called by the run loop to advance this sink's internal
+    /// "next expected offset" to a higher value. The sink must update
+    /// state so that:
+    ///   1. the next [`Self::next_expected_offset`] call returns the
+    ///      new value (idle-drift check stays consistent);
+    ///   2. [`Self::write`] accepts the next incoming record at the
+    ///      new value (the per-record gate stays consistent);
+    ///   3. blob/file naming reflects the new value as the new
     ///      starting offset for the snapshot range.
     ///
-    /// Only ever called when both invariants hold:
-    /// `allows_compacted_source() == true` and the loop's first call
-    /// to `next_expected_offset()` returned a value strictly less than
-    /// `low_watermark`. Default impl is a no-op (sinks that don't
-    /// override `allows_compacted_source` never see this call).
+    /// Two call sites today, both guarded by
+    /// `allows_compacted_source() == true`:
+    ///
+    /// - **Bootstrap pre-align.** The run loop's bootstrap branch
+    ///   calls this with the source's `low_watermark` when the
+    ///   source has been compacted/trimmed past the sink's current
+    ///   durable position (`sink.next_expected_offset() < low_watermark`).
+    ///   The argument is therefore the broker's reported low
+    ///   watermark.
+    /// - **First-delivery alignment.** Inside the run loop, when the
+    ///   broker delivers an offset *above* `expected` (the
+    ///   `cleanup.policy=compact` case where `LogStartOffset = 0`
+    ///   masks the actual deliverable start), this is called with
+    ///   that delivered offset before the record is written.
+    ///
+    /// Either way the argument is "the new authoritative start offset",
+    /// not specifically a watermark. Default impl is a no-op (sinks
+    /// that don't override `allows_compacted_source` never see this
+    /// call).
     async fn align_to_source_low_watermark(&mut self, low_watermark: u64) -> Result<(), SinkError> {
         let _ = low_watermark;
         Ok(())
@@ -269,11 +280,23 @@ pub enum MirrorError {
     Source(#[from] SourceError),
     #[error(transparent)]
     Sink(#[from] SinkError),
-    /// Source delivered a record whose offset does not match what we
-    /// asked for. Indicates a Kafka client bug, a producer that skipped
-    /// offsets (impossible in normal Kafka), or a logic error.
-    #[error("source delivered offset {actual}, expected {expected}")]
-    SourceOffsetMismatch { expected: u64, actual: u64 },
+    /// Source delivered an offset *below* `expected`. Always a hard
+    /// error: a Kafka client bug, a producer that rewound, or a
+    /// destination chain that has somehow advanced past the broker.
+    #[error("source delivered offset {got}, expected at least {expected} (went backwards)")]
+    SourceWentBackwards { expected: u64, got: u64 },
+    /// Source delivered an offset *above* `expected`. Hard error in
+    /// append mode (would leave a gap in the destination chain).
+    /// Recoverable under `compaction: log`: the run loop aligns the
+    /// sink to the delivered offset and continues — the broker's
+    /// `LogStartOffset` reports 0 for a `cleanup.policy=compact`
+    /// topic even when the earliest deliverable record is much later
+    /// (compaction deduplicates by key but does not advance the
+    /// segment start), so the bootstrap pre-align can only be a hint
+    /// and the first-delivery offset is the authoritative starting
+    /// point.
+    #[error("source delivered offset {got}, expected {expected} (gap above expected)")]
+    SourceGapAboveExpected { expected: u64, got: u64 },
     /// Sink's view of next-expected-offset diverged from what we
     /// believed while we were idle. Indicates an out-of-band write or
     /// a topic reset.
@@ -446,11 +469,45 @@ where
             poll_result = source.poll_one() => {
                 match poll_result? {
                     Some(record) => {
-                        if record.source_offset != expected {
-                            return Err(MirrorError::SourceOffsetMismatch {
+                        if record.source_offset < expected {
+                            // Always a hard error: cannot rewrite a
+                            // record we've already committed to the
+                            // destination chain.
+                            return Err(MirrorError::SourceWentBackwards {
                                 expected,
-                                actual: record.source_offset,
+                                got: record.source_offset,
                             });
+                        }
+                        if record.source_offset > expected {
+                            if sink.allows_compacted_source() {
+                                // `cleanup.policy=compact` leaves
+                                // `LogStartOffset` at 0 even when the
+                                // earliest deliverable record is much
+                                // later; the bootstrap pre-align (which
+                                // uses `low_watermark`) misses this
+                                // case and gaps also surface mid-stream
+                                // every time the broker dropped a
+                                // superseded record. The sink's `write`
+                                // accepts forward gaps under
+                                // `compaction:log` so we only bump the
+                                // local `expected` tracker here. The
+                                // bootstrap-time `align_to_source_low_watermark`
+                                // is still called (with an empty
+                                // buffer) so the first snapshot file's
+                                // `from` reflects the broker's low
+                                // watermark when that path applies.
+                                tracing::warn!(
+                                    expected,
+                                    delivered = record.source_offset,
+                                    "source delivered above expected on compaction:log mirror; accepting gap"
+                                );
+                                expected = record.source_offset;
+                            } else {
+                                return Err(MirrorError::SourceGapAboveExpected {
+                                    expected,
+                                    got: record.source_offset,
+                                });
+                            }
                         }
                         sink.write(record).await?;
                         expected = expected

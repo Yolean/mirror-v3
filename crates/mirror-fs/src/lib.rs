@@ -239,6 +239,22 @@ impl FilesystemSink {
         self.flush_locked().await
     }
 
+    /// Lowest source-offset the sink will accept on the next `write`.
+    /// Under append mode this is `durable_position + buffer.len()` (the
+    /// chain is contiguous). Under `compaction:log` the buffer may
+    /// have gaps so the head is `last_buffered.source_offset + 1`
+    /// (or `durable_position` when the buffer is empty).
+    fn buffered_head(&self) -> u64 {
+        match self.compaction {
+            Some(CompactionMode::Log) => self
+                .buffer
+                .last()
+                .map(|r| r.source_offset + 1)
+                .unwrap_or(self.durable_position),
+            _ => self.durable_position + self.buffer.len() as u64,
+        }
+    }
+
     fn should_flush(&self) -> bool {
         if self.buffer.is_empty() {
             return false;
@@ -256,7 +272,20 @@ impl FilesystemSink {
         debug_assert!(!self.buffer.is_empty());
         let flush_started = Instant::now();
         let from = self.durable_position;
-        let to = self.durable_position + self.buffer.len() as u64 - 1;
+        let to = match self.compaction {
+            // Under compaction:log the buffer may contain gaps in its
+            // source-offset sequence (records dropped by upstream
+            // compaction are skipped on delivery, not buffered as
+            // tombstones), so `durable + len - 1` would underflow the
+            // actual high-water. Use the last buffered record's
+            // source_offset directly.
+            Some(CompactionMode::Log) => self
+                .buffer
+                .last()
+                .map(|r| r.source_offset)
+                .expect("buffer non-empty by debug_assert above"),
+            _ => self.durable_position + self.buffer.len() as u64 - 1,
+        };
         let count = self.buffer.len();
         let ext = self.format.extension();
         let final_name = naming::batch_filename(from, to, ext);
@@ -381,13 +410,27 @@ impl Sink for FilesystemSink {
                 actual: on_disk,
             });
         }
-        Ok(self.durable_position + self.buffer.len() as u64)
+        Ok(self.buffered_head())
     }
 
     async fn write(&mut self, record: Record) -> Result<(), SinkError> {
         self.tick_daily().await?;
-        let expected = self.durable_position + self.buffer.len() as u64;
-        if record.source_offset != expected {
+        let expected = self.buffered_head();
+        // Backwards is always a hard error.
+        if record.source_offset < expected {
+            return Err(SinkError::UnexpectedPosition {
+                expected,
+                actual: record.source_offset,
+            });
+        }
+        // Append mode also rejects forward gaps (the destination
+        // chain forbids holes). Under compaction:log forward gaps
+        // are legitimate — the upstream may have compacted the
+        // intermediate offsets out and the snapshot only stores
+        // latest-per-key.
+        if !matches!(self.compaction, Some(CompactionMode::Log))
+            && record.source_offset != expected
+        {
             return Err(SinkError::UnexpectedPosition {
                 expected,
                 actual: record.source_offset,
