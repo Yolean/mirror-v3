@@ -1062,6 +1062,14 @@ fn validate_notify_shared(m: &Mirror, notify: &Notify) -> Result<(), LoadError> 
                     m.name
                 )));
             }
+            // The spec also rejects `destination-flush` on kafka-only
+            // mirrors — kafka commits per-record and has no
+            // observable batch flushes. That rule is enforced
+            // transitively here: notify requires http-access, and
+            // http-access is incompatible with kafka-only destinations
+            // (see `has_blob` checks above), so any kafka-only mirror
+            // with a notify block is already rejected with a clearer
+            // message before this point. No separate check needed.
         }
     }
     Ok(())

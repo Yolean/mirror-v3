@@ -192,29 +192,7 @@ impl KkvV1Notifier {
         partition: i32,
         resolver: Arc<dyn DnsAResolver>,
     ) -> Result<Self, BuildError> {
-        assert_eq!(notify.api, NotifyApi::KkvV1, "only kkv-v1 supported today");
-        if notify.targets.is_empty() {
-            return Err(BuildError::NoTargets);
-        }
-
-        let timeout = Duration::from_millis(notify.timeout_ms);
-        // One client per notifier; reqwest's connection pool handles
-        // keep-alive across requests to the same host. The fan-out:
-        // dns-a path shares this client too — per-IP rewritten URLs
-        // each get their own connection pool entry inside reqwest.
-        let client = Client::builder()
-            .timeout(timeout)
-            // No global redirect-following — 3xx is a documented
-            // outcome bucket and must surface as a status code, not
-            // get silently followed.
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(|e| BuildError::ClientBuild(e.to_string()))?;
-
-        let mut endpoints = Vec::with_capacity(notify.targets.len());
-        for t in &notify.targets {
-            endpoints.push(build_endpoint(t, client.clone())?);
-        }
+        let inner = Arc::new(build_inner(notify, topic, partition, resolver)?);
 
         // Debounce config lives on the trigger block. Defaults come
         // from `NotifyTrigger::default()` (`Some({100, 250})` for
@@ -230,15 +208,6 @@ impl KkvV1Notifier {
             });
         let max_records = debounce.max_records;
         let max_time = Duration::from_millis(debounce.max_time_ms);
-
-        let inner = Arc::new(Inner {
-            endpoints,
-            outcomes: notify.outcomes,
-            retry: notify.retry,
-            topic,
-            partition,
-            resolver,
-        });
         let state = Arc::new(NotifierState {
             buffer: TokioMutex::new(Buffer::default()),
             new_data: TokioNotify::new(),
@@ -723,6 +692,171 @@ async fn timer_loop(inner: Arc<Inner>, state: Arc<NotifierState>, max_time: Dura
                 *state.error_state.lock().await = Some(e);
                 return;
             }
+        }
+    }
+}
+
+/// Build the per-mirror dispatcher state shared by both
+/// [`KkvV1Notifier`] (source-consume trigger) and [`FlushDispatcher`]
+/// (destination-flush trigger). Validates targets, opens the
+/// reqwest client, and resolves each target into an [`Endpoint`].
+fn build_inner(
+    notify: &mirror_config::Notify,
+    topic: String,
+    partition: i32,
+    resolver: Arc<dyn DnsAResolver>,
+) -> Result<Inner, BuildError> {
+    assert_eq!(notify.api, NotifyApi::KkvV1, "only kkv-v1 supported today");
+    if notify.targets.is_empty() {
+        return Err(BuildError::NoTargets);
+    }
+    let timeout = Duration::from_millis(notify.timeout_ms);
+    let client = Client::builder()
+        .timeout(timeout)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|e| BuildError::ClientBuild(e.to_string()))?;
+    let mut endpoints = Vec::with_capacity(notify.targets.len());
+    for t in &notify.targets {
+        endpoints.push(build_endpoint(t, client.clone())?);
+    }
+    Ok(Inner {
+        endpoints,
+        outcomes: notify.outcomes,
+        retry: notify.retry,
+        topic,
+        partition,
+        resolver,
+    })
+}
+
+/// Webhook dispatcher for the `trigger.on: destination-flush` mode.
+/// Implements [`mirror_core::FlushObserver`]: each `on_flushed(from,
+/// to)` enqueues a [`FlushEvent`] into an unbounded channel; the
+/// drainer task pulls events and POSTs a kkv-v1 body per event
+/// (`offsets: {partition: to}`, `updates: {}`).
+///
+/// Separate type from [`KkvV1Notifier`] because the two trigger
+/// modes' lifecycles don't overlap: source-consume builds a
+/// notifier and uses `NoOpNotifier`-shaped destination behaviour;
+/// destination-flush builds a dispatcher and uses
+/// `NoOpNotifier` in the run loop. The supervisor picks one or the
+/// other based on `notify.trigger.on`.
+pub struct FlushDispatcher {
+    /// Held so the drainer task can be addressed via
+    /// `error_state` / `tx` for shutdown signalling; otherwise
+    /// untouched at runtime. (`#[allow(dead_code)]` quiets the
+    /// linter — the field exists so callers can extend the type
+    /// without re-deriving the shared state from the channel.)
+    #[allow(dead_code)]
+    inner: Arc<Inner>,
+    tx: tokio::sync::mpsc::UnboundedSender<FlushEvent>,
+    drainer: Option<JoinHandle<()>>,
+    error_state: Arc<TokioMutex<Option<NotifyError>>>,
+}
+
+enum FlushEvent {
+    Flushed { to: u64 },
+    Shutdown,
+}
+
+impl FlushDispatcher {
+    pub fn from_config(
+        notify: &mirror_config::Notify,
+        topic: String,
+        partition: i32,
+    ) -> Result<Self, BuildError> {
+        Self::from_config_with_resolver(notify, topic, partition, Arc::new(SystemDnsResolver))
+    }
+
+    pub fn from_config_with_resolver(
+        notify: &mirror_config::Notify,
+        topic: String,
+        partition: i32,
+        resolver: Arc<dyn DnsAResolver>,
+    ) -> Result<Self, BuildError> {
+        let inner = Arc::new(build_inner(notify, topic, partition, resolver)?);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let error_state = Arc::new(TokioMutex::new(None));
+        let drainer = tokio::spawn(flush_drainer_loop(
+            Arc::clone(&inner),
+            rx,
+            Arc::clone(&error_state),
+        ));
+        Ok(Self {
+            inner,
+            tx,
+            drainer: Some(drainer),
+            error_state,
+        })
+    }
+
+    /// Drain pending events and stop the background task. Returns
+    /// any error the drainer accumulated before exit. Idempotent —
+    /// calling twice is safe (the second call is a no-op).
+    pub async fn shutdown(&mut self) -> Result<(), NotifyError> {
+        let _ = self.tx.send(FlushEvent::Shutdown);
+        if let Some(handle) = self.drainer.take() {
+            handle.abort();
+            let _ = handle.await;
+        }
+        if let Some(err) = self.error_state.lock().await.take() {
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    /// Snapshot the drainer's latest error without consuming the
+    /// dispatcher. Used by `mirror-bin`'s status / supervision loop
+    /// to detect a fatal dispatch failure without waiting for
+    /// shutdown.
+    pub async fn last_error(&self) -> Option<NotifyError> {
+        self.error_state.lock().await.take()
+    }
+}
+
+impl mirror_core::FlushObserver for FlushDispatcher {
+    fn on_flushed(&self, _from: u64, to: u64) {
+        // Fire-and-forget into the channel. If the drainer has
+        // already exited (error_state is set), the send fails — and
+        // that's fine; the supervisor will see the error on the
+        // next `last_error` / `shutdown` call. `from` is intentionally
+        // dropped: the kkv-v1 body only carries the high-water `to`
+        // in its `offsets` field (consumer's `requireOffset`
+        // semantic).
+        let _ = self.tx.send(FlushEvent::Flushed { to });
+    }
+}
+
+/// Background task that pulls flush events off the channel and
+/// dispatches one kkv-v1 POST per event. Exits on `Shutdown` or
+/// channel close, or stashes the first fatal dispatch error and
+/// exits.
+async fn flush_drainer_loop(
+    inner: Arc<Inner>,
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<FlushEvent>,
+    error_state: Arc<TokioMutex<Option<NotifyError>>>,
+) {
+    while let Some(event) = rx.recv().await {
+        let to = match event {
+            FlushEvent::Shutdown => return,
+            FlushEvent::Flushed { to } => to,
+        };
+        let mut offsets = IndexMap::new();
+        offsets.insert(inner.partition.to_string(), to);
+        let payload = KkvV1Payload {
+            topic: &inner.topic,
+            // Empty `updates` per WEBHOOKS.md open-question #2:
+            // destination-flush is the "tell me a file landed" use
+            // case, not cache invalidation, so the consumer doesn't
+            // need a key set. The `offsets` field gives them the
+            // high-water mark.
+            offsets,
+            updates: IndexMap::new(),
+        };
+        if let Err(e) = inner.dispatch_batch(&payload).await {
+            *error_state.lock().await = Some(e);
+            return;
         }
     }
 }

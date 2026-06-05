@@ -706,21 +706,39 @@ async fn spawn_mirror(
         ));
         dest_descriptions.push("notify-only".to_string());
     }
-    let tee = mirror_core::TeeSink::open(inners, cache.clone())
+    let mut tee = mirror_core::TeeSink::open(inners, cache.clone())
         .await
         .map_err(|e| anyhow::anyhow!("opening tee for mirror {name}: {e}"))?;
 
-    // Build the notifier from `mirror.notify` if present, else fall
-    // back to the no-op notifier. The two branches monomorphise
-    // `run_mirror_with_notifier` against different `N` types — no
-    // boxing needed.
-    let notifier_opt = build_notifier(&mirror).await?;
+    // Branch on the notify trigger mode (validated upstream in
+    // mirror-config; see WEBHOOKS.md § Trigger):
+    //   * source-consume → build `KkvV1Notifier`, pass as the run
+    //     loop's `N: Notifier`.
+    //   * destination-flush → build `FlushDispatcher`, attach as the
+    //     TeeSink's `FlushObserver`; the run loop's notifier is
+    //     `NoOpNotifier` (records flow through unobserved).
+    let trigger_mode = mirror.notify.as_ref().map(|n| n.trigger.on);
+    let notifier_opt = match trigger_mode {
+        Some(mirror_config::TriggerOn::SourceConsume) => build_source_consume_notifier(&mirror)?,
+        _ => None,
+    };
+    if matches!(
+        trigger_mode,
+        Some(mirror_config::TriggerOn::DestinationFlush)
+    ) {
+        let dispatcher = build_flush_dispatcher(&mirror)?;
+        tee.set_flush_observer(std::sync::Arc::new(dispatcher));
+    }
 
     let destinations_log = dest_descriptions.join(",");
     let notify_log = match &mirror.notify {
         Some(n) => {
             let targets: Vec<&str> = n.targets.iter().map(|t| t.url.as_str()).collect();
-            format!(" notify=kkv-v1[{}]", targets.join(","))
+            let trigger = match n.trigger.on {
+                mirror_config::TriggerOn::SourceConsume => "source-consume",
+                mirror_config::TriggerOn::DestinationFlush => "destination-flush",
+            };
+            format!(" notify=kkv-v1[{}] trigger={trigger}", targets.join(","))
         }
         None => String::new(),
     };
@@ -777,11 +795,15 @@ async fn spawn_mirror(
     ))
 }
 
-/// Construct the `KkvV1Notifier` for a mirror, or `None` if the
-/// mirror has no `notify:` block. Failures bubble up so the
-/// supervisor refuses to spawn a mirror whose webhook surface can't
-/// possibly work, instead of crashing on the first record.
-async fn build_notifier(mirror: &Mirror) -> Result<Option<mirror_notify_kkv::KkvV1Notifier>> {
+/// Construct the `KkvV1Notifier` for a mirror with
+/// `trigger.on: source-consume`. Returns `None` when the mirror has
+/// no notify block or uses a different trigger (the supervisor
+/// handles the destination-flush case via [`build_flush_dispatcher`]).
+/// Failures bubble up so the supervisor refuses to spawn a mirror
+/// whose webhook surface can't possibly work.
+fn build_source_consume_notifier(
+    mirror: &Mirror,
+) -> Result<Option<mirror_notify_kkv::KkvV1Notifier>> {
     let Some(notify) = mirror.notify.as_ref() else {
         return Ok(None);
     };
@@ -793,6 +815,32 @@ async fn build_notifier(mirror: &Mirror) -> Result<Option<mirror_notify_kkv::Kkv
     )
     .with_context(|| format!("building notify dispatcher for mirror {}", mirror.name))?;
     Ok(Some(notifier))
+}
+
+/// Construct the `FlushDispatcher` for a mirror with
+/// `trigger.on: destination-flush`. Validator guarantees the mirror
+/// has notify set; this asserts on the trigger variant.
+fn build_flush_dispatcher(mirror: &Mirror) -> Result<mirror_notify_kkv::FlushDispatcher> {
+    let notify = mirror
+        .notify
+        .as_ref()
+        .expect("build_flush_dispatcher called with no notify block");
+    debug_assert!(matches!(
+        notify.trigger.on,
+        mirror_config::TriggerOn::DestinationFlush
+    ));
+    let dispatcher = mirror_notify_kkv::FlushDispatcher::from_config(
+        notify,
+        mirror.topic.clone(),
+        mirror.partition as i32,
+    )
+    .with_context(|| {
+        format!(
+            "building notify flush dispatcher for mirror {}",
+            mirror.name
+        )
+    })?;
+    Ok(dispatcher)
 }
 
 /// In-memory sink for `destinations: []` notify-only mirrors. Holds

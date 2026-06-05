@@ -567,3 +567,45 @@ fn no_retry_accept() -> NotifyOutcome {
         final_: FinalAction::Accept,
     }
 }
+
+#[test]
+fn destination_flush_with_only_kafka_destination_is_rejected_transitively() {
+    // Per WEBHOOKS.md: "A mirror with no blob destinations (kafka-
+    // only) cannot use `destination-flush`". The validator enforces
+    // this transitively: notify requires http-access, http-access
+    // requires ≥1 blob destination — so kafka-only + notify is
+    // already rejected, regardless of trigger mode. This test pins
+    // that the rejection happens.
+    let yaml = r#"
+mirrors:
+  - name: events
+    source: { bootstrap-servers: kafka:9092 }
+    topic: events
+    partition: 0
+    destinations:
+      - type: kafka
+        bootstrap-servers: kafka:9092
+    notify:
+      api: kkv-v1
+      targets:
+        - url: http://target:8080
+      trigger:
+        on: destination-flush
+"#;
+    let err = load_from_str(yaml).expect_err("kafka-only + notify must be rejected");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("notify") || msg.contains("http-access"),
+        "got: {msg}"
+    );
+}
+
+#[test]
+fn destination_flush_with_filesystem_destination_is_accepted() {
+    let yaml = format!("{MINIMAL_WITH_NOTIFY}      trigger:\n        on: destination-flush\n");
+    let cfg = load_from_str(&yaml).expect("must parse");
+    assert_eq!(
+        cfg.mirrors[0].notify.as_ref().unwrap().trigger.on,
+        TriggerOn::DestinationFlush
+    );
+}
