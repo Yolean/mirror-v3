@@ -21,6 +21,7 @@ use thiserror::Error;
 pub mod cache;
 pub mod mock;
 pub mod tee;
+pub mod testing;
 
 pub use cache::{CacheBinding, CacheState};
 pub use tee::TeeSink;
@@ -222,6 +223,21 @@ pub trait Source: Send {
     /// safe choice for tests and any source that doesn't trim.
     async fn low_watermark(&mut self) -> Result<u64, SourceError> {
         Ok(0)
+    }
+
+    /// Highest offset still retained by the source (Kafka "high
+    /// watermark"; i.e. `last_offset + 1` if the source has any
+    /// records, or `0` if it's empty). The run loop doesn't query
+    /// this today — the default `Ok(u64::MAX)` is the
+    /// "always-satisfiable" sentinel, so future spec changes (e.g.
+    /// "fatal if sink_next_expected > source_high_watermark") can be
+    /// added without breaking sources that don't implement it.
+    ///
+    /// Implementations should query the broker rather than caching
+    /// (same contract as [`Self::low_watermark`]). The Kafka source
+    /// wraps the existing `mirror_kafka::fetch_high_watermark` helper.
+    async fn high_watermark(&mut self) -> Result<u64, SourceError> {
+        Ok(u64::MAX)
     }
 }
 

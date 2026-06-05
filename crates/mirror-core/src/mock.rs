@@ -15,6 +15,7 @@ pub struct MockSource {
     events: VecDeque<MockSourceEvent>,
     pub seeks: Vec<u64>,
     pub low_watermark: u64,
+    pub high_watermark: u64,
 }
 
 pub enum MockSourceEvent {
@@ -34,6 +35,10 @@ impl MockSource {
             events: events.into_iter().collect(),
             seeks: Vec::new(),
             low_watermark: 0,
+            // Default `u64::MAX` matches the trait's default — no
+            // spec currently rejects on HWM, so the sentinel value
+            // is "always satisfiable."
+            high_watermark: u64::MAX,
         }
     }
 
@@ -41,6 +46,16 @@ impl MockSource {
     /// by tests that simulate a compacted or trimmed source topic.
     pub fn with_low_watermark(mut self, low_watermark: u64) -> Self {
         self.low_watermark = low_watermark;
+        self
+    }
+
+    /// Configure the value returned by [`Source::high_watermark`].
+    /// Used by tests for spec changes that introduce a "sink can't
+    /// exceed source HWM" gate. The default is `u64::MAX` (the
+    /// trait's "always-satisfiable" sentinel) so unrelated tests
+    /// aren't affected.
+    pub fn with_high_watermark(mut self, high_watermark: u64) -> Self {
+        self.high_watermark = high_watermark;
         self
     }
 }
@@ -67,6 +82,10 @@ impl Source for MockSource {
 
     async fn low_watermark(&mut self) -> Result<u64, SourceError> {
         Ok(self.low_watermark)
+    }
+
+    async fn high_watermark(&mut self) -> Result<u64, SourceError> {
+        Ok(self.high_watermark)
     }
 }
 
