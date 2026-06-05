@@ -8,6 +8,7 @@ members = [
     "crates/mirror-kafka",
     "crates/mirror-fs",
     "crates/mirror-s3",
+    "crates/mirror-notify-kkv",
     "crates/mirror-bin",
     "crates/xtask",
     "e2e",
@@ -28,6 +29,7 @@ mirror-envelope = { path = "crates/mirror-envelope" }
 mirror-kafka = { path = "crates/mirror-kafka" }
 mirror-fs = { path = "crates/mirror-fs" }
 mirror-s3 = { path = "crates/mirror-s3" }
+mirror-notify-kkv = { path = "crates/mirror-notify-kkv" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
