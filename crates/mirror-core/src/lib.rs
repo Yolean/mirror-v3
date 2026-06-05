@@ -15,6 +15,8 @@
 //!    `next_expected_offset()` and require it to still equal what we
 //!    expect. This catches external topic resets / out-of-band writes.
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use thiserror::Error;
 
@@ -308,6 +310,42 @@ pub trait Sink: Send {
         let _ = low_watermark;
         Ok(())
     }
+
+    /// Install a [`FlushObserver`] that will be invoked every time
+    /// this sink durably commits a batch. Used by the
+    /// `notify.trigger.on: destination-flush` dispatch path to learn
+    /// when records are durable on the destination side without
+    /// scraping logs or polling `next_expected_offset`.
+    ///
+    /// Default no-op — sinks without observable flushes (Kafka,
+    /// mocks, in-memory) keep this default and the observer simply
+    /// never fires for them. Blob sinks (FS, S3) override and call
+    /// `observer.on_flushed(from, to)` after every successful
+    /// flush, where `to` is the highest source offset in the
+    /// just-flushed batch and `from` is the lowest. Only one
+    /// observer is supported per sink instance; later installs
+    /// replace earlier ones.
+    fn set_flush_observer(&mut self, _observer: Arc<dyn FlushObserver>) {}
+}
+
+/// Observer notified when a sink durably commits a batch. Lives in
+/// `mirror-core` so [`Sink`] implementations (blob and tee) can
+/// invoke it without depending on the notify crate. The webhook
+/// dispatcher in `mirror-notify-kkv` implements this trait.
+///
+/// Synchronous on purpose: a flush is rare relative to records, and
+/// the observer is expected to do something cheap — typically
+/// enqueueing the `(from, to)` pair into an `mpsc` channel that a
+/// dedicated async task drains. Doing the HTTP POST inline would
+/// block the flush path and serialise destinations behind the
+/// receiver's latency.
+pub trait FlushObserver: Send + Sync {
+    /// `from` is the lowest source offset in the just-flushed batch
+    /// (inclusive). `to` is the highest (inclusive). For a tee over
+    /// multiple inner sinks the values are the *combined* advance
+    /// (the min across inner sinks); the observer fires only when
+    /// that min strictly increases.
+    fn on_flushed(&self, from: u64, to: u64);
 }
 
 /// Per-mirror observer of records as they flow through the loop.

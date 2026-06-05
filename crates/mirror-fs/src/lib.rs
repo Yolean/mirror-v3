@@ -104,6 +104,11 @@ pub struct FilesystemSink {
     values: ColumnType,
     compaction: Option<CompactionMode>,
     flush: FlushTriggers,
+    /// Optional callback fired after every successful flush. Wired
+    /// up by [`Sink::set_flush_observer`]; default is `None` (no
+    /// observer). Stored as `Arc` so the same observer can be
+    /// shared across multiple sinks under a tee.
+    flush_observer: Option<std::sync::Arc<dyn mirror_core::FlushObserver>>,
     /// Durable destination position: `max(to) + 1` of files on disk.
     durable_position: u64,
     /// Buffered records arrived since the last flush. In append mode
@@ -193,6 +198,7 @@ impl FilesystemSink {
             values: cfg.values,
             compaction: cfg.compaction,
             flush: cfg.flush,
+            flush_observer: None,
             durable_position,
             buffer: Vec::new(),
             buffer_bytes: 0,
@@ -391,6 +397,13 @@ impl FilesystemSink {
             trigger = trigger.as_str(),
             "flushed batch"
         );
+        // Notify the destination-flush observer if one is wired.
+        // The observer is expected to do something cheap (queue the
+        // event for an async drainer); inlining HTTP here would
+        // serialise per-flush write latency behind webhook RTT.
+        if let Some(observer) = self.flush_observer.as_ref() {
+            observer.on_flushed(from, to);
+        }
         Ok(())
     }
 }
@@ -528,6 +541,10 @@ impl Sink for FilesystemSink {
         // and the on-disk gap from the prior `durable_position` is fine.
         self.durable_position = low_watermark;
         Ok(())
+    }
+
+    fn set_flush_observer(&mut self, observer: std::sync::Arc<dyn mirror_core::FlushObserver>) {
+        self.flush_observer = Some(observer);
     }
 }
 

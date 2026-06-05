@@ -102,6 +102,10 @@ pub struct S3Sink {
     view: Option<BTreeMap<String, Record>>,
     next_daily_unix: Option<u64>,
     clock: UnixClock,
+    /// See [`mirror_fs::FilesystemSink::flush_observer`] — same
+    /// contract: stored Arc, default `None`, fired after every
+    /// successful PUT.
+    flush_observer: Option<Arc<dyn mirror_core::FlushObserver>>,
 }
 
 impl S3Sink {
@@ -173,6 +177,7 @@ impl S3Sink {
             view,
             next_daily_unix,
             clock,
+            flush_observer: None,
         })
     }
 
@@ -346,6 +351,10 @@ impl S3Sink {
             trigger = trigger.as_str(),
             "flushed batch"
         );
+        // See mirror-fs for the destination-flush observer contract.
+        if let Some(observer) = self.flush_observer.as_ref() {
+            observer.on_flushed(from, to);
+        }
         Ok(())
     }
 }
@@ -477,6 +486,10 @@ impl Sink for S3Sink {
         }
         self.durable_position = low_watermark;
         Ok(())
+    }
+
+    fn set_flush_observer(&mut self, observer: Arc<dyn mirror_core::FlushObserver>) {
+        self.flush_observer = Some(observer);
     }
 }
 
