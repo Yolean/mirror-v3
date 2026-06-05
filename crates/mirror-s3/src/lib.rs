@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::StreamExt;
-use mirror_core::{Record, Sink, SinkError};
+use mirror_core::{FlushTrigger, Record, Sink, SinkError};
 use mirror_envelope::{ColumnType, Format, ParquetCompression};
 use mirror_fs::naming;
 use object_store::path::Path;
@@ -185,7 +185,7 @@ impl S3Sink {
             return Ok(());
         }
         if !self.buffer.is_empty() {
-            self.flush_locked().await?;
+            self.flush_locked(FlushTrigger::Daily).await?;
         }
         let mut t = next;
         let now = (self.clock)();
@@ -200,7 +200,7 @@ impl S3Sink {
         if self.buffer.is_empty() {
             return Ok(());
         }
-        self.flush_locked().await
+        self.flush_locked(FlushTrigger::Explicit).await
     }
 
     /// Lowest source-offset the sink will accept on the next `write`.
@@ -219,19 +219,27 @@ impl S3Sink {
         }
     }
 
-    fn should_flush(&self) -> bool {
+    fn should_flush(&self) -> Option<FlushTrigger> {
         if self.buffer.is_empty() {
-            return false;
+            return None;
         }
-        self.buffer.len() as u64 >= self.flush.max_offsets
-            || self.buffer_bytes >= self.flush.max_bytes
-            || self
-                .buffer_started
-                .map(|t| t.elapsed() >= self.flush.max_time)
-                .unwrap_or(false)
+        if self.buffer.len() as u64 >= self.flush.max_offsets {
+            return Some(FlushTrigger::MaxOffsets);
+        }
+        if self.buffer_bytes >= self.flush.max_bytes {
+            return Some(FlushTrigger::MaxBytes);
+        }
+        if self
+            .buffer_started
+            .map(|t| t.elapsed() >= self.flush.max_time)
+            .unwrap_or(false)
+        {
+            return Some(FlushTrigger::MaxTime);
+        }
+        None
     }
 
-    async fn flush_locked(&mut self) -> Result<(), SinkError> {
+    async fn flush_locked(&mut self, trigger: FlushTrigger) -> Result<(), SinkError> {
         debug_assert!(!self.buffer.is_empty());
         let flush_started = Instant::now();
         let from = self.durable_position;
@@ -335,6 +343,7 @@ impl S3Sink {
             encoded_bytes,
             elapsed_ms,
             interval_ms,
+            trigger = trigger.as_str(),
             "flushed batch"
         );
         Ok(())
@@ -435,8 +444,8 @@ impl Sink for S3Sink {
         if self.buffer_started.is_none() {
             self.buffer_started = Some(Instant::now());
         }
-        if self.should_flush() {
-            self.flush_locked().await?;
+        if let Some(trigger) = self.should_flush() {
+            self.flush_locked(trigger).await?;
         }
         Ok(())
     }

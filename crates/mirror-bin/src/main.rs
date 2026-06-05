@@ -9,6 +9,7 @@ use mirror_core::{run_mirror, MetricLabels, MIRROR_LABELS};
 use mirror_fs::{FilesystemSink, FilesystemSinkConfig};
 use mirror_kafka::{KafkaSink, KafkaSinkConfig, KafkaSource, KafkaSourceConfig};
 use mirror_s3::{S3Sink, S3SinkConfig};
+use tracing::Instrument;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
@@ -687,24 +688,32 @@ async fn spawn_mirror(
         .map_err(|e| anyhow::anyhow!("opening tee for mirror {name}: {e}"))?;
 
     let destinations_log = dest_descriptions.join(",");
-    Ok(tokio::spawn(async move {
-        tracing::info!(
-            mirror = %name,
-            destinations = %destinations_log,
-            compaction,
-            "loop start"
-        );
-        let result = MIRROR_LABELS
-            .scope(
-                labels,
-                run_mirror(source, tee, shutdown_signal(shutdown_rx)),
-            )
-            .await;
-        match result {
-            Ok(()) => Ok(()),
-            Err(e) => Err(anyhow::anyhow!("mirror {name}: {e}")),
+    // Single span carries `mirror = <name>` onto every event emitted
+    // from the spawned task — including the mirror-core logs
+    // (`starting mirror`, `heartbeat`, etc.) that don't otherwise have
+    // access to the operator-chosen mirror name. MIRROR_LABELS still
+    // carries topic+partition for metric labeling separately.
+    let span = tracing::info_span!("mirror", name = %name);
+    Ok(tokio::spawn(
+        async move {
+            tracing::info!(
+                destinations = %destinations_log,
+                compaction,
+                "loop start"
+            );
+            let result = MIRROR_LABELS
+                .scope(
+                    labels,
+                    run_mirror(source, tee, shutdown_signal(shutdown_rx)),
+                )
+                .await;
+            match result {
+                Ok(()) => Ok(()),
+                Err(e) => Err(anyhow::anyhow!("mirror {name}: {e}")),
+            }
         }
-    }))
+        .instrument(span),
+    ))
 }
 
 async fn open_inner_sink(

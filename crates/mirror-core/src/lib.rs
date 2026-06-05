@@ -106,6 +106,40 @@ pub struct Header {
     pub value: Option<Vec<u8>>,
 }
 
+/// Which buffer trigger caused a blob sink (FS / S3) to flush. Used
+/// only as a label on the `flushed batch` log line so operators can
+/// tell why a given snapshot was emitted without grepping for the
+/// matching threshold in the config.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlushTrigger {
+    /// `flush.max-offsets` reached: the buffer accumulated as many
+    /// records as the config allows.
+    MaxOffsets,
+    /// `flush.max-bytes` reached: the buffered payload size hit the
+    /// configured byte cap.
+    MaxBytes,
+    /// `flush.max-time-ms` elapsed since the first record landed in
+    /// the buffer.
+    MaxTime,
+    /// `flush.daily.at-utc` wall-clock boundary crossed.
+    Daily,
+    /// Explicit `Sink::flush` (graceful shutdown, end-of-test, or any
+    /// other operator-driven flush).
+    Explicit,
+}
+
+impl FlushTrigger {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FlushTrigger::MaxOffsets => "max-offsets",
+            FlushTrigger::MaxBytes => "max-bytes",
+            FlushTrigger::MaxTime => "max-time",
+            FlushTrigger::Daily => "daily",
+            FlushTrigger::Explicit => "explicit",
+        }
+    }
+}
+
 /// Topic-schema declaration for a record column (`key` or `value`).
 ///
 /// This is the runtime representation shared by all sinks. The
@@ -459,7 +493,15 @@ where
                 }
             } => {
                 let progressed = expected - last_heartbeat_offset;
-                tracing::info!(
+                // Heartbeat fires per clock interval, not per record
+                // batch. SRE-facing liveness is the
+                // `mirror_v3_destination_offset_verified` gauge and
+                // the existing `flushed batch` line; the heartbeat is
+                // primarily diagnostic for the "no records arriving"
+                // case. DEBUG keeps it discoverable via
+                // `RUST_LOG=mirror_core=debug` without taking a slot
+                // in default operator logs.
+                tracing::debug!(
                     expected_offset = expected,
                     progressed,
                     "heartbeat"
@@ -496,11 +538,27 @@ where
                                 // buffer) so the first snapshot file's
                                 // `from` reflects the broker's low
                                 // watermark when that path applies.
-                                tracing::warn!(
-                                    expected,
-                                    delivered = record.source_offset,
-                                    "source delivered above expected on compaction:log mirror; accepting gap"
-                                );
+                                //
+                                // Not logged per-record: a compacted
+                                // topic can have a gap on every
+                                // delivered record (one per surviving
+                                // key after upstream dedup), so any
+                                // log level here scales with millions
+                                // of lines per restart. Observability
+                                // for gap rate is the dedicated
+                                // counter below — plot a rate or
+                                // alert on a threshold rather than
+                                // reading logs. The startup `loop
+                                // start … compaction="log"` INFO
+                                // line is the one-shot "expect gaps
+                                // here" signal.
+                                let (topic_l, partition_l) = current_labels();
+                                metrics::counter!(
+                                    "mirror_v3_source_offset_gap_records_total",
+                                    "topic" => topic_l,
+                                    "partition" => partition_l,
+                                )
+                                .increment(1);
                                 expected = record.source_offset;
                             } else {
                                 return Err(MirrorError::SourceGapAboveExpected {
