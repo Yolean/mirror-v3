@@ -7,12 +7,21 @@
 //!   * Headers: `x-kkv-topic`, `x-kkv-offsets`
 //!   * Body: `{ "topic": "...", "offsets": {"<partition>": <offset>}, "updates": { "<key>": null } }`
 //!
-//! Phase 3a scope: per-record POST (no debounce, no fan-out) wired
-//! through the per-outcome retry × final-action state machine from
-//! `WEBHOOKS.md` § "Outcomes and retry policy". The buffer that
-//! coalesces records into batches per `notify.trigger.debounce` is
-//! added on top in Phase 3c.
+//! Trigger model (`trigger.on: source-consume`):
+//!   * Every accepted record is fed to [`KkvV1Notifier::on_record`]
+//!     by the mirror loop. Records accumulate in an in-memory buffer
+//!     (key set with the highest source offset across the batch).
+//!   * The buffer is drained — i.e. POSTed and reset — when either
+//!     `debounce.max-records` records have arrived since the last
+//!     drain, or `debounce.max-time-ms` has elapsed since the *first*
+//!     record of the current batch landed.
+//!   * The max-records trigger drains inline (`on_record` awaits the
+//!     dispatch); the max-time-ms trigger drains from a background
+//!     timer task. Errors from the timer-task drain are surfaced on
+//!     the next `on_record` / `shutdown` call.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -24,7 +33,12 @@ use mirror_core::{current_labels, Notifier, NotifyError, Record};
 use reqwest::Client;
 use serde::Serialize;
 use thiserror::Error;
+use tokio::sync::{Mutex as TokioMutex, Notify as TokioNotify};
+use tokio::task::JoinHandle;
 use url::Url;
+
+mod buffer;
+use buffer::{Buffer, DrainedBatch};
 
 /// Default path component when a target's URL has no explicit path.
 /// Matches the legacy `@yolean/kafka-keyvalue` Node client's
@@ -68,15 +82,37 @@ struct Endpoint {
     client: Client,
 }
 
-/// Notifier implementing the kkv-v1 wire contract. One instance per
-/// mirror (per `(topic, partition)`). Each instance owns its own
-/// reqwest client and outcome table.
-pub struct KkvV1Notifier {
+/// Stateless dispatcher: takes a built batch payload, runs it through
+/// the per-outcome retry/final-action state machine, against each
+/// configured endpoint in turn. Lives behind an `Arc` so the buffer's
+/// inline-drain path and the background timer task can both invoke it.
+struct Inner {
     endpoints: Vec<Endpoint>,
     outcomes: NotifyOutcomes,
     retry: NotifyRetry,
     topic: String,
     partition: i32,
+}
+
+/// Shared notifier state. `buffer` holds the in-progress batch;
+/// `new_data` wakes the timer task when on_record adds to an empty
+/// buffer; `shutting_down` lets shutdown signal the timer to exit
+/// even if it's mid-sleep; `error_state` lets the timer surface a
+/// terminal error to whichever of on_record / shutdown polls next.
+struct NotifierState {
+    buffer: TokioMutex<Buffer>,
+    new_data: TokioNotify,
+    shutting_down: AtomicBool,
+    error_state: TokioMutex<Option<NotifyError>>,
+}
+
+/// Notifier implementing the kkv-v1 wire contract. One instance per
+/// mirror (per `(topic, partition)`).
+pub struct KkvV1Notifier {
+    inner: Arc<Inner>,
+    state: Arc<NotifierState>,
+    timer_task: Option<JoinHandle<()>>,
+    max_records: u64,
 }
 
 impl KkvV1Notifier {
@@ -87,11 +123,11 @@ impl KkvV1Notifier {
     /// checks here are the lighter-weight last-mile ones the runtime
     /// needs to actually open a `reqwest::Client`.
     ///
-    /// Phase 3a/3b: the trigger mode (`source-consume` vs
-    /// `destination-flush`) is read by the supervisor but doesn't
-    /// alter the dispatcher's behaviour — per-record POST is
-    /// equivalent to a max-records=1 debounce. The 3c batch-and-
-    /// debounce path will live on this same notifier.
+    /// Phase 3c: the trigger mode is read from `notify.trigger.on` and
+    /// the debounce window from `notify.trigger.debounce`. For
+    /// `trigger.on: destination-flush` the debounce config is
+    /// ignored — that path will be added when the
+    /// destination-flush callback hook is wired in a later phase.
     pub fn from_config(
         notify: &mirror_config::Notify,
         topic: String,
@@ -121,23 +157,76 @@ impl KkvV1Notifier {
             endpoints.push(build_endpoint(t, client.clone())?);
         }
 
-        Ok(Self {
+        // Debounce config lives on the trigger block. Defaults come
+        // from `NotifyTrigger::default()` (`Some({100, 250})` for
+        // source-consume); validator rejects missing debounce for
+        // source-consume so the `expect` here is unreachable for any
+        // legit config.
+        let debounce = notify
+            .trigger
+            .debounce
+            .unwrap_or(mirror_config::NotifyDebounce {
+                max_records: 1,
+                max_time_ms: u64::MAX,
+            });
+        let max_records = debounce.max_records;
+        let max_time = Duration::from_millis(debounce.max_time_ms);
+
+        let inner = Arc::new(Inner {
             endpoints,
             outcomes: notify.outcomes,
             retry: notify.retry,
             topic,
             partition,
+        });
+        let state = Arc::new(NotifierState {
+            buffer: TokioMutex::new(Buffer::default()),
+            new_data: TokioNotify::new(),
+            shutting_down: AtomicBool::new(false),
+            error_state: TokioMutex::new(None),
+        });
+
+        // Always spawn the timer task. For `max_records: 1` it just
+        // never fires (every drain is inline from on_record), and the
+        // sleeping task costs ~nothing.
+        let timer_task = tokio::spawn(timer_loop(Arc::clone(&inner), Arc::clone(&state), max_time));
+
+        Ok(Self {
+            inner,
+            state,
+            timer_task: Some(timer_task),
+            max_records,
         })
     }
 
+    /// Drain the current buffer (if any) and dispatch it. Used from
+    /// both the on_record max-records path and shutdown.
+    async fn drain_now(&self) -> Result<(), NotifyError> {
+        let batch = {
+            let mut buf = self.state.buffer.lock().await;
+            buf.take(self.inner.partition)
+        };
+        let Some(batch) = batch else {
+            return Ok(());
+        };
+        self.inner.dispatch_drained(batch).await
+    }
+}
+
+impl Inner {
+    async fn dispatch_drained(&self, batch: DrainedBatch) -> Result<(), NotifyError> {
+        let payload = KkvV1Payload {
+            topic: &self.topic,
+            offsets: batch.offsets,
+            updates: batch.updates,
+        };
+        self.dispatch_batch(&payload).await
+    }
+
     /// POST a single batch payload to every configured endpoint
-    /// serially. Used by both the per-record path (Phase 3a) and the
-    /// debounced batch path (Phase 3c).
+    /// serially. A future fan-out implementation will parallelize
+    /// across resolved addresses.
     async fn dispatch_batch(&self, payload: &KkvV1Payload<'_>) -> Result<(), NotifyError> {
-        // Serial per endpoint: keeps the dispatch deterministic, makes
-        // partial-failure ordering simple, and matches Phase 3a's
-        // "one target most of the time" reality. A future fan-out
-        // implementation will parallelize across resolved addresses.
         for endpoint in &self.endpoints {
             self.dispatch_one(endpoint, payload).await?;
         }
@@ -146,7 +235,7 @@ impl KkvV1Notifier {
 
     /// Resolve outcome → retry/final-action for a single endpoint.
     async fn dispatch_one(
-        &self,
+        self: &Inner,
         endpoint: &Endpoint,
         payload: &KkvV1Payload<'_>,
     ) -> Result<(), NotifyError> {
@@ -253,7 +342,7 @@ impl KkvV1Notifier {
     }
 
     async fn apply_final_action(
-        &self,
+        self: &Inner,
         endpoint: &Endpoint,
         outcome: Outcome,
         policy: NotifyOutcome,
@@ -332,38 +421,129 @@ impl KkvV1Notifier {
 #[async_trait]
 impl Notifier for KkvV1Notifier {
     async fn on_record(&mut self, record: &Record) -> Result<(), NotifyError> {
-        // Phase 3a: per-record dispatch. One record → one POST per
-        // endpoint. The debounce buffer that coalesces records into
-        // batches comes in Phase 3c; until then, `max-records: 1`
-        // is the effective config and the per-record HTTP overhead
-        // is acceptable at low rates.
-        let mut updates = IndexMap::new();
+        // First: surface any terminal error the timer task accumulated
+        // since the last call. Once an error is observed we still let
+        // the run loop hand us further records — they'll just keep
+        // returning the same error until the loop aborts. Take() so
+        // we only return it once.
+        if let Some(err) = self.state.error_state.lock().await.take() {
+            return Err(err);
+        }
+
         // Keys may be missing or non-UTF-8. Legacy kkv emits whatever
         // string repr the consumer expects; mirror-v3 chooses
         // lossy-UTF-8 on bytes and `""` on missing key. Real
         // deployments use UTF-8 keys; this keeps the surface working
         // on edge cases instead of crashing.
         let key_str = render_key(record.key.as_deref());
-        updates.insert(key_str, serde_json::Value::Null);
-
-        let mut offsets = IndexMap::new();
-        offsets.insert(self.partition.to_string(), record.source_offset);
-
-        let payload = KkvV1Payload {
-            topic: &self.topic,
-            offsets,
-            updates,
-        };
 
         let (topic_l, partition_l) = current_labels();
         metrics::counter!(
             "mirror_v3_notify_records_total",
-            "topic" => topic_l,
-            "partition" => partition_l,
+            "topic" => topic_l.clone(),
+            "partition" => partition_l.clone(),
         )
         .increment(1);
 
-        self.dispatch_batch(&payload).await
+        let drain_now;
+        let buffer_depth;
+        {
+            let mut buf = self.state.buffer.lock().await;
+            let was_empty = buf.is_empty();
+            buf.append(key_str, record.source_offset);
+            drain_now = buf.seen_records() >= self.max_records;
+            buffer_depth = buf.seen_records();
+            // Wake the timer when the buffer transitions empty →
+            // non-empty so the max-time-ms clock starts running.
+            if was_empty {
+                self.state.new_data.notify_one();
+            }
+        }
+        metrics::gauge!(
+            "mirror_v3_notify_buffer_records",
+            "topic" => topic_l,
+            "partition" => partition_l,
+        )
+        .set(buffer_depth as f64);
+
+        if drain_now {
+            // Inline drain: caller (the consume loop) blocks on the
+            // POST + retry cycle. This is the natural backpressure
+            // mechanism from the spec's failure-modes table.
+            self.drain_now().await
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn shutdown(&mut self) -> Result<(), NotifyError> {
+        // Signal the timer task to exit even if it's mid-sleep, then
+        // drain any pending batch synchronously so we can surface the
+        // result to the supervisor before returning.
+        self.state.shutting_down.store(true, Ordering::SeqCst);
+        self.state.new_data.notify_one();
+
+        let drain_result = self.drain_now().await;
+
+        if let Some(t) = self.timer_task.take() {
+            // Abort before await — the task may currently be in a
+            // `sleep` we can't easily interrupt otherwise. The task
+            // does no externally-visible work past the shutting_down
+            // check, so aborting is safe.
+            t.abort();
+            let _ = t.await;
+        }
+
+        // Prefer the just-now drain error over any older one the
+        // timer task might have stashed.
+        drain_result?;
+        if let Some(err) = self.state.error_state.lock().await.take() {
+            return Err(err);
+        }
+        Ok(())
+    }
+}
+
+/// Background drain loop. Waits for `state.new_data` to signal that
+/// the buffer transitioned empty → non-empty, then sleeps for the
+/// remaining time before the buffer's `first_at + max_time` deadline
+/// and drains. The on_record path may have drained inline in the
+/// meantime — in that case the take() returns None and we go back to
+/// waiting.
+async fn timer_loop(inner: Arc<Inner>, state: Arc<NotifierState>, max_time: Duration) {
+    loop {
+        state.new_data.notified().await;
+        if state.shutting_down.load(Ordering::SeqCst) {
+            return;
+        }
+        // Compute the actual remaining time relative to the buffer's
+        // first_at — between notify_one() and our wake-up, on_record
+        // could have drained inline (first_at = None) or there could
+        // simply be no data left.
+        let remaining = {
+            let buf = state.buffer.lock().await;
+            match buf.first_at() {
+                Some(t) => max_time.saturating_sub(t.elapsed()),
+                None => continue,
+            }
+        };
+        tokio::time::sleep(remaining).await;
+        if state.shutting_down.load(Ordering::SeqCst) {
+            return;
+        }
+        let batch = {
+            let mut buf = state.buffer.lock().await;
+            buf.take(inner.partition)
+        };
+        if let Some(batch) = batch {
+            if let Err(e) = inner.dispatch_drained(batch).await {
+                // Stash for the next on_record / shutdown to surface;
+                // exit so the buffer doesn't grow further behind a
+                // broken receiver.
+                *state.error_state.lock().await = Some(e);
+                return;
+            }
+        }
     }
 }
 

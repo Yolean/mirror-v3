@@ -137,9 +137,23 @@ async fn handle_post(
     }
 }
 
+/// Build a `Notify` config with an explicit debounce window. Used by
+/// the buffer tests where the default-helper's `max_records: 1`
+/// would force per-record inline drains.
+pub fn notify_pointing_at_debounced(
+    addr: SocketAddr,
+    outcomes: NotifyOutcomes,
+    retry: NotifyRetry,
+    timeout_ms: u64,
+    debounce: NotifyDebounce,
+) -> Notify {
+    let mut n = notify_pointing_at(addr, outcomes, retry, timeout_ms);
+    n.trigger.debounce = Some(debounce);
+    n
+}
+
 /// Build a minimal `Notify` config pointed at the given local addr.
 /// Tests override individual fields by mutating the returned value.
-#[allow(dead_code)]
 pub fn notify_pointing_at(
     addr: SocketAddr,
     outcomes: NotifyOutcomes,
@@ -155,9 +169,15 @@ pub fn notify_pointing_at(
         }],
         trigger: NotifyTrigger {
             on: TriggerOn::SourceConsume,
+            // `max_records: 1` keeps the default helper's
+            // `on_record` dispatch synchronous so the existing
+            // wire-format / outcomes tests can assert against
+            // `server.captured()` immediately after on_record
+            // returns. Debounce-specific tests configure their own
+            // window via `notify_pointing_at_debounced`.
             debounce: Some(NotifyDebounce {
-                max_records: 100,
-                max_time_ms: 250,
+                max_records: 1,
+                max_time_ms: 60_000,
             }),
         },
         timeout_ms,
