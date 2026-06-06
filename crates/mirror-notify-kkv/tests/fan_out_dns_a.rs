@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use common::{Reply, TestServer};
+use common::{ready_cache, Reply, TestServer};
 use mirror_config::{
     FanOut, Notify, NotifyApi, NotifyDebounce, NotifyOutcomes, NotifyRetry, NotifyTarget,
     NotifyTrigger, TriggerOn,
@@ -95,7 +95,15 @@ async fn posts_to_every_resolved_address() {
     });
 
     let cfg = notify_dns_a();
-    let mut n = KkvV1Notifier::from_config_with_resolver(&cfg, "t".into(), 0, resolver).unwrap();
+    let mut n = KkvV1Notifier::from_config_with_resolver(
+        &cfg,
+        "t".into(),
+        0,
+        ready_cache("m"),
+        "m".into(),
+        resolver,
+    )
+    .unwrap();
 
     n.on_record(&rec(1)).await.unwrap();
 
@@ -124,7 +132,15 @@ async fn empty_address_set_returns_transport_error() {
         calls: Arc::clone(&calls),
     });
     let cfg = notify_dns_a();
-    let mut n = KkvV1Notifier::from_config_with_resolver(&cfg, "t".into(), 0, resolver).unwrap();
+    let mut n = KkvV1Notifier::from_config_with_resolver(
+        &cfg,
+        "t".into(),
+        0,
+        ready_cache("m"),
+        "m".into(),
+        resolver,
+    )
+    .unwrap();
 
     let err = n.on_record(&rec(1)).await.unwrap_err();
     let s = format!("{err}");
@@ -148,7 +164,15 @@ async fn one_address_failure_fails_the_whole_batch() {
 
     let mut cfg = notify_dns_a();
     cfg.retry.max_attempts = 2;
-    let mut n = KkvV1Notifier::from_config_with_resolver(&cfg, "t".into(), 0, resolver).unwrap();
+    let mut n = KkvV1Notifier::from_config_with_resolver(
+        &cfg,
+        "t".into(),
+        0,
+        ready_cache("m"),
+        "m".into(),
+        resolver,
+    )
+    .unwrap();
 
     let err = n.on_record(&rec(1)).await.unwrap_err();
     assert!(matches!(err, NotifyError::Exhausted { .. }), "got {err:?}");
@@ -171,7 +195,15 @@ async fn cached_addresses_reused_within_ttl_then_re_resolved_on_failure() {
         calls: Arc::clone(&calls),
     });
     let cfg = notify_dns_a();
-    let mut n = KkvV1Notifier::from_config_with_resolver(&cfg, "t".into(), 0, resolver).unwrap();
+    let mut n = KkvV1Notifier::from_config_with_resolver(
+        &cfg,
+        "t".into(),
+        0,
+        ready_cache("m"),
+        "m".into(),
+        resolver,
+    )
+    .unwrap();
 
     n.on_record(&rec(1)).await.unwrap();
     assert_eq!(calls.load(Ordering::SeqCst), 1, "first call");
@@ -199,7 +231,15 @@ async fn cached_addresses_reused_within_ttl_then_re_resolved_on_failure() {
     });
     let mut cfg2 = notify_dns_a();
     cfg2.retry.max_attempts = 1;
-    let mut n2 = KkvV1Notifier::from_config_with_resolver(&cfg2, "t".into(), 0, resolver2).unwrap();
+    let mut n2 = KkvV1Notifier::from_config_with_resolver(
+        &cfg2,
+        "t".into(),
+        0,
+        ready_cache("m"),
+        "m".into(),
+        resolver2,
+    )
+    .unwrap();
 
     let _ = n2.on_record(&rec(3)).await; // expected err
     assert_eq!(calls2.load(Ordering::SeqCst), 1);
@@ -228,7 +268,15 @@ async fn dispatches_concurrently_to_all_addresses() {
         calls: Arc::clone(&calls),
     });
     let cfg = notify_dns_a();
-    let mut n = KkvV1Notifier::from_config_with_resolver(&cfg, "t".into(), 0, resolver).unwrap();
+    let mut n = KkvV1Notifier::from_config_with_resolver(
+        &cfg,
+        "t".into(),
+        0,
+        ready_cache("m"),
+        "m".into(),
+        resolver,
+    )
+    .unwrap();
 
     let start = Instant::now();
     n.on_record(&rec(1)).await.unwrap();

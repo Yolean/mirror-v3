@@ -7,7 +7,7 @@ mod common;
 
 use std::time::Duration;
 
-use common::{notify_pointing_at, Reply, TestServer};
+use common::{notify_pointing_at, ready_cache, Reply, TestServer};
 use mirror_config::{NotifyOutcomes, NotifyRetry};
 use mirror_core::{Notifier, Record, TimestampType};
 use mirror_notify_kkv::{KkvV1Notifier, KKV_V1_DEFAULT_PATH};
@@ -37,7 +37,8 @@ fn fast_retry() -> NotifyRetry {
 async fn posts_to_default_kkv_path_with_canonical_body() {
     let server = TestServer::start(Reply::Status(200), vec![]).await;
     let cfg = notify_pointing_at(server.addr, NotifyOutcomes::default(), fast_retry(), 1000);
-    let mut notifier = KkvV1Notifier::from_config(&cfg, "events".into(), 3).unwrap();
+    let mut notifier =
+        KkvV1Notifier::from_config(&cfg, "events".into(), 3, ready_cache("m"), "m".into()).unwrap();
 
     notifier
         .on_record(&rec(42, "user-7", "ignored"))
@@ -92,7 +93,8 @@ async fn null_key_serializes_as_empty_string() {
     // with; same as the legacy kkv null handling.
     let server = TestServer::start(Reply::Status(200), vec![]).await;
     let cfg = notify_pointing_at(server.addr, NotifyOutcomes::default(), fast_retry(), 1000);
-    let mut notifier = KkvV1Notifier::from_config(&cfg, "events".into(), 0).unwrap();
+    let mut notifier =
+        KkvV1Notifier::from_config(&cfg, "events".into(), 0, ready_cache("m"), "m".into()).unwrap();
 
     let mut record = rec(7, "", "v");
     record.key = None;
@@ -108,7 +110,8 @@ async fn respects_explicit_target_path_override() {
     let mut cfg = notify_pointing_at(server.addr, NotifyOutcomes::default(), fast_retry(), 1000);
     cfg.targets[0].path = Some("/custom/route".into());
 
-    let mut notifier = KkvV1Notifier::from_config(&cfg, "t".into(), 0).unwrap();
+    let mut notifier =
+        KkvV1Notifier::from_config(&cfg, "t".into(), 0, ready_cache("m"), "m".into()).unwrap();
     notifier.on_record(&rec(1, "k", "v")).await.unwrap();
 
     let captured = server.captured().await;
@@ -130,7 +133,8 @@ async fn timeout_classification_uses_timeout_outcome() {
     };
     let server = TestServer::start(Reply::SlowOk(Duration::from_millis(200)), vec![]).await;
     let cfg = notify_pointing_at(server.addr, outcomes, fast_retry(), 50);
-    let mut notifier = KkvV1Notifier::from_config(&cfg, "t".into(), 0).unwrap();
+    let mut notifier =
+        KkvV1Notifier::from_config(&cfg, "t".into(), 0, ready_cache("m"), "m".into()).unwrap();
 
     let err = notifier
         .on_record(&rec(1, "k", "v"))
@@ -159,7 +163,8 @@ async fn connection_refused_classification_uses_connrefused_outcome() {
     // never bound).
     let addr: std::net::SocketAddr = "127.0.0.1:1".parse().unwrap();
     let cfg = notify_pointing_at(addr, outcomes, fast_retry(), 1000);
-    let mut notifier = KkvV1Notifier::from_config(&cfg, "t".into(), 0).unwrap();
+    let mut notifier =
+        KkvV1Notifier::from_config(&cfg, "t".into(), 0, ready_cache("m"), "m".into()).unwrap();
 
     let err = notifier
         .on_record(&rec(1, "k", "v"))

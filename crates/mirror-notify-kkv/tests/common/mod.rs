@@ -23,6 +23,7 @@ use mirror_config::{
     FanOut, Notify, NotifyApi, NotifyDebounce, NotifyOutcomes, NotifyRetry, NotifyTarget,
     NotifyTrigger, TriggerOn,
 };
+use mirror_core::CacheState;
 use tokio::sync::Mutex;
 
 /// A single captured POST.
@@ -135,6 +136,17 @@ async fn handle_post(
             (StatusCode::OK, "")
         }
     }
+}
+
+/// `CacheState` whose mirror slot is already marked caught-up so the
+/// notifier's per-mirror bootstrap_hwm gate lets every record through.
+/// Use in any test whose focus isn't the readiness gate itself.
+/// `register_mirror(name, 0)` declares an empty source partition, so
+/// the slot's `caught_up` flag is `true` at registration time.
+pub fn ready_cache(mirror_name: &str) -> Arc<CacheState> {
+    let state = Arc::new(CacheState::new());
+    state.register_mirror(mirror_name, 0);
+    state
 }
 
 /// Build a `Notify` config with an explicit debounce window. Used by

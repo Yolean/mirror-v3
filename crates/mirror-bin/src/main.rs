@@ -719,14 +719,16 @@ async fn spawn_mirror(
     //     `NoOpNotifier` (records flow through unobserved).
     let trigger_mode = mirror.notify.as_ref().map(|n| n.trigger.on);
     let notifier_opt = match trigger_mode {
-        Some(mirror_config::TriggerOn::SourceConsume) => build_source_consume_notifier(&mirror)?,
+        Some(mirror_config::TriggerOn::SourceConsume) => {
+            build_source_consume_notifier(&mirror, cache.as_ref())?
+        }
         _ => None,
     };
     if matches!(
         trigger_mode,
         Some(mirror_config::TriggerOn::DestinationFlush)
     ) {
-        let dispatcher = build_flush_dispatcher(&mirror)?;
+        let dispatcher = build_flush_dispatcher(&mirror, cache.as_ref())?;
         tee.set_flush_observer(std::sync::Arc::new(dispatcher));
     }
 
@@ -801,17 +803,32 @@ async fn spawn_mirror(
 /// handles the destination-flush case via [`build_flush_dispatcher`]).
 /// Failures bubble up so the supervisor refuses to spawn a mirror
 /// whose webhook surface can't possibly work.
+///
+/// `cache` carries the shared `CacheState` and the per-mirror name
+/// used by the notifier's bootstrap_hwm suppression gate.
+/// `mirror-config` validation requires `http-access: cache-v1`
+/// whenever `notify` is set, so this binding is always present for
+/// any mirror that reaches this branch.
 fn build_source_consume_notifier(
     mirror: &Mirror,
+    cache: Option<&mirror_core::CacheBinding>,
 ) -> Result<Option<mirror_notify_kkv::KkvV1Notifier>> {
     let Some(notify) = mirror.notify.as_ref() else {
         return Ok(None);
     };
+    let binding = cache.ok_or_else(|| {
+        anyhow::anyhow!(
+            "mirror {} has notify but no cache binding; validator should reject this",
+            mirror.name
+        )
+    })?;
     // Only kkv-v1 exists today; validator rejects other api: values.
     let notifier = mirror_notify_kkv::KkvV1Notifier::from_config(
         notify,
         mirror.topic.clone(),
         mirror.partition as i32,
+        std::sync::Arc::clone(&binding.state),
+        binding.mirror_name.clone(),
     )
     .with_context(|| format!("building notify dispatcher for mirror {}", mirror.name))?;
     Ok(Some(notifier))
@@ -820,7 +837,10 @@ fn build_source_consume_notifier(
 /// Construct the `FlushDispatcher` for a mirror with
 /// `trigger.on: destination-flush`. Validator guarantees the mirror
 /// has notify set; this asserts on the trigger variant.
-fn build_flush_dispatcher(mirror: &Mirror) -> Result<mirror_notify_kkv::FlushDispatcher> {
+fn build_flush_dispatcher(
+    mirror: &Mirror,
+    cache: Option<&mirror_core::CacheBinding>,
+) -> Result<mirror_notify_kkv::FlushDispatcher> {
     let notify = mirror
         .notify
         .as_ref()
@@ -829,10 +849,18 @@ fn build_flush_dispatcher(mirror: &Mirror) -> Result<mirror_notify_kkv::FlushDis
         notify.trigger.on,
         mirror_config::TriggerOn::DestinationFlush
     ));
+    let binding = cache.ok_or_else(|| {
+        anyhow::anyhow!(
+            "mirror {} has notify but no cache binding; validator should reject this",
+            mirror.name
+        )
+    })?;
     let dispatcher = mirror_notify_kkv::FlushDispatcher::from_config(
         notify,
         mirror.topic.clone(),
         mirror.partition as i32,
+        std::sync::Arc::clone(&binding.state),
+        binding.mirror_name.clone(),
     )
     .with_context(|| {
         format!(

@@ -8,7 +8,7 @@ mod common;
 
 use std::time::Duration;
 
-use common::{notify_pointing_at, Reply, TestServer};
+use common::{notify_pointing_at, ready_cache, Reply, TestServer};
 use mirror_config::{FinalAction, NotifyOutcome, NotifyOutcomes, NotifyRetry};
 use mirror_core::{Notifier, NotifyError, Record, TimestampType};
 use mirror_notify_kkv::KkvV1Notifier;
@@ -66,7 +66,8 @@ enum TargetBucket {
 async fn outcome_2xx_default_accepts_after_one_attempt() {
     let server = TestServer::start(Reply::Status(200), vec![]).await;
     let cfg = notify_pointing_at(server.addr, NotifyOutcomes::default(), retry(5), 1000);
-    let mut n = KkvV1Notifier::from_config(&cfg, "t".into(), 0).unwrap();
+    let mut n =
+        KkvV1Notifier::from_config(&cfg, "t".into(), 0, ready_cache("m"), "m".into()).unwrap();
 
     n.on_record(&rec(1)).await.expect("2xx must accept");
     assert_eq!(
@@ -82,7 +83,8 @@ async fn outcome_2xx_default_accepts_after_one_attempt() {
 async fn outcome_4xx_default_fails_immediately() {
     let server = TestServer::start(Reply::Status(404), vec![]).await;
     let cfg = notify_pointing_at(server.addr, NotifyOutcomes::default(), retry(5), 1000);
-    let mut n = KkvV1Notifier::from_config(&cfg, "t".into(), 0).unwrap();
+    let mut n =
+        KkvV1Notifier::from_config(&cfg, "t".into(), 0, ready_cache("m"), "m".into()).unwrap();
 
     let err = n.on_record(&rec(1)).await.unwrap_err();
     assert!(
@@ -105,7 +107,8 @@ async fn outcome_4xx_with_skip_drops_batch_silently() {
     );
     let server = TestServer::start(Reply::Status(404), vec![]).await;
     let cfg = notify_pointing_at(server.addr, outcomes, retry(5), 1000);
-    let mut n = KkvV1Notifier::from_config(&cfg, "t".into(), 0).unwrap();
+    let mut n =
+        KkvV1Notifier::from_config(&cfg, "t".into(), 0, ready_cache("m"), "m".into()).unwrap();
 
     n.on_record(&rec(1)).await.expect("skip must surface as Ok");
     assert_eq!(server.request_count(), 1);
@@ -124,7 +127,8 @@ async fn outcome_4xx_with_retry_and_accept_treats_as_delivered_after_exhaustion(
     );
     let server = TestServer::start(Reply::Status(400), vec![]).await;
     let cfg = notify_pointing_at(server.addr, outcomes, retry(3), 1000);
-    let mut n = KkvV1Notifier::from_config(&cfg, "t".into(), 0).unwrap();
+    let mut n =
+        KkvV1Notifier::from_config(&cfg, "t".into(), 0, ready_cache("m"), "m".into()).unwrap();
 
     n.on_record(&rec(1))
         .await
@@ -142,7 +146,8 @@ async fn outcome_4xx_with_retry_and_accept_treats_as_delivered_after_exhaustion(
 async fn outcome_5xx_default_retries_then_fails() {
     let server = TestServer::start(Reply::Status(503), vec![]).await;
     let cfg = notify_pointing_at(server.addr, NotifyOutcomes::default(), retry(4), 1000);
-    let mut n = KkvV1Notifier::from_config(&cfg, "t".into(), 0).unwrap();
+    let mut n =
+        KkvV1Notifier::from_config(&cfg, "t".into(), 0, ready_cache("m"), "m".into()).unwrap();
 
     let err = n.on_record(&rec(1)).await.unwrap_err();
     match err {
@@ -166,7 +171,8 @@ async fn outcome_5xx_recovers_when_server_starts_returning_2xx() {
     )
     .await;
     let cfg = notify_pointing_at(server.addr, NotifyOutcomes::default(), retry(5), 1000);
-    let mut n = KkvV1Notifier::from_config(&cfg, "t".into(), 0).unwrap();
+    let mut n =
+        KkvV1Notifier::from_config(&cfg, "t".into(), 0, ready_cache("m"), "m".into()).unwrap();
 
     n.on_record(&rec(1))
         .await
@@ -187,7 +193,8 @@ async fn outcome_5xx_with_skip_drops_batch_after_exhaustion() {
     );
     let server = TestServer::start(Reply::Status(500), vec![]).await;
     let cfg = notify_pointing_at(server.addr, outcomes, retry(3), 1000);
-    let mut n = KkvV1Notifier::from_config(&cfg, "t".into(), 0).unwrap();
+    let mut n =
+        KkvV1Notifier::from_config(&cfg, "t".into(), 0, ready_cache("m"), "m".into()).unwrap();
 
     n.on_record(&rec(1))
         .await
@@ -203,7 +210,8 @@ async fn outcome_3xx_default_fails_immediately() {
     // surface it loudly.
     let server = TestServer::start(Reply::Status(301), vec![]).await;
     let cfg = notify_pointing_at(server.addr, NotifyOutcomes::default(), retry(5), 1000);
-    let mut n = KkvV1Notifier::from_config(&cfg, "t".into(), 0).unwrap();
+    let mut n =
+        KkvV1Notifier::from_config(&cfg, "t".into(), 0, ready_cache("m"), "m".into()).unwrap();
 
     let err = n.on_record(&rec(1)).await.unwrap_err();
     assert!(
@@ -221,7 +229,8 @@ async fn outcome_timeout_default_retries_then_fails() {
     // times out. Default outcome is retry: true, final: fail.
     let server = TestServer::start(Reply::SlowOk(Duration::from_millis(200)), vec![]).await;
     let cfg = notify_pointing_at(server.addr, NotifyOutcomes::default(), retry(3), 30);
-    let mut n = KkvV1Notifier::from_config(&cfg, "t".into(), 0).unwrap();
+    let mut n =
+        KkvV1Notifier::from_config(&cfg, "t".into(), 0, ready_cache("m"), "m".into()).unwrap();
 
     let err = n.on_record(&rec(1)).await.unwrap_err();
     match err {
@@ -244,7 +253,8 @@ async fn outcome_timeout_with_no_retry_fails_after_first_attempt() {
     );
     let server = TestServer::start(Reply::SlowOk(Duration::from_millis(200)), vec![]).await;
     let cfg = notify_pointing_at(server.addr, outcomes, retry(5), 30);
-    let mut n = KkvV1Notifier::from_config(&cfg, "t".into(), 0).unwrap();
+    let mut n =
+        KkvV1Notifier::from_config(&cfg, "t".into(), 0, ready_cache("m"), "m".into()).unwrap();
 
     let err = n.on_record(&rec(1)).await.unwrap_err();
     assert!(
@@ -273,7 +283,8 @@ async fn outcome_connrefused_default_retries_then_fails() {
         path: None,
         fan_out: FanOut::None,
     }];
-    let mut n = KkvV1Notifier::from_config(&cfg, "t".into(), 0).unwrap();
+    let mut n =
+        KkvV1Notifier::from_config(&cfg, "t".into(), 0, ready_cache("m"), "m".into()).unwrap();
 
     let err = n.on_record(&rec(1)).await.unwrap_err();
     match err {

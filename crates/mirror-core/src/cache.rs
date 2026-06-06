@@ -223,6 +223,19 @@ impl CacheState {
         self.ready.load(Ordering::Acquire)
     }
 
+    /// Per-mirror readiness gate. Returns the slot's `caught_up`
+    /// value if `mirror_name` was registered; `false` for unknown
+    /// names so callers that read the flag through the wrong key
+    /// cannot accidentally fire before the supervisor wires up.
+    /// Sticky on `true` per the same invariant `is_ready` relies on.
+    pub fn is_mirror_ready(&self, mirror_name: &str) -> bool {
+        let mirrors = self.mirrors.read().expect("cache mirrors poisoned");
+        mirrors
+            .get(mirror_name)
+            .map(|m| m.caught_up.load(Ordering::Acquire))
+            .unwrap_or(false)
+    }
+
     /// Lookup for `GET /cache/v1/raw/{key}`. Returns `None` if the
     /// key is absent (404 territory).
     pub fn get_value(&self, key: &str) -> Option<Vec<u8>> {
@@ -290,6 +303,34 @@ mod tests {
             value: value.map(|v| v.to_vec()),
             headers: Vec::<Header>::new(),
         }
+    }
+
+    #[test]
+    fn is_mirror_ready_reports_per_mirror_status() {
+        // Per-mirror gate is the kkv-v1 notifier's suppression knob:
+        // it lets one mirror start emitting webhooks while another is
+        // still warming up against its bootstrap_hwm. Verify the three
+        // states the notifier cares about: unknown name, registered
+        // but pre-hwm, registered and caught up.
+        let s = CacheState::new();
+        assert!(
+            !s.is_mirror_ready("unknown"),
+            "unknown name must report false so an uninstrumented \
+             notifier can't accidentally fire"
+        );
+        s.register_mirror("warming", 3);
+        assert!(!s.is_mirror_ready("warming"), "hwm 3, no records yet");
+        s.apply_record("warming", &rec("warming", 0, 0, "k0", Some(b"v")));
+        s.apply_record("warming", &rec("warming", 0, 1, "k1", Some(b"v")));
+        assert!(!s.is_mirror_ready("warming"), "still 1 offset short of hwm");
+        s.apply_record("warming", &rec("warming", 0, 2, "k2", Some(b"v")));
+        assert!(s.is_mirror_ready("warming"), "offset hwm-1 flips the slot");
+        // Independent slot stays at its own state.
+        s.register_mirror("empty", 0);
+        assert!(
+            s.is_mirror_ready("empty"),
+            "hwm 0 = immediately ready, independent of other mirrors"
+        );
     }
 
     #[test]

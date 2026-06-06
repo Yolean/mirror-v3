@@ -8,7 +8,7 @@ mod common;
 
 use std::time::Duration;
 
-use common::{Reply, TestServer};
+use common::{ready_cache, Reply, TestServer};
 use mirror_config::{
     FanOut, Notify, NotifyApi, NotifyOutcomes, NotifyRetry, NotifyTarget, NotifyTrigger, TriggerOn,
 };
@@ -64,7 +64,8 @@ async fn fires_one_post_per_flush_event_with_empty_updates() {
     let server = TestServer::start(Reply::Status(200), vec![]).await;
     let cfg = notify_dest_flush(server.addr);
     let mut dispatcher =
-        FlushDispatcher::from_config(&cfg, "events".into(), 3).expect("must build");
+        FlushDispatcher::from_config(&cfg, "events".into(), 3, ready_cache("m"), "m".into())
+            .expect("must build");
 
     // Drive the observer twice; simulates two real flushes from the
     // TeeSink coordinator. `from` is ignored by the dispatcher.
@@ -101,7 +102,8 @@ async fn shutdown_surfaces_drainer_dispatch_error() {
     let server = TestServer::start(Reply::Status(503), vec![]).await;
     let cfg = notify_dest_flush(server.addr);
     let mut dispatcher =
-        FlushDispatcher::from_config(&cfg, "events".into(), 0).expect("must build");
+        FlushDispatcher::from_config(&cfg, "events".into(), 0, ready_cache("m"), "m".into())
+            .expect("must build");
 
     dispatcher.on_flushed(0, 9);
 
@@ -143,7 +145,9 @@ async fn shutdown_surfaces_drainer_dispatch_error() {
 async fn shutdown_with_no_events_is_a_noop() {
     let server = TestServer::start(Reply::Status(200), vec![]).await;
     let cfg = notify_dest_flush(server.addr);
-    let mut dispatcher = FlushDispatcher::from_config(&cfg, "t".into(), 0).expect("must build");
+    let mut dispatcher =
+        FlushDispatcher::from_config(&cfg, "t".into(), 0, ready_cache("m"), "m".into())
+            .expect("must build");
 
     dispatcher
         .shutdown()

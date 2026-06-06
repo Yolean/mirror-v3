@@ -31,7 +31,7 @@ use indexmap::IndexMap;
 use mirror_config::{
     FanOut, FinalAction, NotifyApi, NotifyOutcome, NotifyOutcomes, NotifyRetry, NotifyTarget,
 };
-use mirror_core::{current_labels, Notifier, NotifyError, Record};
+use mirror_core::{current_labels, CacheState, Notifier, NotifyError, Record};
 use reqwest::Client;
 use serde::Serialize;
 use thiserror::Error;
@@ -156,6 +156,13 @@ pub struct KkvV1Notifier {
     state: Arc<NotifierState>,
     timer_task: Option<JoinHandle<()>>,
     max_records: u64,
+    /// Per-mirror readiness handle. `on_record` consults
+    /// `cache_state.is_mirror_ready(&mirror_name)` and drops records
+    /// whose source offset hasn't crossed the mirror's bootstrap
+    /// high-watermark yet. Matches the legacy kkv `KafkaCache` Stage
+    /// gate which suppressed push notifications until `Polling`.
+    cache_state: Arc<CacheState>,
+    mirror_name: String,
 }
 
 impl KkvV1Notifier {
@@ -174,8 +181,17 @@ impl KkvV1Notifier {
         notify: &mirror_config::Notify,
         topic: String,
         partition: i32,
+        cache_state: Arc<CacheState>,
+        mirror_name: String,
     ) -> Result<Self, BuildError> {
-        Self::from_config_with_resolver(notify, topic, partition, Arc::new(SystemDnsResolver))
+        Self::from_config_with_resolver(
+            notify,
+            topic,
+            partition,
+            cache_state,
+            mirror_name,
+            Arc::new(SystemDnsResolver),
+        )
     }
 
     /// Same as [`Self::from_config`] but with a caller-supplied DNS
@@ -187,6 +203,8 @@ impl KkvV1Notifier {
         notify: &mirror_config::Notify,
         topic: String,
         partition: i32,
+        cache_state: Arc<CacheState>,
+        mirror_name: String,
         resolver: Arc<dyn DnsAResolver>,
     ) -> Result<Self, BuildError> {
         let inner = Arc::new(build_inner(notify, topic, partition, resolver)?);
@@ -222,6 +240,8 @@ impl KkvV1Notifier {
             state,
             timer_task: Some(timer_task),
             max_records,
+            cache_state,
+            mirror_name,
         })
     }
 
@@ -572,6 +592,26 @@ impl Notifier for KkvV1Notifier {
             return Err(err);
         }
 
+        // Suppress records whose source offset hasn't crossed this
+        // mirror's bootstrap high-watermark yet. CacheState's
+        // per-mirror `caught_up` flag flips in the destination write
+        // path once `last_offset + 1 >= bootstrap_hwm`; the first
+        // post-watermark record falls through to dispatch as normal.
+        // Sticky once true, no flip-back. Matches the legacy kkv
+        // `KafkaCache` Stage gate which suppresses push notifications
+        // until `Polling`. The suppressed counter is the operator's
+        // visibility into how much of a backlog was skipped.
+        if !self.cache_state.is_mirror_ready(&self.mirror_name) {
+            let (topic_l, partition_l) = current_labels();
+            metrics::counter!(
+                "mirror_v3_notify_suppressed_records_total",
+                "topic" => topic_l,
+                "partition" => partition_l,
+            )
+            .increment(1);
+            return Ok(());
+        }
+
         // Keys may be missing or non-UTF-8. Legacy kkv emits whatever
         // string repr the consumer expects; mirror-v3 chooses
         // lossy-UTF-8 on bytes and `""` on missing key. Real
@@ -746,6 +786,14 @@ pub struct FlushDispatcher {
     tx: tokio::sync::mpsc::UnboundedSender<FlushEvent>,
     drainer: Option<JoinHandle<()>>,
     error_state: Arc<TokioMutex<Option<NotifyError>>>,
+    /// Per-mirror readiness handle. `on_flushed` consults
+    /// `cache_state.is_mirror_ready(&mirror_name)` and drops events
+    /// arriving before the mirror's bootstrap high-watermark is
+    /// crossed. Matches the source-consume gate on [`KkvV1Notifier`].
+    cache_state: Arc<CacheState>,
+    mirror_name: String,
+    topic: String,
+    partition: i32,
 }
 
 enum FlushEvent {
@@ -758,17 +806,28 @@ impl FlushDispatcher {
         notify: &mirror_config::Notify,
         topic: String,
         partition: i32,
+        cache_state: Arc<CacheState>,
+        mirror_name: String,
     ) -> Result<Self, BuildError> {
-        Self::from_config_with_resolver(notify, topic, partition, Arc::new(SystemDnsResolver))
+        Self::from_config_with_resolver(
+            notify,
+            topic,
+            partition,
+            cache_state,
+            mirror_name,
+            Arc::new(SystemDnsResolver),
+        )
     }
 
     pub fn from_config_with_resolver(
         notify: &mirror_config::Notify,
         topic: String,
         partition: i32,
+        cache_state: Arc<CacheState>,
+        mirror_name: String,
         resolver: Arc<dyn DnsAResolver>,
     ) -> Result<Self, BuildError> {
-        let inner = Arc::new(build_inner(notify, topic, partition, resolver)?);
+        let inner = Arc::new(build_inner(notify, topic.clone(), partition, resolver)?);
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let error_state = Arc::new(TokioMutex::new(None));
         let drainer = tokio::spawn(flush_drainer_loop(
@@ -781,6 +840,10 @@ impl FlushDispatcher {
             tx,
             drainer: Some(drainer),
             error_state,
+            cache_state,
+            mirror_name,
+            topic,
+            partition,
         })
     }
 
@@ -810,6 +873,22 @@ impl FlushDispatcher {
 
 impl mirror_core::FlushObserver for FlushDispatcher {
     fn on_flushed(&self, _from: u64, to: u64) {
+        // Suppress flush events arriving before this mirror's
+        // bootstrap high-watermark is crossed. Symmetric with the
+        // source-consume gate in [`KkvV1Notifier::on_record`] so a
+        // cold restart doesn't fan a backlog catch-up notify out to
+        // every consumer pod. `on_flushed` is a sync trait method
+        // outside the `MIRROR_LABELS` task-local scope, so labels
+        // come from the fields populated at construction.
+        if !self.cache_state.is_mirror_ready(&self.mirror_name) {
+            metrics::counter!(
+                "mirror_v3_notify_suppressed_records_total",
+                "topic" => self.topic.clone(),
+                "partition" => self.partition.to_string(),
+            )
+            .increment(1);
+            return;
+        }
         // Fire-and-forget into the channel. If the drainer has
         // already exited (error_state is set), the send fails; and
         // that's fine; the supervisor will see the error on the

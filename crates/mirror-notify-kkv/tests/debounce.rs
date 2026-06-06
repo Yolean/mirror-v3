@@ -10,7 +10,7 @@ mod common;
 
 use std::time::Duration;
 
-use common::{notify_pointing_at, notify_pointing_at_debounced, Reply, TestServer};
+use common::{notify_pointing_at, notify_pointing_at_debounced, ready_cache, Reply, TestServer};
 use mirror_config::{NotifyDebounce, NotifyOutcomes, NotifyRetry};
 use mirror_core::{Notifier, Record, TimestampType};
 use mirror_notify_kkv::KkvV1Notifier;
@@ -51,7 +51,8 @@ async fn drains_when_max_records_reached() {
             max_time_ms: 60_000,
         },
     );
-    let mut n = KkvV1Notifier::from_config(&cfg, "t".into(), 0).unwrap();
+    let mut n =
+        KkvV1Notifier::from_config(&cfg, "t".into(), 0, ready_cache("m"), "m".into()).unwrap();
 
     n.on_record(&rec(10, "a")).await.unwrap();
     n.on_record(&rec(11, "b")).await.unwrap();
@@ -94,7 +95,8 @@ async fn drains_when_max_time_ms_elapses() {
             max_time_ms: 50,
         },
     );
-    let mut n = KkvV1Notifier::from_config(&cfg, "t".into(), 0).unwrap();
+    let mut n =
+        KkvV1Notifier::from_config(&cfg, "t".into(), 0, ready_cache("m"), "m".into()).unwrap();
 
     n.on_record(&rec(7, "x")).await.unwrap();
     assert_eq!(
@@ -132,7 +134,8 @@ async fn key_dedup_keeps_one_entry_with_max_offset() {
             max_time_ms: 60_000,
         },
     );
-    let mut n = KkvV1Notifier::from_config(&cfg, "t".into(), 0).unwrap();
+    let mut n =
+        KkvV1Notifier::from_config(&cfg, "t".into(), 0, ready_cache("m"), "m".into()).unwrap();
 
     n.on_record(&rec(20, "hot")).await.unwrap();
     n.on_record(&rec(21, "hot")).await.unwrap();
@@ -166,7 +169,8 @@ async fn shutdown_drains_pending_batch() {
             max_time_ms: 60_000,
         },
     );
-    let mut n = KkvV1Notifier::from_config(&cfg, "t".into(), 0).unwrap();
+    let mut n =
+        KkvV1Notifier::from_config(&cfg, "t".into(), 0, ready_cache("m"), "m".into()).unwrap();
 
     n.on_record(&rec(1, "a")).await.unwrap();
     n.on_record(&rec(2, "b")).await.unwrap();
@@ -187,7 +191,8 @@ async fn shutdown_drains_pending_batch() {
 async fn shutdown_with_empty_buffer_is_a_noop() {
     let server = TestServer::start(Reply::Status(200), vec![]).await;
     let cfg = notify_pointing_at(server.addr, NotifyOutcomes::default(), retry(1), 1000);
-    let mut n = KkvV1Notifier::from_config(&cfg, "t".into(), 0).unwrap();
+    let mut n =
+        KkvV1Notifier::from_config(&cfg, "t".into(), 0, ready_cache("m"), "m".into()).unwrap();
 
     n.shutdown().await.expect("empty shutdown must succeed");
     assert_eq!(server.request_count(), 0, "no records → no POST");
@@ -209,7 +214,8 @@ async fn timer_drain_failure_surfaces_on_next_on_record() {
             max_time_ms: 50,
         },
     );
-    let mut n = KkvV1Notifier::from_config(&cfg, "t".into(), 0).unwrap();
+    let mut n =
+        KkvV1Notifier::from_config(&cfg, "t".into(), 0, ready_cache("m"), "m".into()).unwrap();
 
     n.on_record(&rec(1, "a")).await.unwrap();
     // Wait long enough for the timer to fire, exhaust retries
@@ -239,7 +245,8 @@ async fn buffer_continues_to_accept_after_inline_drain() {
             max_time_ms: 60_000,
         },
     );
-    let mut n = KkvV1Notifier::from_config(&cfg, "t".into(), 0).unwrap();
+    let mut n =
+        KkvV1Notifier::from_config(&cfg, "t".into(), 0, ready_cache("m"), "m".into()).unwrap();
 
     // First batch
     n.on_record(&rec(10, "a")).await.unwrap();
