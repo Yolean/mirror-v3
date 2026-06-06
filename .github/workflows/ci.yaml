@@ -102,7 +102,15 @@ jobs:
       uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f  # v7.1.0
       with:
         context: .
-        platforms: linux/amd64,linux/arm64
+        # PR/QA runs build linux/amd64 only — the arm64 leg runs under
+        # QEMU on amd64 runners and dominates wall time (Rust +
+        # librdkafka cross-compile). Push events build both arches
+        # because releases ship multi-arch. See issue #2.
+        # GHA's per-branch cache scope means PR caches don't warm main
+        # anyway, so dropping arm64 from PR runs is the simplest
+        # effective fix; switching to a registry-backed cache would
+        # share across branches but needs PR write access to ghcr.
+        platforms: ${{ github.event_name == 'pull_request' && 'linux/amd64' || 'linux/amd64,linux/arm64' }}
         push: ${{ github.event_name != 'pull_request' }}
         tags: ${{ steps.meta.outputs.tags }}
         labels: ${{ steps.meta.outputs.labels }}
