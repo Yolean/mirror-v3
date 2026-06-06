@@ -27,7 +27,11 @@ mirrors:
     format: parquet
     compression: zstd-1
     http-access:
-      api: cache-v1
+      # /cache/v1/user-states/raw/{key} always; the unprefixed
+      # /cache/v1/raw/{key} is the legacy kkv path consumers hit,
+      # served onto this mirror's view via `cache-v1-main`.
+      cache-v1: {}
+      cache-v1-main: {}
     notify:
       api: kkv-v1
       targets:

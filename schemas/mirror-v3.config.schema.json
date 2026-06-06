@@ -452,27 +452,43 @@
       ]
     },
     "HttpAccess": {
-      "description": "HTTP read-access block. Today the only variant is the KKV-compatible\n`/cache/v1` surface; the field is grouped so future APIs can be\nadded without re-shaping the YAML.",
+      "description": "HTTP read-access block. Multiple API surfaces can be enabled on\nthe same mirror; each is configured by its presence under its\nown key. The map shape (rather than the original `{ api: ... }`\nenum) lets a mirror opt into more than one API and keeps room\nfor per-API knobs without further config reshaping.",
       "type": "object",
       "properties": {
-        "api": {
-          "$ref": "#/$defs/HttpAccessApi"
+        "cache-v1": {
+          "description": "`/cache/v1/{mirror}/raw/{key}` etc. mounted at the mirror's\nown name. Required if `cache-v1-main` is set. See the\n`mirror-cache` crate for behavior and the committed OpenAPI\n3.1 spec in `schemas/mirror-v3.cache.openapi.json`.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CacheV1Config"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "cache-v1-main": {
+          "description": "`/cache/v1/raw/{key}` etc. mounted at the unprefixed path,\ndispatching to this mirror's per-mirror view. At most one\nmirror in the whole config may set this; the validator\nrejects more than one so a `cache-v1-main` consumer sees a\nsingle deterministic view. Migration aid; once every consumer\nhas moved to `/cache/v1/{mirror}/...` it can be removed.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CacheV1MainConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
-      "additionalProperties": false,
-      "required": [
-        "api"
-      ]
+      "additionalProperties": false
     },
-    "HttpAccessApi": {
-      "description": "Variants of the read API surface mirror-v3 will host. Each opt-in\nmirror declares which one applies to it; today only `cache-v1`\nexists (a drop-in for `Yolean/kafka-keyvalue`'s `/cache/v1`).",
-      "oneOf": [
-        {
-          "description": "`/cache/v1/raw/{key}`, `/cache/v1/keys`, `/cache/v1/values`,\n`/cache/v1/offset/{topic}/{partition}`. See the `mirror-cache`\ncrate for behavior and the committed OpenAPI 3.1 spec in\n`schemas/mirror-v3.cache.openapi.json`.",
-          "type": "string",
-          "const": "cache-v1"
-        }
-      ]
+    "CacheV1Config": {
+      "description": "Per-API configuration block for `cache-v1`. Empty today, populated\nas the field is given operator-tunable knobs.",
+      "type": "object",
+      "additionalProperties": false
+    },
+    "CacheV1MainConfig": {
+      "description": "Per-API configuration block for `cache-v1-main`. Empty today.",
+      "type": "object",
+      "additionalProperties": false
     },
     "Notify": {
       "description": "Per-mirror outbound notify block. Today only the `kkv-v1` API\nvariant is supported; future variants (e.g. `nats-v1`, a\n`kkv-v2` with auth) hang off the same block without re-shaping.",

@@ -2,7 +2,7 @@
 
 A minimal, configurable outbound webhook surface so mirror-v3 can
 replace `Yolean/kafka-keyvalue` (kkv) end-to-end, not just on the
-read side. The existing `http-access: { api: cache-v1 }` block
+read side. The existing `http-access: { cache-v1: {} }` block
 covers the GET surface; this proposal adds the symmetric
 *you-need-to-re-read* push that legacy consumers depend on.
 
@@ -55,7 +55,7 @@ Non-goals (out of scope, deferable):
   "unrecoverable error exits the process" model).
 - Push-only mode (no cache-v1, just notify). The kkv contract
   assumes consumers re-fetch via cache-v1 on receipt; require
-  `http-access: { api: cache-v1 }` to coexist for now.
+  `http-access: { cache-v1: {} }` to coexist for now.
 
 ## Use cases this needs to cover
 
@@ -99,7 +99,7 @@ mirrors:
     compression: zstd-1
     compaction: log
     http-access:
-      api: cache-v1
+      cache-v1: {}
     notify:
       api: kkv-v1                              # only variant initially
       targets:
@@ -164,9 +164,9 @@ Field-level notes:
   below; defaults match what kkv operators tend to expect.
 
 The block is **forbidden** unless the mirror also has
-`http-access: { api: cache-v1 }` (validator rejects otherwise). The
-notify body tells consumers "go re-read"; that's only meaningful if
-there's somewhere to re-read from.
+`http-access.cache-v1` set (validator rejects otherwise). The notify
+body tells consumers "go re-read"; that's only meaningful if there's
+somewhere to re-read from.
 
 ## Wire contract (`api: kkv-v1`)
 
@@ -636,7 +636,7 @@ Per-record DEBUG only; counters cover the operational signal.
 
 ## Validation
 
-- `notify` requires `http-access.api: cache-v1` on the same mirror.
+- `notify` requires `http-access.cache-v1` on the same mirror.
 - `notify.targets` non-empty.
 - `notify.trigger.debounce.max-records >= 1`, `max-time-ms >= 1`
   (when `trigger.on: source-consume`).

@@ -1,12 +1,14 @@
-//! Shared in-memory cache view for `http-access: { api: cache-v1 }`
+//! Per-mirror in-memory cache views for `http-access: { cache-v1: {} }`
 //! mirrors.
 //!
-//! mirror-v3's KKV-compatibility mode keeps a merged `key → latest
-//! value` map of every record consumed by every opt-in mirror. This
-//! module owns the cross-task state behind an `Arc<CacheState>`: the
-//! sinks update it from the consume loop (per-record, *not* per-flush
-//! — freshness is independent of bucket-write cadence), and the HTTP
-//! handlers in `mirror-cache` read from it.
+//! Each opt-in mirror owns its own `key → latest value` map and
+//! `(topic, partition) → offset` map; the sinks update those from
+//! the consume loop (per-record, *not* per-flush — freshness is
+//! independent of bucket-write cadence), and the HTTP handlers in
+//! `mirror-cache` read them out under
+//! `/cache/v1/{mirror}/...`. A single mirror may additionally
+//! enable `cache-v1-main`, in which case `mirror-cache` mounts the
+//! unprefixed `/cache/v1/...` paths onto that mirror's view.
 //!
 //! ## Monotonicity
 //!
@@ -21,9 +23,11 @@
 //! Each participating mirror declares a `bootstrap_hwm` at sink
 //! open (`fetch_high_watermark` against the source partition). Once a
 //! mirror's last-applied offset has caught up to its bootstrap
-//! watermark, it is "ready"; once *every* registered mirror is
-//! ready, [`CacheState::is_ready`] flips to `true` and stays true.
-//! HTTP handlers gate on this; they return 503 until it flips.
+//! watermark, it is "ready"; per-mirror HTTP handlers gate on
+//! [`CacheState::is_mirror_ready`] and return 503 until that mirror
+//! flips. The aggregate [`CacheState::is_ready`] flips only when
+//! *every* registered mirror is ready, and backs the `/q/health/ready`
+//! drop-in.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -65,32 +69,40 @@ pub struct TopicPartitionOffset {
     pub offset: u64,
 }
 
-/// Per-mirror readiness slot. The supervisor (mirror-bin) creates
-/// one per opt-in mirror at startup, populates `bootstrap_hwm`, and
-/// stores the slot in [`CacheState`]. The sink's per-record path
-/// flips the slot to `caught_up` once its last-seen offset has
-/// crossed `bootstrap_hwm`.
+/// Per-mirror slot. The supervisor (mirror-bin) creates one per
+/// opt-in mirror at startup, populates `bootstrap_hwm`, and stores
+/// the slot in [`CacheState`]. The sink's per-record path applies
+/// records into this slot's `view` / `offsets` and flips the slot
+/// to `caught_up` once its last-seen offset has crossed
+/// `bootstrap_hwm`.
 #[derive(Debug)]
-struct MirrorReadiness {
+struct MirrorSlot {
     bootstrap_hwm: u64,
     caught_up: AtomicBool,
+    /// `key → latest-value` for this mirror only. Iteration order is
+    /// insertion order (the position a key gets the *first* time
+    /// it's seen). Overwrites don't change position. Tombstones
+    /// shift subsequent keys down.
+    view: RwLock<IndexMap<String, Vec<u8>>>,
+    /// Last-seen source offset per (topic, partition) within this
+    /// mirror. Monotonic.
+    offsets: RwLock<HashMap<TopicPartition, u64>>,
 }
 
 #[derive(Debug, Default)]
 pub struct CacheState {
-    /// Merged key → latest-value across every opt-in mirror.
-    /// Iteration order is **insertion order**: the position a key
-    /// gets the *first* time it's seen. Overwrites don't change
-    /// position. Tombstones shift subsequent keys down to fill the
-    /// gap. Clients that want a sorted listing sort client-side.
-    view: RwLock<IndexMap<String, Vec<u8>>>,
-    /// Last-seen source offset per (topic, partition). Monotonic.
-    offsets: RwLock<HashMap<TopicPartition, u64>>,
-    /// Per-mirror readiness slots, keyed by the mirror's
-    /// configuration name (unique per process).
-    mirrors: RwLock<HashMap<String, MirrorReadiness>>,
-    /// Sticky global ready flag. Flips to `true` once every
-    /// registered mirror has caught up; never flips back.
+    /// Per-mirror slots, keyed by the mirror's configuration name
+    /// (unique per process).
+    mirrors: RwLock<HashMap<String, MirrorSlot>>,
+    /// Name of the mirror that opted into `cache-v1-main`, if any.
+    /// `mirror-cache` consults this to decide whether to mount the
+    /// unprefixed `/cache/v1/...` routes and which slot to dispatch
+    /// them to. Sticky for the lifetime of the process — set at
+    /// startup, never re-assigned. Validator enforces at-most-one.
+    main_mirror: RwLock<Option<String>>,
+    /// Sticky aggregate ready flag. Flips to `true` once every
+    /// registered mirror has caught up; never flips back. Backs the
+    /// `/q/health/ready` kkv-compat shim.
     ready: AtomicBool,
 }
 
@@ -105,39 +117,60 @@ impl CacheState {
     ///
     /// `bootstrap_hwm` is the Kafka high-watermark (one past the last
     /// existing offset). An empty topic has `bootstrap_hwm = 0` and
-    /// the mirror is immediately considered caught up.
-    pub fn register_mirror(&self, mirror_name: &str, bootstrap_hwm: u64) {
+    /// the mirror is immediately considered caught up. `is_main`
+    /// selects this mirror as the one `cache-v1-main` mounts the
+    /// unprefixed `/cache/v1/...` paths onto; the validator enforces
+    /// at-most-one, so the supervisor's last call wins if it ever
+    /// passes multiple `true`s (defensive — should never happen).
+    pub fn register_mirror(&self, mirror_name: &str, bootstrap_hwm: u64, is_main: bool) {
         let caught_up = bootstrap_hwm == 0;
         {
             let mut m = self.mirrors.write().expect("cache mirrors poisoned");
             m.insert(
                 mirror_name.to_string(),
-                MirrorReadiness {
+                MirrorSlot {
                     bootstrap_hwm,
                     caught_up: AtomicBool::new(caught_up),
+                    view: RwLock::new(IndexMap::new()),
+                    offsets: RwLock::new(HashMap::new()),
                 },
             );
+        }
+        if is_main {
+            *self
+                .main_mirror
+                .write()
+                .expect("cache main_mirror poisoned") = Some(mirror_name.to_string());
         }
         if caught_up {
             self.recheck_ready();
         }
     }
 
-    /// Apply a record from the source consume loop to the in-memory
-    /// view and offset map. The supervisor passes `mirror_name` so we
-    /// can flip the mirror's readiness slot once the bootstrap
-    /// watermark is reached.
+    /// Apply a record from the source consume loop to the named
+    /// mirror's in-memory view and offset map. Flips the mirror's
+    /// readiness slot once the bootstrap watermark is reached.
     ///
     /// Monotonic: if `record.source_offset` is not strictly greater
-    /// than the partition's last-applied offset (rewind / replay),
-    /// this is a no-op for both the view and the offset map.
+    /// than the partition's last-applied offset on this mirror
+    /// (rewind / replay), the call is a no-op for both the view and
+    /// the offset map.
     pub fn apply_record(&self, mirror_name: &str, record: &Record) {
+        let mirrors = self.mirrors.read().expect("cache mirrors poisoned");
+        let Some(slot) = mirrors.get(mirror_name) else {
+            // No registered slot for this mirror; sinks that route
+            // through a `CacheBinding` are wired to one that always
+            // matches. Treat an unknown name as a no-op rather than
+            // panic so a future refactor that decouples destinations
+            // from registration can't crash the consume loop.
+            return;
+        };
         let tp = TopicPartition {
             topic: record.topic.clone(),
             partition: record.partition as u32,
         };
         {
-            let mut offsets = self.offsets.write().expect("cache offsets poisoned");
+            let mut offsets = slot.offsets.write().expect("mirror offsets poisoned");
             if let Some(&last) = offsets.get(&tp) {
                 if record.source_offset <= last {
                     return; // monotonic guard — never rewind the cache
@@ -158,50 +191,49 @@ impl CacheState {
             // production. Skip silently rather than panicking.
             None => return,
         };
-        let mut view = self.view.write().expect("cache view poisoned");
-        match record.value.as_ref() {
-            Some(v) => {
-                // IndexMap::insert keeps the existing position on
-                // overwrite and appends only on first sighting —
-                // which is the contract clients want for `/keys`
-                // ordering ("new keys appear at the end").
-                view.insert(key, v.clone());
-            }
-            None => {
-                // shift_remove preserves the relative order of the
-                // remaining entries; swap_remove would be faster but
-                // shuffle the trailing key into the gap, breaking
-                // determinism.
-                view.shift_remove(&key);
+        {
+            let mut view = slot.view.write().expect("mirror view poisoned");
+            match record.value.as_ref() {
+                Some(v) => {
+                    // IndexMap::insert keeps the existing position on
+                    // overwrite and appends only on first sighting —
+                    // which is the contract clients want for `/keys`
+                    // ordering ("new keys appear at the end").
+                    view.insert(key, v.clone());
+                }
+                None => {
+                    // shift_remove preserves the relative order of
+                    // the remaining entries; swap_remove would be
+                    // faster but shuffle the trailing key into the
+                    // gap, breaking determinism.
+                    view.shift_remove(&key);
+                }
             }
         }
-        drop(view);
         // Readiness check after the view update so observers seeing
-        // ready=true also see the record applied.
+        // ready=true also see the record applied. `slot` reference
+        // and the outer mirrors-read lock are still live; pass the
+        // slot directly to avoid a re-lookup.
         if !self.ready.load(Ordering::Acquire) {
-            self.maybe_flip_mirror_ready(mirror_name, record.source_offset);
+            self.maybe_flip_slot_ready(slot, record.source_offset, &mirrors);
         }
     }
 
-    fn maybe_flip_mirror_ready(&self, mirror_name: &str, last_offset: u64) {
-        let mut all_ready = true;
-        let mirrors = self.mirrors.read().expect("cache mirrors poisoned");
-        if let Some(slot) = mirrors.get(mirror_name) {
-            // The slot can have been flipped to caught_up either by
-            // register (empty topic) or by a previous record on the
-            // same mirror. Either way: once the mirror's
-            // last-applied offset hits `bootstrap_hwm - 1`, flip.
-            if !slot.caught_up.load(Ordering::Acquire) && last_offset + 1 >= slot.bootstrap_hwm {
-                slot.caught_up.store(true, Ordering::Release);
-            }
+    /// Inner: flip the given slot if its bootstrap watermark has
+    /// been reached, then recompute the aggregate flag. Caller holds
+    /// the `mirrors` read lock.
+    fn maybe_flip_slot_ready(
+        &self,
+        slot: &MirrorSlot,
+        last_offset: u64,
+        all_slots: &HashMap<String, MirrorSlot>,
+    ) {
+        if !slot.caught_up.load(Ordering::Acquire) && last_offset + 1 >= slot.bootstrap_hwm {
+            slot.caught_up.store(true, Ordering::Release);
         }
-        for slot in mirrors.values() {
-            if !slot.caught_up.load(Ordering::Acquire) {
-                all_ready = false;
-                break;
-            }
-        }
-        drop(mirrors);
+        let all_ready = all_slots
+            .values()
+            .all(|s| s.caught_up.load(Ordering::Acquire));
         if all_ready {
             self.ready.store(true, Ordering::Release);
         }
@@ -236,32 +268,54 @@ impl CacheState {
             .unwrap_or(false)
     }
 
-    /// Lookup for `GET /cache/v1/raw/{key}`. Returns `None` if the
-    /// key is absent (404 territory).
-    pub fn get_value(&self, key: &str) -> Option<Vec<u8>> {
-        let view = self.view.read().expect("cache view poisoned");
+    /// Name of the mirror that opted into `cache-v1-main`, or
+    /// `None` if no mirror selected the singleton. The cache HTTP
+    /// router uses this to decide whether to mount the unprefixed
+    /// `/cache/v1/...` paths and which slot to dispatch them to.
+    pub fn main_mirror(&self) -> Option<String> {
+        self.main_mirror
+            .read()
+            .expect("cache main_mirror poisoned")
+            .clone()
+    }
+
+    /// Lookup for `GET /cache/v1/{mirror}/raw/{key}`. Returns `None`
+    /// when the mirror has no such key (404 territory) and also when
+    /// `mirror_name` is unknown — the HTTP handler maps unknown
+    /// mirrors to 404 anyway, so the call sites stay tight.
+    pub fn get_value_for(&self, mirror_name: &str, key: &str) -> Option<Vec<u8>> {
+        let mirrors = self.mirrors.read().expect("cache mirrors poisoned");
+        let slot = mirrors.get(mirror_name)?;
+        let view = slot.view.read().expect("mirror view poisoned");
         view.get(key).cloned()
     }
 
-    /// Snapshot of every key currently in the merged view, in
-    /// insertion order (first-sighting). Materializes under a single
-    /// read lock so callers see a consistent set.
-    pub fn snapshot_keys(&self) -> Vec<String> {
-        let view = self.view.read().expect("cache view poisoned");
-        view.keys().cloned().collect()
+    /// Snapshot of every key currently in the named mirror's view,
+    /// in insertion order. Returns `None` if the mirror is unknown.
+    pub fn snapshot_keys_for(&self, mirror_name: &str) -> Option<Vec<String>> {
+        let mirrors = self.mirrors.read().expect("cache mirrors poisoned");
+        let slot = mirrors.get(mirror_name)?;
+        let view = slot.view.read().expect("mirror view poisoned");
+        Some(view.keys().cloned().collect())
     }
 
-    /// Snapshot of every value currently in the merged view, in the
-    /// same order as [`snapshot_keys`](Self::snapshot_keys).
-    pub fn snapshot_values(&self) -> Vec<Vec<u8>> {
-        let view = self.view.read().expect("cache view poisoned");
-        view.values().cloned().collect()
+    /// Snapshot of every value in the named mirror's view, in the
+    /// same order as [`Self::snapshot_keys_for`]. `None` for unknown
+    /// mirrors.
+    pub fn snapshot_values_for(&self, mirror_name: &str) -> Option<Vec<Vec<u8>>> {
+        let mirrors = self.mirrors.read().expect("cache mirrors poisoned");
+        let slot = mirrors.get(mirror_name)?;
+        let view = slot.view.read().expect("mirror view poisoned");
+        Some(view.values().cloned().collect())
     }
 
-    /// Last-seen offset for one source (topic, partition), or `None`
-    /// if no record has been applied to that partition yet.
-    pub fn get_offset(&self, topic: &str, partition: u32) -> Option<u64> {
-        let offsets = self.offsets.read().expect("cache offsets poisoned");
+    /// Last-seen offset within `mirror_name` for one source
+    /// (topic, partition). `None` if the mirror is unknown or has
+    /// not seen a record on that partition yet.
+    pub fn get_offset_for(&self, mirror_name: &str, topic: &str, partition: u32) -> Option<u64> {
+        let mirrors = self.mirrors.read().expect("cache mirrors poisoned");
+        let slot = mirrors.get(mirror_name)?;
+        let offsets = slot.offsets.read().expect("mirror offsets poisoned");
         offsets
             .get(&TopicPartition {
                 topic: topic.to_string(),
@@ -270,10 +324,13 @@ impl CacheState {
             .copied()
     }
 
-    /// Snapshot of every `(topic, partition) → offset` entry, sorted
-    /// for deterministic header output.
-    pub fn snapshot_offsets(&self) -> Vec<TopicPartitionOffset> {
-        let offsets = self.offsets.read().expect("cache offsets poisoned");
+    /// Snapshot of `(topic, partition) → offset` entries for the
+    /// named mirror, sorted for deterministic header output. `None`
+    /// if the mirror is unknown.
+    pub fn snapshot_offsets_for(&self, mirror_name: &str) -> Option<Vec<TopicPartitionOffset>> {
+        let mirrors = self.mirrors.read().expect("cache mirrors poisoned");
+        let slot = mirrors.get(mirror_name)?;
+        let offsets = slot.offsets.read().expect("mirror offsets poisoned");
         let mut out: Vec<TopicPartitionOffset> = offsets
             .iter()
             .map(|(tp, off)| TopicPartitionOffset {
@@ -283,7 +340,7 @@ impl CacheState {
             })
             .collect();
         out.sort_by(|a, b| a.topic.cmp(&b.topic).then(a.partition.cmp(&b.partition)));
-        out
+        Some(out)
     }
 }
 
@@ -318,7 +375,7 @@ mod tests {
             "unknown name must report false so an uninstrumented \
              notifier can't accidentally fire"
         );
-        s.register_mirror("warming", 3);
+        s.register_mirror("warming", 3, false);
         assert!(!s.is_mirror_ready("warming"), "hwm 3, no records yet");
         s.apply_record("warming", &rec("warming", 0, 0, "k0", Some(b"v")));
         s.apply_record("warming", &rec("warming", 0, 1, "k1", Some(b"v")));
@@ -326,7 +383,7 @@ mod tests {
         s.apply_record("warming", &rec("warming", 0, 2, "k2", Some(b"v")));
         assert!(s.is_mirror_ready("warming"), "offset hwm-1 flips the slot");
         // Independent slot stays at its own state.
-        s.register_mirror("empty", 0);
+        s.register_mirror("empty", 0, false);
         assert!(
             s.is_mirror_ready("empty"),
             "hwm 0 = immediately ready, independent of other mirrors"
@@ -340,21 +397,22 @@ mod tests {
         // there's no useful cache yet).
         let s = CacheState::new();
         assert!(!s.is_ready());
-        assert!(s.snapshot_keys().is_empty());
-        assert!(s.snapshot_offsets().is_empty());
+        assert!(s.main_mirror().is_none());
+        assert!(s.snapshot_keys_for("missing").is_none());
+        assert!(s.snapshot_offsets_for("missing").is_none());
     }
 
     #[test]
     fn register_empty_topic_marks_mirror_ready_immediately() {
         let s = CacheState::new();
-        s.register_mirror("ops", 0);
+        s.register_mirror("ops", 0, false);
         assert!(s.is_ready(), "empty topic = hwm 0 = immediately ready");
     }
 
     #[test]
     fn readiness_flips_only_after_bootstrap_hwm_reached() {
         let s = CacheState::new();
-        s.register_mirror("ops", 3); // need offsets 0..=2
+        s.register_mirror("ops", 3, false); // need offsets 0..=2
         assert!(!s.is_ready());
         s.apply_record("ops", &rec("ops", 0, 0, "k0", Some(b"v0")));
         assert!(!s.is_ready());
@@ -367,8 +425,8 @@ mod tests {
     #[test]
     fn multiple_mirrors_all_must_catch_up() {
         let s = CacheState::new();
-        s.register_mirror("a", 2);
-        s.register_mirror("b", 1);
+        s.register_mirror("a", 2, false);
+        s.register_mirror("b", 1, false);
         assert!(!s.is_ready());
         s.apply_record("a", &rec("topic-a", 0, 0, "ka0", Some(b"va0")));
         s.apply_record("a", &rec("topic-a", 0, 1, "ka1", Some(b"va1")));
@@ -380,33 +438,33 @@ mod tests {
     #[test]
     fn tombstone_removes_key() {
         let s = CacheState::new();
-        s.register_mirror("ops", 2);
+        s.register_mirror("ops", 2, false);
         s.apply_record("ops", &rec("ops", 0, 0, "user-1", Some(br#"{"v":1}"#)));
         assert_eq!(
-            s.get_value("user-1").as_deref(),
+            s.get_value_for("ops", "user-1").as_deref(),
             Some(br#"{"v":1}"#.as_ref())
         );
         s.apply_record("ops", &rec("ops", 0, 1, "user-1", None)); // tombstone
-        assert!(s.get_value("user-1").is_none());
+        assert!(s.get_value_for("ops", "user-1").is_none());
     }
 
     #[test]
     fn rewind_does_not_overwrite_or_remove() {
         let s = CacheState::new();
-        s.register_mirror("ops", 1);
+        s.register_mirror("ops", 1, false);
         s.apply_record("ops", &rec("ops", 0, 0, "k", Some(b"first")));
         s.apply_record("ops", &rec("ops", 0, 1, "k", Some(b"second")));
         // Now feed a record with an older offset (simulated rewind).
         s.apply_record("ops", &rec("ops", 0, 0, "k", Some(b"first-again")));
         assert_eq!(
-            s.get_value("k").as_deref(),
+            s.get_value_for("ops", "k").as_deref(),
             Some(b"second".as_ref()),
             "rewind must not overwrite the latest value"
         );
         // Equal-offset record is also rejected.
         s.apply_record("ops", &rec("ops", 0, 1, "k", None));
         assert_eq!(
-            s.get_value("k").as_deref(),
+            s.get_value_for("ops", "k").as_deref(),
             Some(b"second".as_ref()),
             "equal-offset replay must not tombstone"
         );
@@ -415,11 +473,11 @@ mod tests {
     #[test]
     fn snapshot_offsets_is_deterministic_order() {
         let s = CacheState::new();
-        s.register_mirror("m", 10);
+        s.register_mirror("m", 10, false);
         s.apply_record("m", &rec("z-topic", 1, 5, "k", Some(b"v")));
         s.apply_record("m", &rec("a-topic", 3, 4, "k2", Some(b"v")));
         s.apply_record("m", &rec("a-topic", 1, 6, "k3", Some(b"v")));
-        let snap = s.snapshot_offsets();
+        let snap = s.snapshot_offsets_for("m").unwrap();
         let order: Vec<_> = snap
             .iter()
             .map(|tpo| (tpo.topic.clone(), tpo.partition))
@@ -437,23 +495,23 @@ mod tests {
     #[test]
     fn snapshot_keys_in_insertion_order() {
         let s = CacheState::new();
-        s.register_mirror("m", 0);
+        s.register_mirror("m", 0, false);
         s.apply_record("m", &rec("t", 0, 0, "c", Some(b"v")));
         s.apply_record("m", &rec("t", 0, 1, "a", Some(b"v")));
         s.apply_record("m", &rec("t", 0, 2, "b", Some(b"v")));
-        assert_eq!(s.snapshot_keys(), vec!["c", "a", "b"]);
+        assert_eq!(s.snapshot_keys_for("m").unwrap(), vec!["c", "a", "b"]);
     }
 
     #[test]
     fn overwrite_keeps_position_in_listing() {
         let s = CacheState::new();
-        s.register_mirror("m", 0);
+        s.register_mirror("m", 0, false);
         s.apply_record("m", &rec("t", 0, 0, "x", Some(b"v0")));
         s.apply_record("m", &rec("t", 0, 1, "y", Some(b"v1")));
         s.apply_record("m", &rec("t", 0, 2, "x", Some(b"v0-updated")));
-        assert_eq!(s.snapshot_keys(), vec!["x", "y"]);
+        assert_eq!(s.snapshot_keys_for("m").unwrap(), vec!["x", "y"]);
         assert_eq!(
-            s.snapshot_values(),
+            s.snapshot_values_for("m").unwrap(),
             vec![b"v0-updated".to_vec(), b"v1".to_vec()]
         );
     }
@@ -461,11 +519,41 @@ mod tests {
     #[test]
     fn tombstone_preserves_order_of_remaining() {
         let s = CacheState::new();
-        s.register_mirror("m", 0);
+        s.register_mirror("m", 0, false);
         s.apply_record("m", &rec("t", 0, 0, "a", Some(b"va")));
         s.apply_record("m", &rec("t", 0, 1, "b", Some(b"vb")));
         s.apply_record("m", &rec("t", 0, 2, "c", Some(b"vc")));
         s.apply_record("m", &rec("t", 0, 3, "b", None)); // tombstone middle
-        assert_eq!(s.snapshot_keys(), vec!["a", "c"]);
+        assert_eq!(s.snapshot_keys_for("m").unwrap(), vec!["a", "c"]);
+    }
+
+    #[test]
+    fn per_mirror_views_are_independent() {
+        // Two mirrors writing through their own slots: a key in
+        // mirror A must not show up in mirror B's view, and an
+        // unregistered mirror name returns None across the board.
+        let s = CacheState::new();
+        s.register_mirror("a", 0, false);
+        s.register_mirror("b", 0, false);
+        s.apply_record("a", &rec("topic-a", 0, 0, "k-a", Some(b"va")));
+        s.apply_record("b", &rec("topic-b", 0, 0, "k-b", Some(b"vb")));
+        assert_eq!(s.get_value_for("a", "k-a").as_deref(), Some(b"va".as_ref()));
+        assert!(s.get_value_for("a", "k-b").is_none());
+        assert_eq!(s.get_value_for("b", "k-b").as_deref(), Some(b"vb".as_ref()));
+        assert!(s.get_value_for("missing", "anything").is_none());
+        assert!(s.snapshot_keys_for("missing").is_none());
+    }
+
+    #[test]
+    fn register_mirror_tracks_main_mirror_singleton() {
+        let s = CacheState::new();
+        assert!(s.main_mirror().is_none());
+        s.register_mirror("ops", 0, false);
+        assert!(
+            s.main_mirror().is_none(),
+            "is_main=false does not assign the singleton"
+        );
+        s.register_mirror("users", 0, true);
+        assert_eq!(s.main_mirror().as_deref(), Some("users"));
     }
 }

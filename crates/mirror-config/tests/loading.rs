@@ -1,7 +1,7 @@
 use mirror_config::{
-    load_from_str, ColumnConfig, ColumnType, Compaction, Config, Destination, DestinationFormat,
-    FilesystemDestination, FlushTriggers, HttpAccess, HttpAccessApi, KafkaDestination, KafkaSource,
-    Mirror, S3Destination, TimestampMode,
+    load_from_str, CacheV1Config, ColumnConfig, ColumnType, Compaction, Config, Destination,
+    DestinationFormat, FilesystemDestination, FlushTriggers, HttpAccess, KafkaDestination,
+    KafkaSource, Mirror, S3Destination, TimestampMode,
 };
 use std::path::PathBuf;
 
@@ -597,7 +597,7 @@ mirrors:
       - type: filesystem
         root: /tmp/mirror
     http-access:
-      api: cache-v1
+      cache-v1: {}
     flush:
       max-time-ms: 5000
       max-bytes: 1000
@@ -607,7 +607,8 @@ mirrors:
     assert_eq!(
         cfg.mirrors[0].http_access,
         Some(HttpAccess {
-            api: HttpAccessApi::CacheV1
+            cache_v1: Some(CacheV1Config {}),
+            cache_v1_main: None,
         })
     );
 }
@@ -624,7 +625,7 @@ mirrors:
       - type: kafka
         bootstrap-servers: redpanda:9092
     http-access:
-      api: cache-v1
+      cache-v1: {}
 "#;
     let err = load_from_str(yaml).expect_err("http-access on kafka-only mirror must be rejected");
     let msg = format!("{err}");
@@ -647,7 +648,7 @@ mirrors:
         root: /tmp/mirror
     keys: { type: bytes }
     http-access:
-      api: cache-v1
+      cache-v1: {}
     flush:
       max-time-ms: 5000
       max-bytes: 1000
@@ -673,7 +674,7 @@ mirrors:
       - type: filesystem
         root: /tmp/mirror
     http-access:
-      api: cache-v1
+      cache-v1: {}
     flush:
       max-time-ms: 5000
       max-bytes: 1000
@@ -785,4 +786,119 @@ mirrors:
     assert_eq!(cfg.mirrors[0].destinations.len(), 2);
     assert_eq!(cfg.mirrors[0].timestamp_mode, Some(TimestampMode::Source));
     assert_eq!(cfg.mirrors[0].format, Some(DestinationFormat::Parquet));
+}
+
+#[test]
+fn http_access_cache_v1_main_requires_cache_v1() {
+    // Without the per-mirror surface there's no view for the
+    // unprefixed /cache/v1/... paths to dispatch to.
+    let yaml = r#"
+mirrors:
+  - name: ops
+    source: { bootstrap-servers: kafka:9092 }
+    topic: ops
+    partition: 0
+    destinations:
+      - type: filesystem
+        root: /tmp/mirror
+    http-access:
+      cache-v1-main: {}
+    flush: { max-time-ms: 5000, max-bytes: 1000, max-offsets: 100 }
+"#;
+    let err = load_from_str(yaml).expect_err("cache-v1-main alone must be rejected");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("cache-v1-main") && msg.contains("requires `http-access.cache-v1`"),
+        "got: {msg}"
+    );
+}
+
+#[test]
+fn http_access_cache_v1_main_at_most_one_mirror() {
+    let yaml = r#"
+mirrors:
+  - name: ops
+    source: { bootstrap-servers: kafka:9092 }
+    topic: ops
+    partition: 0
+    destinations: [{ type: filesystem, root: /tmp/ops }]
+    http-access: { cache-v1: {}, cache-v1-main: {} }
+    flush: { max-time-ms: 5000, max-bytes: 1000, max-offsets: 100 }
+  - name: users
+    source: { bootstrap-servers: kafka:9092 }
+    topic: users
+    partition: 0
+    destinations: [{ type: filesystem, root: /tmp/users }]
+    http-access: { cache-v1: {}, cache-v1-main: {} }
+    flush: { max-time-ms: 5000, max-bytes: 1000, max-offsets: 100 }
+"#;
+    let err = load_from_str(yaml).expect_err("two cache-v1-main mirrors must be rejected");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("cache-v1-main") && msg.contains("at most one"),
+        "got: {msg}"
+    );
+}
+
+#[test]
+fn http_access_cache_v1_main_one_mirror_ok() {
+    // Singleton is allowed; sibling mirror enables only cache-v1.
+    let yaml = r#"
+mirrors:
+  - name: ops
+    source: { bootstrap-servers: kafka:9092 }
+    topic: ops
+    partition: 0
+    destinations: [{ type: filesystem, root: /tmp/ops }]
+    http-access: { cache-v1: {}, cache-v1-main: {} }
+    flush: { max-time-ms: 5000, max-bytes: 1000, max-offsets: 100 }
+  - name: users
+    source: { bootstrap-servers: kafka:9092 }
+    topic: users
+    partition: 0
+    destinations: [{ type: filesystem, root: /tmp/users }]
+    http-access: { cache-v1: {} }
+    flush: { max-time-ms: 5000, max-bytes: 1000, max-offsets: 100 }
+"#;
+    let cfg = load_from_str(yaml).expect("must parse");
+    assert!(cfg.mirrors[0]
+        .http_access
+        .as_ref()
+        .unwrap()
+        .cache_v1_main
+        .is_some());
+    assert!(cfg.mirrors[1]
+        .http_access
+        .as_ref()
+        .unwrap()
+        .cache_v1_main
+        .is_none());
+}
+
+#[test]
+fn http_access_rejects_mirror_name_colliding_with_literal_path_segment() {
+    // Mirror named `keys` would make /cache/v1/keys/raw/<key> race
+    // against the literal /cache/v1/keys served for cache-v1-main.
+    for name in ["raw", "offset", "keys", "values"] {
+        let yaml = format!(
+            r#"
+mirrors:
+  - name: {name}
+    source: {{ bootstrap-servers: kafka:9092 }}
+    topic: t
+    partition: 0
+    destinations: [{{ type: filesystem, root: /tmp/m }}]
+    http-access: {{ cache-v1: {{}} }}
+    flush: {{ max-time-ms: 5000, max-bytes: 1000, max-offsets: 100 }}
+"#
+        );
+        let err = load_from_str(&yaml)
+            .err()
+            .unwrap_or_else(|| panic!("mirror name {name:?} must be rejected"));
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("collides") && msg.contains(name),
+            "name {name:?}, got: {msg}"
+        );
+    }
 }

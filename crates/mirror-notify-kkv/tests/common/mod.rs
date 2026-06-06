@@ -143,9 +143,11 @@ async fn handle_post(
 /// Use in any test whose focus isn't the readiness gate itself.
 /// `register_mirror(name, 0)` declares an empty source partition, so
 /// the slot's `caught_up` flag is `true` at registration time.
+/// `is_main` is irrelevant to the suppression gate so we always pass
+/// `false`.
 pub fn ready_cache(mirror_name: &str) -> Arc<CacheState> {
     let state = Arc::new(CacheState::new());
-    state.register_mirror(mirror_name, 0);
+    state.register_mirror(mirror_name, 0, false);
     state
 }
 

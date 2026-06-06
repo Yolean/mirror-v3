@@ -52,7 +52,7 @@ async fn source_consume_suppresses_until_caught_up() {
     let cfg = notify_pointing_at(server.addr, NotifyOutcomes::default(), fast_retry(), 1000);
 
     let cache = Arc::new(CacheState::new());
-    cache.register_mirror("m", 101);
+    cache.register_mirror("m", 101, false);
     let mut notifier =
         KkvV1Notifier::from_config(&cfg, "t".into(), 0, Arc::clone(&cache), "m".into()).unwrap();
 
@@ -146,7 +146,7 @@ async fn destination_flush_suppresses_until_caught_up() {
     let cfg = notify_dest_flush(server.addr);
 
     let cache = Arc::new(CacheState::new());
-    cache.register_mirror("m", 101);
+    cache.register_mirror("m", 101, false);
     let dispatcher =
         FlushDispatcher::from_config(&cfg, "t".into(), 0, Arc::clone(&cache), "m".into())
             .expect("must build");

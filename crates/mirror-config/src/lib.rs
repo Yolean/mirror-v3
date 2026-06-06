@@ -498,26 +498,47 @@ pub enum FinalAction {
     Fail,
 }
 
-/// HTTP read-access block. Today the only variant is the KKV-compatible
-/// `/cache/v1` surface; the field is grouped so future APIs can be
-/// added without re-shaping the YAML.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+/// HTTP read-access block. Multiple API surfaces can be enabled on
+/// the same mirror; each is configured by its presence under its
+/// own key. The map shape (rather than the original `{ api: ... }`
+/// enum) lets a mirror opt into more than one API and keeps room
+/// for per-API knobs without further config reshaping.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct HttpAccess {
-    pub api: HttpAccessApi,
+    /// `/cache/v1/{mirror}/raw/{key}` etc. mounted at the mirror's
+    /// own name. Required if `cache-v1-main` is set. See the
+    /// `mirror-cache` crate for behavior and the committed OpenAPI
+    /// 3.1 spec in `schemas/mirror-v3.cache.openapi.json`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_v1: Option<CacheV1Config>,
+    /// `/cache/v1/raw/{key}` etc. mounted at the unprefixed path,
+    /// dispatching to this mirror's per-mirror view. At most one
+    /// mirror in the whole config may set this; the validator
+    /// rejects more than one so a `cache-v1-main` consumer sees a
+    /// single deterministic view. Migration aid; once every consumer
+    /// has moved to `/cache/v1/{mirror}/...` it can be removed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_v1_main: Option<CacheV1MainConfig>,
 }
 
-/// Variants of the read API surface mirror-v3 will host. Each opt-in
-/// mirror declares which one applies to it; today only `cache-v1`
-/// exists (a drop-in for `Yolean/kafka-keyvalue`'s `/cache/v1`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "kebab-case")]
-pub enum HttpAccessApi {
-    /// `/cache/v1/raw/{key}`, `/cache/v1/keys`, `/cache/v1/values`,
-    /// `/cache/v1/offset/{topic}/{partition}`. See the `mirror-cache`
-    /// crate for behavior and the committed OpenAPI 3.1 spec in
-    /// `schemas/mirror-v3.cache.openapi.json`.
-    CacheV1,
+/// Per-API configuration block for `cache-v1`. Empty today, populated
+/// as the field is given operator-tunable knobs.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CacheV1Config {}
+
+/// Per-API configuration block for `cache-v1-main`. Empty today.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CacheV1MainConfig {}
+
+impl HttpAccess {
+    /// `true` if any API surface is enabled. Used at validator and
+    /// supervisor sites that don't care which one.
+    pub fn any_enabled(&self) -> bool {
+        self.cache_v1.is_some() || self.cache_v1_main.is_some()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -840,8 +861,35 @@ fn validate(cfg: &Config) -> Result<(), LoadError> {
         }
         validate_mirror(m)?;
     }
+    // Cross-mirror: `cache-v1-main` mounts the unprefixed
+    // /cache/v1/... routes onto exactly one mirror's view. Two
+    // mains would race over the same paths so the supervisor would
+    // never know which mirror to dispatch to; reject up front.
+    let mains: Vec<&str> = cfg
+        .mirrors
+        .iter()
+        .filter(|m| {
+            m.http_access
+                .as_ref()
+                .and_then(|h| h.cache_v1_main.as_ref())
+                .is_some()
+        })
+        .map(|m| m.name.as_str())
+        .collect();
+    if mains.len() > 1 {
+        return Err(LoadError::Validation(format!(
+            "`http-access.cache-v1-main` may be set on at most one mirror; \
+             found on: {mains:?}"
+        )));
+    }
     Ok(())
 }
+
+/// Path segments the `/cache/v1/...` router already binds at the
+/// top of the per-mirror tree. A mirror named after one of these
+/// would make `/cache/v1/{mirror}/raw/{key}` ambiguous against the
+/// literal `/cache/v1/keys` etc., so the validator refuses.
+const RESERVED_MIRROR_NAMES_AT_CACHE_V1: &[&str] = &["raw", "offset", "keys", "values"];
 
 fn validate_mirror(m: &Mirror) -> Result<(), LoadError> {
     // Destinations-empty is allowed ONLY when notify is set with at
@@ -900,7 +948,10 @@ fn validate_mirror(m: &Mirror) -> Result<(), LoadError> {
             ("compression", m.compression.is_some()),
             ("compaction", m.compaction.is_some()),
             ("flush", m.flush.is_some()),
-            ("http-access", m.http_access.is_some()),
+            (
+                "http-access",
+                m.http_access.as_ref().is_some_and(HttpAccess::any_enabled),
+            ),
         ] {
             if present {
                 return Err(LoadError::Validation(format!(
@@ -945,7 +996,9 @@ fn validate_mirror(m: &Mirror) -> Result<(), LoadError> {
                 )));
             }
         }
-        if m.http_access.is_some() && matches!(keys.kind, ColumnType::Bytes) {
+        if m.http_access.as_ref().is_some_and(HttpAccess::any_enabled)
+            && matches!(keys.kind, ColumnType::Bytes)
+        {
             return Err(LoadError::Validation(format!(
                 "mirror {:?}: `http-access` requires `keys.type` ∈ {{utf8, json, json-parseable}}; \
                  /cache/v1 routes keys through URL path segments",
@@ -954,13 +1007,39 @@ fn validate_mirror(m: &Mirror) -> Result<(), LoadError> {
         }
     }
 
+    if let Some(http) = m.http_access.as_ref() {
+        // `cache-v1-main` mounts the unprefixed /cache/v1/... routes
+        // onto this mirror's per-mirror view; it has no value without
+        // the underlying per-mirror surface (and there is no separate
+        // legacy data path).
+        if http.cache_v1_main.is_some() && http.cache_v1.is_none() {
+            return Err(LoadError::Validation(format!(
+                "mirror {:?}: `http-access.cache-v1-main` requires `http-access.cache-v1` \
+                 on the same mirror",
+                m.name
+            )));
+        }
+        // The /cache/v1/{mirror}/raw/{key} router uses {mirror} as a
+        // path parameter directly under /cache/v1/. Names like
+        // `keys` would collide with the literal /cache/v1/keys path
+        // serving cache-v1-main.
+        if http.cache_v1.is_some() && RESERVED_MIRROR_NAMES_AT_CACHE_V1.contains(&m.name.as_str()) {
+            return Err(LoadError::Validation(format!(
+                "mirror {:?}: name collides with a `/cache/v1/...` literal segment ({:?}); \
+                 rename the mirror to enable `http-access.cache-v1`",
+                m.name, RESERVED_MIRROR_NAMES_AT_CACHE_V1
+            )));
+        }
+    }
+
     // Notify on a mirror with destinations: per WEBHOOKS.md, the
     // notify body says "go re-read via /cache/v1/raw/<key>". That's
-    // only meaningful when http-access is set.
+    // only meaningful when the per-mirror `cache-v1` API is enabled.
     if let Some(notify) = m.notify.as_ref() {
-        if m.http_access.is_none() {
+        let has_cache_v1 = m.http_access.as_ref().is_some_and(|h| h.cache_v1.is_some());
+        if !has_cache_v1 {
             return Err(LoadError::Validation(format!(
-                "mirror {:?}: `notify` requires `http-access: {{ api: cache-v1 }}` on the same \
+                "mirror {:?}: `notify` requires `http-access.cache-v1` on the same \
                  mirror (the notify body tells consumers to re-read via /cache/v1)",
                 m.name
             )));
@@ -1088,7 +1167,10 @@ fn validate_notify_only(m: &Mirror, notify: &Notify) -> Result<(), LoadError> {
         ("compaction", m.compaction.is_some()),
         ("flush", m.flush.is_some()),
         ("timestamp-mode", m.timestamp_mode.is_some()),
-        ("http-access", m.http_access.is_some()),
+        (
+            "http-access",
+            m.http_access.as_ref().is_some_and(HttpAccess::any_enabled),
+        ),
     ] {
         if present {
             return Err(LoadError::Validation(format!(

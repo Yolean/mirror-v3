@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use mirror_config::{Destination, Mirror};
+use mirror_config::{Destination, HttpAccess, Mirror};
 use mirror_core::{
     heartbeat_interval_from_env, run_mirror_with_notifier, MetricLabels, NoOpNotifier, Record,
     Sink, SinkError, MIRROR_LABELS,
@@ -498,37 +498,52 @@ async fn run(path: PathBuf) -> Result<()> {
         }
     }
 
-    // Build a shared CacheState if any *enabled* mirror opted into
-    // http-access. Capture each opt-in mirror's source-partition
-    // high-watermark *now* so the readiness gate flips only after
-    // we've consumed past whatever was already there at startup. (KKV
-    // semantics - dependents must not see a partially-rebuilt cache
-    // after a reload.) Disabled mirrors never register, otherwise
-    // their slot would never flip ready and the whole cache would
-    // sit at 503 forever.
-    let cache_state = if enabled_mirrors.iter().any(|m| m.http_access.is_some()) {
+    // Build a shared CacheState if any *enabled* mirror needs a
+    // readiness slot - either to host the per-mirror /cache/v1
+    // surface (`http_access`) or to gate the kkv-v1 notifier's
+    // bootstrap-hwm suppression (`notify`). Capture each registered
+    // mirror's source-partition high-watermark *now* so the gate
+    // flips only after we've consumed past whatever was already
+    // there at startup (KKV semantics: dependents must not see a
+    // partially-rebuilt cache, and webhook subscribers must not see
+    // historical-replay invalidations). Disabled mirrors never
+    // register: otherwise their slot would never flip ready and
+    // the aggregate /q/health/ready would sit at 503 forever.
+    let needs_slot = |m: &Mirror| m.http_access.is_some() || m.notify.is_some();
+    let cache_state = if enabled_mirrors.iter().copied().any(needs_slot) {
         let state = std::sync::Arc::new(mirror_core::CacheState::new());
         for m in &enabled_mirrors {
-            if m.http_access.is_some() {
-                let hwm = fetch_hwm_for_mirror(m).await?;
-                tracing::info!(
-                    mirror = %m.name,
-                    topic = %m.topic,
-                    partition = m.partition,
-                    bootstrap_hwm = hwm,
-                    "registering mirror with cache readiness gate"
-                );
-                state.register_mirror(&m.name, hwm);
+            if !needs_slot(m) {
+                continue;
             }
+            let hwm = fetch_hwm_for_mirror(m).await?;
+            let is_main = m
+                .http_access
+                .as_ref()
+                .is_some_and(|h| h.cache_v1_main.is_some());
+            tracing::info!(
+                mirror = %m.name,
+                topic = %m.topic,
+                partition = m.partition,
+                bootstrap_hwm = hwm,
+                is_main,
+                "registering mirror with cache readiness gate"
+            );
+            state.register_mirror(&m.name, hwm, is_main);
         }
         Some(state)
     } else {
         None
     };
 
-    // Spawn the cache HTTP server if any mirror has opt-in. Server
-    // runs until shutdown_rx flips OR /_admin/v1/shutdown is hit.
-    if let Some(state) = cache_state.as_ref() {
+    // Spawn the cache HTTP server if any mirror opted into a route
+    // surface (`cache-v1` or `cache-v1-main`). Mirrors that only
+    // need the bootstrap-hwm gate (notify-only) don't pull in the
+    // server. Runs until shutdown_rx flips OR /_admin/v1/shutdown is hit.
+    let wants_http_routes = enabled_mirrors
+        .iter()
+        .any(|m| m.http_access.as_ref().is_some_and(HttpAccess::any_enabled));
+    if let (Some(state), true) = (cache_state.as_ref(), wants_http_routes) {
         let addr = cache_listen_addr();
         let state = std::sync::Arc::clone(state);
         let cache_shutdown_rx = shutdown_rx.clone();
@@ -578,14 +593,19 @@ fn cache_listen_addr() -> std::net::SocketAddr {
     std::net::SocketAddr::from(([0, 0, 0, 0], port))
 }
 
-/// Materialise a `CacheBinding` for the given mirror if it has
-/// `http-access` set and the supervisor built a shared CacheState.
+/// Materialise a `CacheBinding` for the given mirror if it has a
+/// registered slot in the shared CacheState. Slots are registered
+/// for any mirror that opts into `http_access` (for the HTTP read
+/// surface) or `notify` (for the bootstrap-hwm suppression gate);
+/// the binding wires the consume loop's TeeSink to that slot so
+/// `apply_record` flips the slot's `caught_up` at the right offset.
 fn mirror_cache_binding(
     mirror: &Mirror,
     cache: Option<&std::sync::Arc<mirror_core::CacheState>>,
 ) -> Option<mirror_core::CacheBinding> {
-    match (mirror.http_access.as_ref(), cache) {
-        (Some(_), Some(state)) => Some(mirror_core::CacheBinding {
+    let needs_slot = mirror.http_access.is_some() || mirror.notify.is_some();
+    match (needs_slot, cache) {
+        (true, Some(state)) => Some(mirror_core::CacheBinding {
             state: std::sync::Arc::clone(state),
             mirror_name: mirror.name.clone(),
         }),

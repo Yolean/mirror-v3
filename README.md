@@ -65,16 +65,18 @@ A minimal PodMonitor for the checkit chart points at port 9090; the standard pro
 
 ### `/cache/v1` (drop-in for `Yolean/kafka-keyvalue`)
 
-Per-mirror opt-in via `http-access: { api: cache-v1 }`. When at least one mirror has it set, `mirror-v3 run` starts a second HTTP server on `0.0.0.0:8080` (override with `MIRROR_V3_CACHE_PORT`) that exposes the KKV `/cache/v1` surface:
+Per-mirror opt-in via `http-access: { cache-v1: {} }`. When at least one mirror has it set, `mirror-v3 run` starts a second HTTP server on `0.0.0.0:8080` (override with `MIRROR_V3_CACHE_PORT`) that exposes the KKV-shaped surface under each opt-in mirror's name:
 
 ```
-GET /cache/v1/raw/{key}                  → value bytes (application/octet-stream), 404 if absent
-GET /cache/v1/offset/{topic}/{partition} → decimal text
-GET /cache/v1/keys                       → newline-separated keys
-GET /cache/v1/values                     → newline-separated raw values
+GET /cache/v1/{mirror}/raw/{key}                  → value bytes (application/octet-stream), 404 if absent
+GET /cache/v1/{mirror}/offset/{topic}/{partition} → decimal text
+GET /cache/v1/{mirror}/keys                       → newline-separated keys
+GET /cache/v1/{mirror}/values                     → newline-separated raw values
 ```
 
-Reads carry `x-kkv-last-seen-offsets: <JSON>` and return **503** until every opt-in mirror has caught up to the source's high-watermark captured at startup — same readiness contract as KKV, so dependents don't transiently see an older state across reloads. The cache view updates per-record from the consume loop, decoupled from disk flush cadence (set `flush.max-time-ms` high to save bucket ops without sacrificing freshness). Updates are monotonic; if a future feature ever rewinds source consumption, the cache stays at the highest offset seen.
+Each mirror owns its own `key → latest-value` view; a key only shows up under the mirror that consumed it. Reads carry `x-kkv-last-seen-offsets: <JSON>` and return **503** until that mirror has caught up to its source's high-watermark captured at startup — same readiness contract as KKV, so dependents don't transiently see an older state across reloads. The view updates per-record from the consume loop, decoupled from disk flush cadence (set `flush.max-time-ms` high to save bucket ops without sacrificing freshness). Updates are monotonic; if a future feature ever rewinds source consumption, the cache stays at the highest offset seen.
+
+To keep existing kkv consumers working unmodified during a migration, **one** mirror per process may additionally set `cache-v1-main: {}`. That mounts the unprefixed `/cache/v1/...` paths onto that mirror's view (alias-only — same handlers, no separate data path). The validator rejects more than one `cache-v1-main` in the config. Mirror names that collide with the literal path segments `raw | offset | keys | values` are rejected.
 
 Also exposed on the same port:
 

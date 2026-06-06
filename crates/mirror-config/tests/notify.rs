@@ -24,7 +24,7 @@ mirrors:
         root: /var/mirror
     format: parquet
     compression: zstd-1
-    http-access: { api: cache-v1 }
+    http-access: { cache-v1: {} }
     flush:
       max-time-ms: 60000
       max-bytes: 67108864
@@ -119,7 +119,7 @@ mirrors:
     destinations:
       - type: filesystem
         root: /var/mirror
-    http-access: { api: cache-v1 }
+    http-access: { cache-v1: {} }
     flush:
       max-time-ms: 60000
       max-bytes: 67108864
@@ -180,7 +180,7 @@ mirrors:
     destinations:
       - type: filesystem
         root: /var/mirror
-    http-access: { api: cache-v1 }
+    http-access: { cache-v1: {} }
     flush:
       max-time-ms: 60000
       max-bytes: 67108864
@@ -208,7 +208,7 @@ mirrors:
     destinations:
       - type: filesystem
         root: /var/mirror
-    http-access: { api: cache-v1 }
+    http-access: { cache-v1: {} }
     flush:
       max-time-ms: 60000
       max-bytes: 67108864
@@ -237,7 +237,7 @@ mirrors:
     destinations:
       - type: filesystem
         root: /var/mirror
-    http-access: { api: cache-v1 }
+    http-access: { cache-v1: {} }
     flush:
       max-time-ms: 60000
       max-bytes: 67108864
@@ -266,7 +266,7 @@ mirrors:
     destinations:
       - type: filesystem
         root: /var/mirror
-    http-access: { api: cache-v1 }
+    http-access: { cache-v1: {} }
     flush:
       max-time-ms: 60000
       max-bytes: 67108864
@@ -298,7 +298,7 @@ mirrors:
     destinations:
       - type: filesystem
         root: /var/mirror
-    http-access: { api: cache-v1 }
+    http-access: { cache-v1: {} }
     flush:
       max-time-ms: 60000
       max-bytes: 67108864
@@ -330,7 +330,7 @@ mirrors:
     destinations:
       - type: filesystem
         root: /var/mirror
-    http-access: { api: cache-v1 }
+    http-access: { cache-v1: {} }
     flush:
       max-time-ms: 60000
       max-bytes: 67108864
@@ -360,7 +360,7 @@ mirrors:
     destinations:
       - type: filesystem
         root: /var/mirror
-    http-access: { api: cache-v1 }
+    http-access: { cache-v1: {} }
     flush:
       max-time-ms: 60000
       max-bytes: 67108864
@@ -459,7 +459,7 @@ mirrors:
     topic: events
     partition: 0
     destinations: []
-    http-access: { api: cache-v1 }
+    http-access: { cache-v1: {} }
     notify:
       api: kkv-v1
       targets:
