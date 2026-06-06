@@ -71,6 +71,7 @@ async fn drains_when_max_records_reached() {
     assert_eq!(
         body,
         serde_json::json!({
+            "v": 1,
             "topic": "t",
             "offsets": { "0": 12 },
             "updates": { "a": null, "b": null, "c": null }

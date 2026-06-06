@@ -74,11 +74,14 @@ async fn posts_to_default_kkv_path_with_canonical_body() {
     assert_eq!(
         body,
         serde_json::json!({
+            "v": 1,
             "topic": "events",
             "offsets": { "3": 42 },
             "updates": { "user-7": null }
         }),
-        "body must match the legacy KafkaKeyValue.js parser shape exactly"
+        "body must match the legacy KafkaKeyValue.js parser shape exactly, \
+         including the `v: 1` protocol-version field that the consumer \
+         enforces with an early throw"
     );
 }
 

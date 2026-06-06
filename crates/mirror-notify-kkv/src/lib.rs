@@ -241,11 +241,7 @@ impl KkvV1Notifier {
 
 impl Inner {
     async fn dispatch_drained(&self, batch: DrainedBatch) -> Result<(), NotifyError> {
-        let payload = KkvV1Payload {
-            topic: &self.topic,
-            offsets: batch.offsets,
-            updates: batch.updates,
-        };
+        let payload = KkvV1Payload::new(&self.topic, batch.offsets, batch.updates);
         self.dispatch_batch(&payload).await
     }
 
@@ -841,16 +837,11 @@ async fn flush_drainer_loop(
         };
         let mut offsets = IndexMap::new();
         offsets.insert(inner.partition.to_string(), to);
-        let payload = KkvV1Payload {
-            topic: &inner.topic,
-            // Empty `updates` per WEBHOOKS.md open-question #2:
-            // destination-flush is the "tell me a file landed" use
-            // case, not cache invalidation, so the consumer doesn't
-            // need a key set. The `offsets` field gives them the
-            // high-water mark.
-            offsets,
-            updates: IndexMap::new(),
-        };
+        // Empty `updates` per WEBHOOKS.md open-question #2:
+        // destination-flush is the "tell me a file landed" use case,
+        // not cache invalidation, so the consumer doesn't need a key
+        // set. The `offsets` field gives them the high-water mark.
+        let payload = KkvV1Payload::new(&inner.topic, offsets, IndexMap::new());
         if let Err(e) = inner.dispatch_batch(&payload).await {
             *error_state.lock().await = Some(e);
             return;
@@ -1045,14 +1036,42 @@ fn is_connection_refused(e: &reqwest::Error) -> bool {
 /// (`x-kkv-topic`, `x-kkv-offsets`) so misrouted requests are easy to
 /// debug from the body alone. `updates` is a key → `null` map; the
 /// consumer re-fetches every key via `GET /cache/v1/raw/<key>`.
+///
+/// The `v: 1` field is a load-bearing protocol-version marker.
+/// `@yolean/kafka-keyvalue` v1.8.3's `updateListener` (CJS and ESM
+/// builds) checks `if (requestBody.v !== 1) throw new Error(...)`
+/// before any other parsing; a missing field surfaces as `undefined`,
+/// the throw lands inside an Express middleware as an unhandled
+/// rejection, and the consumer pod crashloops. The legacy Quarkus
+/// kkv server sends this field on every POST.
 #[derive(Debug, Serialize)]
 struct KkvV1Payload<'a> {
+    /// Protocol version. Always 1 for `notify.api: kkv-v1`.
+    v: u8,
     topic: &'a str,
     /// `IndexMap` to preserve insertion order on the wire; the legacy
     /// kkv consumer doesn't care about key order but stable output
     /// makes integration tests deterministic.
     offsets: IndexMap<String, u64>,
     updates: IndexMap<String, serde_json::Value>,
+}
+
+impl<'a> KkvV1Payload<'a> {
+    /// Construct a body with the protocol-version field pinned to 1.
+    /// New call sites should use this rather than constructing the
+    /// struct directly so the `v: 1` invariant can't be bypassed.
+    fn new(
+        topic: &'a str,
+        offsets: IndexMap<String, u64>,
+        updates: IndexMap<String, serde_json::Value>,
+    ) -> Self {
+        Self {
+            v: 1,
+            topic,
+            offsets,
+            updates,
+        }
+    }
 }
 
 #[cfg(test)]

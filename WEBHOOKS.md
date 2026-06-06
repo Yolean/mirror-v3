@@ -185,11 +185,20 @@ unmodified.
 - Body:
   ```json
   {
+    "v": 1,
     "topic": "<source-topic>",
     "offsets": { "<partition>": <highest-offset-in-batch> },
     "updates": { "<key>": null }
   }
   ```
+  - `v` is the protocol-version marker. **Load-bearing**:
+    `@yolean/kafka-keyvalue` v1.8.3's `updateListener` (both CJS
+    and ESM builds) does an early `if (requestBody.v !== 1) throw
+    new Error('Unknown kkv onupdate protocol …')` and a missing
+    field surfaces as `undefined`. The throw lands inside an
+    Express middleware as an unhandled rejection and crashloops
+    the consumer pod. The legacy Quarkus kkv server also sends
+    this field on every POST.
   - `topic` matches the header for double-check robustness.
   - `offsets` carries the highest source offset across the batch
     per partition. Single-partition mirrors send `{"0": <max>}`.

@@ -78,6 +78,7 @@ async fn fires_one_post_per_flush_event_with_empty_updates() {
     assert_eq!(
         body0,
         serde_json::json!({
+            "v": 1,
             "topic": "events",
             "offsets": { "3": 9 },
             "updates": {}
