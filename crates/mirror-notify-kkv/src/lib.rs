@@ -1,8 +1,8 @@
-//! Outbound `kkv-v1` webhook notifier — drop-in replacement for the
+//! Outbound `kkv-v1` webhook notifier. Drop-in replacement for the
 //! push side of `Yolean/kafka-keyvalue`.
 //!
-//! Wire contract (matches the legacy `@yolean/kafka-keyvalue` Node
-//! client unmodified; see `WEBHOOKS.md`):
+//! Wire contract (matches the `@yolean/kafka-keyvalue` Node client
+//! unmodified; see `WEBHOOKS.md`):
 //!   * `POST /kafka-keyvalue/v1/updates`
 //!   * Headers: `x-kkv-topic`, `x-kkv-offsets`
 //!   * Body: `{ "topic": "...", "offsets": {"<partition>": <offset>}, "updates": { "<key>": null } }`
@@ -11,7 +11,7 @@
 //!   * Every accepted record is fed to [`KkvV1Notifier::on_record`]
 //!     by the mirror loop. Records accumulate in an in-memory buffer
 //!     (key set with the highest source offset across the batch).
-//!   * The buffer is drained — i.e. POSTed and reset — when either
+//!   * The buffer is drained (POSTed and reset) when either
 //!     `debounce.max-records` records have arrived since the last
 //!     drain, or `debounce.max-time-ms` has elapsed since the *first*
 //!     record of the current batch landed.
@@ -46,15 +46,13 @@ use buffer::{Buffer, DrainedBatch};
 pub use resolver::{DnsAResolver, SystemDnsResolver};
 
 /// How long a `fan-out: dns-a` resolution is reused before a
-/// re-resolve. The legacy kkv had no caching (it watched K8s
-/// Endpoints continuously); for the DNS-A replacement path we cache
-/// for 30s — matches the spec's "default 30 s if no TTL is
+/// re-resolve. 30s matches the spec's "default 30 s if no TTL is
 /// published". Failure invalidates the cache early (per spec) so
 /// scale-down recovery doesn't wait the full window.
 const DNS_A_CACHE_TTL: Duration = Duration::from_secs(30);
 
 /// Default path component when a target's URL has no explicit path.
-/// Matches the legacy `@yolean/kafka-keyvalue` Node client's
+/// Matches `@yolean/kafka-keyvalue` Node client's
 /// `ON_UPDATE_DEFAULT_PATH`.
 pub const KKV_V1_DEFAULT_PATH: &str = "/kafka-keyvalue/v1/updates";
 
@@ -80,7 +78,7 @@ pub enum BuildError {
     ClientBuild(String),
 }
 
-/// Per-target dispatcher state. One target = one `Endpoint`. The
+/// Per-target dispatcher state. One target maps to one `Endpoint`. The
 /// `fan_out` mode decides whether dispatch goes to the URL's host
 /// (resolved transparently by reqwest) or to every A/AAAA record the
 /// configured resolver returns (one POST per address).
@@ -163,16 +161,15 @@ pub struct KkvV1Notifier {
 impl KkvV1Notifier {
     /// Build a notifier from a validated [`mirror_config::Notify`]
     /// block. The caller is responsible for the higher-level
-    /// validation (URL well-formedness, target non-empty, etc.) —
+    /// validation (URL well-formedness, target non-empty, etc.);
     /// `mirror-config` does that in `validate_notify_shared`. The
     /// checks here are the lighter-weight last-mile ones the runtime
     /// needs to actually open a `reqwest::Client`.
     ///
-    /// Phase 3c: the trigger mode is read from `notify.trigger.on` and
-    /// the debounce window from `notify.trigger.debounce`. For
-    /// `trigger.on: destination-flush` the debounce config is
-    /// ignored — that path will be added when the
-    /// destination-flush callback hook is wired in a later phase.
+    /// `notify.trigger.on` is only consulted for the debounce
+    /// window (`source-consume` honours `debounce.max-time-ms`;
+    /// `destination-flush` ignores debounce since it does not run
+    /// via this notifier at all, only via `FlushDispatcher`).
     pub fn from_config(
         notify: &mirror_config::Notify,
         topic: String,
@@ -469,7 +466,7 @@ impl Inner {
         last_error: String,
     ) -> Result<(), NotifyError> {
         let (topic_l, partition_l) = current_labels();
-        // Reset retry gauge regardless of outcome — the request is
+        // Reset retry gauge regardless of outcome; the request is
         // no longer in flight.
         metrics::gauge!(
             "mirror_v3_notify_inflight_retry",
@@ -572,7 +569,7 @@ impl Notifier for KkvV1Notifier {
     async fn on_record(&mut self, record: &Record) -> Result<(), NotifyError> {
         // First: surface any terminal error the timer task accumulated
         // since the last call. Once an error is observed we still let
-        // the run loop hand us further records — they'll just keep
+        // the run loop hand us further records; they'll just keep
         // returning the same error until the loop aborts. Take() so
         // we only return it once.
         if let Some(err) = self.state.error_state.lock().await.take() {
@@ -635,7 +632,7 @@ impl Notifier for KkvV1Notifier {
         let drain_result = self.drain_now().await;
 
         if let Some(t) = self.timer_task.take() {
-            // Abort before await — the task may currently be in a
+            // Abort before await; the task may currently be in a
             // `sleep` we can't easily interrupt otherwise. The task
             // does no externally-visible work past the shutting_down
             // check, so aborting is safe.
@@ -657,7 +654,7 @@ impl Notifier for KkvV1Notifier {
 /// the buffer transitioned empty → non-empty, then sleeps for the
 /// remaining time before the buffer's `first_at + max_time` deadline
 /// and drains. The on_record path may have drained inline in the
-/// meantime — in that case the take() returns None and we go back to
+/// meantime; in that case the take() returns None and we go back to
 /// waiting.
 async fn timer_loop(inner: Arc<Inner>, state: Arc<NotifierState>, max_time: Duration) {
     loop {
@@ -666,7 +663,7 @@ async fn timer_loop(inner: Arc<Inner>, state: Arc<NotifierState>, max_time: Dura
             return;
         }
         // Compute the actual remaining time relative to the buffer's
-        // first_at — between notify_one() and our wake-up, on_record
+        // first_at; between notify_one() and our wake-up, on_record
         // could have drained inline (first_at = None) or there could
         // simply be no data left.
         let remaining = {
@@ -746,7 +743,7 @@ pub struct FlushDispatcher {
     /// Held so the drainer task can be addressed via
     /// `error_state` / `tx` for shutdown signalling; otherwise
     /// untouched at runtime. (`#[allow(dead_code)]` quiets the
-    /// linter — the field exists so callers can extend the type
+    /// linter; the field exists so callers can extend the type
     /// without re-deriving the shared state from the channel.)
     #[allow(dead_code)]
     inner: Arc<Inner>,
@@ -792,7 +789,7 @@ impl FlushDispatcher {
     }
 
     /// Drain pending events and stop the background task. Returns
-    /// any error the drainer accumulated before exit. Idempotent —
+    /// any error the drainer accumulated before exit. Idempotent -
     /// calling twice is safe (the second call is a no-op).
     pub async fn shutdown(&mut self) -> Result<(), NotifyError> {
         let _ = self.tx.send(FlushEvent::Shutdown);
@@ -818,7 +815,7 @@ impl FlushDispatcher {
 impl mirror_core::FlushObserver for FlushDispatcher {
     fn on_flushed(&self, _from: u64, to: u64) {
         // Fire-and-forget into the channel. If the drainer has
-        // already exited (error_state is set), the send fails — and
+        // already exited (error_state is set), the send fails; and
         // that's fine; the supervisor will see the error on the
         // next `last_error` / `shutdown` call. `from` is intentionally
         // dropped: the kkv-v1 body only carries the high-water `to`
@@ -902,7 +899,7 @@ fn build_endpoint(target: &NotifyTarget, client: Client) -> Result<Endpoint, Bui
         FanOut::DnsA => {
             // Port comes from the URL; `port_or_known_default` falls
             // back to 80/443 per scheme. This is the port the
-            // resolver appends to every A/AAAA address it returns —
+            // resolver appends to every A/AAAA address it returns -
             // matches the K8s headless-Service expectation (all pods
             // listen on the same port).
             let port =
@@ -984,7 +981,7 @@ fn classify(result: reqwest::Result<reqwest::Response>, error: &mut String) -> O
     match result {
         Ok(resp) => {
             let status = resp.status();
-            // Drop body promptly — outcome decision is status-only.
+            // Drop body promptly; outcome decision is status-only.
             // (reqwest will close the connection if we don't consume,
             // hurting keep-alive reuse.) Spawned task isn't needed:
             // the body is small for kkv 2xx (typically empty) and we
@@ -1002,7 +999,7 @@ fn classify(result: reqwest::Result<reqwest::Response>, error: &mut String) -> O
                 *error = format!("HTTP {status}");
                 Outcome::FiveXx
             } else {
-                // 1xx — informational. Treat as 2xx (spec doesn't
+                // 1xx; informational. Treat as 2xx (spec doesn't
                 // enumerate; reqwest already filters most of these).
                 Outcome::TwoXx
             }
@@ -1017,7 +1014,7 @@ fn classify(result: reqwest::Result<reqwest::Response>, error: &mut String) -> O
             } else {
                 // Other transport-layer errors (DNS resolution, TLS,
                 // mid-stream EOF, etc.) are spec-treated like
-                // connection-refused — they're "couldn't reach the
+                // connection-refused; they're "couldn't reach the
                 // receiver", same retry/final policy expectations.
                 *error = format!("connection error: {e}");
                 Outcome::ConnRefused

@@ -133,7 +133,7 @@
           ]
         },
         "enabled": {
-          "description": "Whether mirror-v3 should actually spawn this mirror at\nstartup. Defaults to `true`. Plain YAML boolean only —\n`true` / `false` (and the YAML-1.2 case variants\n`True`/`False`/`TRUE`/`FALSE`). The YAML-1.1 truthy/falsy\nstrings (`yes`/`no`/`on`/`off`) are deliberately NOT\naccepted; operators who want to flip a mirror via env\ninterpolation should write the env value as `true` or\n`false`:\n\n```yaml\n- name: requests\n  enabled: ${REQUESTS_ENABLED:-false}\n  ...\n```\n\nDisabled mirrors are validated the same as enabled ones (so\nflipping `false` → `true` won't surface latent config bugs)\nbut are not spawned, do not register with the cache-v1\nreadiness gate, and do not contribute to source-broker reads.\nIf *every* mirror in a process is disabled, startup fails\nloudly so a misconfigured deployment doesn't silently idle.",
+          "description": "Whether mirror-v3 should actually spawn this mirror at\nstartup. Defaults to `true`. Plain YAML boolean only -\n`true` / `false` (and the YAML-1.2 case variants\n`True`/`False`/`TRUE`/`FALSE`). The YAML-1.1 truthy/falsy\nstrings (`yes`/`no`/`on`/`off`) are deliberately NOT\naccepted; operators who want to flip a mirror via env\ninterpolation should write the env value as `true` or\n`false`:\n\n```yaml\n- name: requests\n  enabled: ${REQUESTS_ENABLED:-false}\n  ...\n```\n\nDisabled mirrors are validated the same as enabled ones (so\nflipping `false` → `true` won't surface latent config bugs)\nbut are not spawned, do not register with the cache-v1\nreadiness gate, and do not contribute to source-broker reads.\nIf *every* mirror in a process is disabled, startup fails\nloudly so a misconfigured deployment doesn't silently idle.",
           "type": [
             "boolean",
             "null"
@@ -293,7 +293,7 @@
       "description": "Envelope format for Filesystem and S3 destinations.",
       "oneOf": [
         {
-          "description": "Apache Parquet. Columnar, embedded schema, compressed.\nStandard data-lake format — readable by DuckDB / Athena /\nSpark out of the box.",
+          "description": "Apache Parquet. Columnar, embedded schema, compressed.\nStandard data-lake format - readable by DuckDB / Athena /\nSpark out of the box.",
           "type": "string",
           "const": "parquet"
         },
@@ -549,7 +549,7 @@
       ]
     },
     "NotifyApi": {
-      "description": "The wire-contract variant this notify block speaks. Today only\nthe legacy kkv shape exists. New variants must explicitly opt\nin — kkv-v1 is not the default to avoid silently changing\nbehaviour if we ever add e.g. a kkv-v2 with auth.",
+      "description": "The wire-contract variant this notify block speaks. Today only\nthe legacy kkv shape exists. New variants must explicitly opt\nin - kkv-v1 is not the default to avoid silently changing\nbehaviour if we ever add e.g. a kkv-v2 with auth.",
       "oneOf": [
         {
           "description": "`POST /kafka-keyvalue/v1/updates` with the legacy kkv body:\n`{ topic, offsets, updates: { <key>: null } }`. Matches the\n`@yolean/kafka-keyvalue` Node client's\n`getOnUpdateRoute()` / `ON_UPDATE_DEFAULT_PATH`.",
@@ -573,7 +573,7 @@
           ]
         },
         "fan-out": {
-          "description": "How the URL's host is resolved. `none` (default) sends one\nPOST to a single keep-alive connection; `dns-a` resolves\nthe host to its full A/AAAA record set and POSTs to every\nreturned address concurrently — the K8s-headless-Service\nfan-out path without a Kubernetes API dependency.",
+          "description": "How the URL's host is resolved. `none` (default) sends one\nPOST to a single keep-alive connection; `dns-a` resolves\nthe host to its full A/AAAA record set and POSTs to every\nreturned address concurrently - the K8s-headless-Service\nfan-out path without a Kubernetes API dependency.",
           "$ref": "#/$defs/FanOut",
           "default": "none"
         }
@@ -623,7 +623,7 @@
     "TriggerOn": {
       "oneOf": [
         {
-          "description": "POST as soon as the consume loop hands a record to the\nmirror — bounded by the `debounce` window. Default;\nmatches legacy kkv behaviour.",
+          "description": "POST as soon as the consume loop hands a record to the\nmirror - bounded by the `debounce` window. Default;\nmatches legacy kkv behaviour.",
           "type": "string",
           "const": "source-consume"
         },
@@ -693,7 +693,7 @@
           }
         },
         "2xx": {
-          "description": "HTTP 2xx — the only success outcome.",
+          "description": "HTTP 2xx - the only success outcome.",
           "$ref": "#/$defs/NotifyOutcome",
           "default": {
             "retry": false,
@@ -701,7 +701,7 @@
           }
         },
         "3xx": {
-          "description": "HTTP 3xx — almost always misconfiguration on a webhook.",
+          "description": "HTTP 3xx - almost always misconfiguration on a webhook.",
           "$ref": "#/$defs/NotifyOutcome",
           "default": {
             "retry": false,
@@ -709,7 +709,7 @@
           }
         },
         "4xx": {
-          "description": "HTTP 4xx — receiver says \"your request is wrong\";\nretrying the same payload doesn't help.",
+          "description": "HTTP 4xx - receiver says \"your request is wrong\";\nretrying the same payload doesn't help.",
           "$ref": "#/$defs/NotifyOutcome",
           "default": {
             "retry": false,
@@ -717,7 +717,7 @@
           }
         },
         "5xx": {
-          "description": "HTTP 5xx — receiver is transiently broken; retry per\npolicy and fail on exhaustion.",
+          "description": "HTTP 5xx - receiver is transiently broken; retry per\npolicy and fail on exhaustion.",
           "$ref": "#/$defs/NotifyOutcome",
           "default": {
             "retry": true,

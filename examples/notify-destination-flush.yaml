@@ -1,6 +1,6 @@
 # yaml-language-server: $schema=../schemas/mirror-v3.config.schema.json
 #
-# `trigger.on: destination-flush` — fire one POST per durable blob
+# `trigger.on: destination-flush`. Fire one POST per durable blob
 # flush. Use case from WEBHOOKS.md: downstream consumers that care
 # about durability over freshness (e.g. an archival sync job that
 # wants "tell me when a parquet file lands so I can copy it
@@ -12,9 +12,9 @@
 #   { "topic": "...", "offsets": { "<partition>": <highest-offset> },
 #     "updates": {} }
 #
-# `updates: {}` is intentional — destination-flush doesn't accumulate
-# record keys; the offset tells the consumer everything they need to
-# act on the just-landed file.
+# `updates: {}` is intentional. Destination-flush doesn't accumulate
+# record keys; the offset alone tells the consumer everything they
+# need to act on the just-landed file.
 
 mirrors:
   - name: archival-feed
@@ -36,7 +36,7 @@ mirrors:
           fan-out: none
       trigger:
         on: destination-flush
-        # No `debounce` block — the destination's flush triggers
+        # No `debounce` block; the destination's flush triggers
         # ARE the debounce in this mode. Validator rejects an
         # explicit debounce here.
       timeout-ms: 5000

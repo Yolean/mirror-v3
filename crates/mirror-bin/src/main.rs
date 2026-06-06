@@ -455,7 +455,7 @@ async fn run(path: PathBuf) -> Result<()> {
     }
     if enabled_mirrors.is_empty() {
         anyhow::bail!(
-            "all {} mirror(s) are disabled (enabled: false); nothing to do — \
+            "all {} mirror(s) are disabled (enabled: false); nothing to do - \
              enable at least one mirror or scale this deployment to zero replicas",
             total_mirrors
         );
@@ -474,7 +474,7 @@ async fn run(path: PathBuf) -> Result<()> {
     // One shutdown channel, cloned per mirror. Listening for Ctrl-C
     // here means SIGINT triggers graceful flush; in containers,
     // SIGTERM will arrive on the same path because tokio's
-    // ctrl_c handler is the platform's INT handler — for full SIGTERM
+    // ctrl_c handler is the platform's INT handler - for full SIGTERM
     // support a unix-signals branch can be added next.
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let signal_tx = shutdown_tx.clone();
@@ -502,7 +502,7 @@ async fn run(path: PathBuf) -> Result<()> {
     // http-access. Capture each opt-in mirror's source-partition
     // high-watermark *now* so the readiness gate flips only after
     // we've consumed past whatever was already there at startup. (KKV
-    // semantics — dependents must not see a partially-rebuilt cache
+    // semantics - dependents must not see a partially-rebuilt cache
     // after a reload.) Disabled mirrors never register, otherwise
     // their slot would never flip ready and the whole cache would
     // sit at 503 forever.
@@ -624,7 +624,7 @@ async fn shutdown_signal(mut rx: tokio::sync::watch::Receiver<bool>) {
 
 /// Install the Prometheus exporter on `0.0.0.0:<port>`. Port defaults
 /// to 9090; override with `MIRROR_V3_METRICS_PORT` (set to `0` to
-/// disable). A failure to bind logs at warn level and is non-fatal —
+/// disable). A failure to bind logs at warn level and is non-fatal -
 /// the operator's observability story degrades, but the mirror keeps
 /// running.
 fn install_metrics_exporter() {
@@ -672,12 +672,12 @@ async fn spawn_mirror(
     let compaction = compaction_label(mirror.compaction);
 
     // Build one inner Sink per destination, then wrap them in a tee.
-    // The single-destination case routes through a length-1 tee too —
+    // The single-destination case routes through a length-1 tee too -
     // this keeps the cache binding's per-record fanout on a single
     // code path. A *notify-only* mirror (no destinations + a notify
     // block, validated upstream) wraps a single in-memory
-    // [`NotifyOnlySink`] in the tee so the rest of the run loop —
-    // bootstrap, low-watermark alignment, idle-drift checks — keeps
+    // [`NotifyOnlySink`] in the tee so the rest of the run loop -
+    // bootstrap, low-watermark alignment, idle-drift checks - keeps
     // its existing shape.
     let mut inners: Vec<(String, Box<dyn Sink>)> = Vec::with_capacity(
         // +1 reserved for the notify-only path; harmless when
@@ -744,7 +744,7 @@ async fn spawn_mirror(
     };
 
     // Single span carries `mirror = <name>` onto every event emitted
-    // from the spawned task — including the mirror-core logs
+    // from the spawned task - including the mirror-core logs
     // (`starting mirror`, `heartbeat`, etc.) that don't otherwise have
     // access to the operator-chosen mirror name. MIRROR_LABELS still
     // carries topic+partition for metric labeling separately.
@@ -847,7 +847,7 @@ fn build_flush_dispatcher(mirror: &Mirror) -> Result<mirror_notify_kkv::FlushDis
 /// only its own "next expected offset" and accepts any record at or
 /// above it. `allows_compacted_source = true` so the run loop's
 /// bootstrap branch can align the head to the broker's low
-/// watermark — matching the spec's "seeks to low watermark on every
+/// watermark - matching the spec's "seeks to low watermark on every
 /// startup" behaviour for notify-only mirrors.
 #[derive(Debug, Default)]
 struct NotifyOnlySink {

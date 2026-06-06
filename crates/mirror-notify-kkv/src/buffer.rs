@@ -12,7 +12,7 @@
 //! set-deduped within a batch (the kkv-v1 body's `updates` is a
 //! key → null map; duplicates over the same window collapse). The
 //! `offsets` field carries the **maximum** source offset across the
-//! batch — the consumer's `requireOffset` constraint then pins the
+//! batch; the consumer's `requireOffset` constraint then pins the
 //! follow-up `/cache/v1/raw/<key>` read to post-batch state.
 
 use std::time::Instant;
@@ -31,7 +31,7 @@ pub(crate) struct Buffer {
     max_offset: u64,
     /// Number of records appended since the last drain. The
     /// `max-records` trigger fires on *record count*, not on dedup-
-    /// bucket cardinality — otherwise a hot key getting repeated
+    /// bucket cardinality; otherwise a hot key getting repeated
     /// hits could stall the trigger and grow the buffer's wall-clock
     /// age indefinitely.
     seen_records: u64,
@@ -151,7 +151,7 @@ mod tests {
         assert_eq!(
             b.first_at(),
             Some(t),
-            "later appends must NOT shift first_at — the debounce window measures from the first record"
+            "later appends must NOT shift first_at; the debounce window measures from the first record"
         );
         b.take(0);
         assert!(b.first_at().is_none(), "drain resets first_at");

@@ -2,7 +2,7 @@
 //!
 //! Production uses [`SystemDnsResolver`] which wraps
 //! `tokio::net::lookup_host`. Tests inject a stub that returns canned
-//! `SocketAddr`s — that lets the multi-address fan-out path be
+//! `SocketAddr`s; that lets the multi-address fan-out path be
 //! exercised against axum servers bound on different ports without
 //! depending on the system resolver or `/etc/hosts`.
 //!
@@ -21,7 +21,7 @@ pub trait DnsAResolver: Send + Sync {
     async fn resolve(&self, host: &str, port: u16) -> std::io::Result<Vec<SocketAddr>>;
 }
 
-/// `tokio::net::lookup_host` wrapper — the default resolver used by
+/// `tokio::net::lookup_host` wrapper; the default resolver used by
 /// [`crate::KkvV1Notifier::from_config`].
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SystemDnsResolver;

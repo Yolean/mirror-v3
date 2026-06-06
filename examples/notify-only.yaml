@@ -1,14 +1,14 @@
 # yaml-language-server: $schema=../schemas/mirror-v3.config.schema.json
 #
 # Notify-only mirror: zero durable destinations, just a webhook feed.
-# A pure invalidation pipe — useful when downstream doesn't need
+# A pure invalidation pipe; useful when downstream doesn't need
 # mirror-v3 to store anything, only to translate "Kafka record landed"
 # into "POST `/kafka-keyvalue/v1/updates`".
 #
 # Restart behaviour: with no durable state, the mirror seeks to the
 # source's *low watermark* on every startup and re-fires webhooks for
 # every record from there forward. On a busy topic that's a burst per
-# restart — tune `debounce` upward (e.g. {1000, 1000}) to coalesce, or
+# restart; tune `debounce` upward (e.g. {1000, 1000}) to coalesce, or
 # add a small filesystem destination for resume-from-offset.
 #
 # Validator rules in mirror-config (see WEBHOOKS.md § Validation):
@@ -16,7 +16,7 @@
 #   * trigger.on MUST be source-consume (destination-flush has no
 #     destinations to ack);
 #   * format / compression / compaction / flush / http-access are all
-#     forbidden — they parameterise destinations that don't exist.
+#     forbidden; they parameterise destinations that don't exist.
 
 mirrors:
   - name: events-invalidator

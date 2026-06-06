@@ -6,7 +6,7 @@
 //!
 //! This module adds primitives for the *uncommon* case: a spec test
 //! that needs a `Sink` or `Source` with behaviour the existing
-//! mocks don't model directly — typically because the spec is being
+//! mocks don't model directly; typically because the spec is being
 //! TDD'd before the implementation exists, and the test wants to
 //! express "next_expected_offset returns 150 and write fails with
 //! UnexpectedPosition" without anyone adding a new builder method
@@ -130,7 +130,7 @@ impl BlanketMockSink {
         let stored = std::sync::Arc::new(Mutex::new(Some(err)));
         self.on_write = Box::new(move |_| {
             let mut slot = stored.lock().unwrap();
-            // Reconstruct an equivalent error each call — match on
+            // Reconstruct an equivalent error each call; match on
             // the originally-stored variant if it's still there;
             // synthesise a Transport variant after the first call so
             // SinkError doesn't need to be Clone.
@@ -273,7 +273,7 @@ mod tests {
     #[tokio::test]
     async fn closure_can_capture_mutable_state() {
         // The decision depends on captured state (the call counter),
-        // not just the record's intrinsics — this is the test's
+        // not just the record's intrinsics; this is the test's
         // whole point. Reject the 3rd write call regardless of which
         // offset it carries.
         let mut written = 0u32;

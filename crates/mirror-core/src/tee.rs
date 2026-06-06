@@ -1,4 +1,4 @@
-//! `TeeSink` — fan one source consumer's records out to N inner sinks
+//! `TeeSink`: fan one source consumer's records out to N inner sinks
 //! while preserving every inner sink's end-offset invariant.
 //!
 //! ## Why "per-sink heads"
@@ -8,7 +8,7 @@
 //! per-record. At any wall-clock moment three concurrent sinks fed
 //! from the same loop have **different durable positions**. Restart
 //! from that heterogeneous state would crash any inner sink that
-//! couldn't silently drop re-presented records — the Kafka end-offset
+//! couldn't silently drop re-presented records; the Kafka end-offset
 //! gate, in particular, would refuse.
 //!
 //! `TeeSink` solves this by tracking a `head` per inner sink. The tee
@@ -72,7 +72,7 @@ impl TeeSink {
     /// starting head. The optional cache binding is applied (once
     /// per record) at the top of [`Self::write`].
     ///
-    /// `names` must be unique and in the same order as `sinks` — they
+    /// `names` must be unique and in the same order as `sinks`; they
     /// appear in error/heartbeat logs so an operator can attribute a
     /// per-sink failure back to the destination element in YAML.
     pub async fn open(
@@ -125,7 +125,7 @@ impl Sink for TeeSink {
     async fn next_expected_offset(&mut self) -> Result<u64, SinkError> {
         // Re-query every inner sink so the per-sink heads stay
         // honest. This is only called at startup and on idle by the
-        // run loop, so the O(N) query cost is bounded — it doesn't
+        // run loop, so the O(N) query cost is bounded; it doesn't
         // run per record.
         for inner in self.inners.iter_mut() {
             let head = inner.sink.next_expected_offset().await?;
@@ -176,7 +176,7 @@ impl Sink for TeeSink {
 
         // Concurrent write fanout. We `join_all` over per-sink
         // futures so the slowest inner sink's per-record latency
-        // dominates the tee's per-record cost — sequential calls
+        // dominates the tee's per-record cost; sequential calls
         // would 1000× the fast sinks' wait time for no reason.
         let mut futs = Vec::with_capacity(indices.len());
         // Take the slots' sinks temporarily so we can drive them
@@ -222,7 +222,7 @@ impl Sink for TeeSink {
 
     async fn flush(&mut self) -> Result<(), SinkError> {
         // Concurrent flush. Per-sink errors are logged; the first
-        // error is returned. The other sinks still flush — losing
+        // error is returned. The other sinks still flush; losing
         // sink A's tail buffer should not cost us sink B's tail too.
         let mut futs = Vec::with_capacity(self.inners.len());
         let mut taken: Vec<(usize, String, Box<dyn Sink>)> = Vec::with_capacity(self.inners.len());
@@ -315,7 +315,7 @@ impl Sink for TeeSink {
         }
         // Multi-destination: wrap the outer observer with a per-sink
         // relay + a min-coordinator. The outer observer fires only
-        // when *every* inner sink has committed past a watermark —
+        // when *every* inner sink has committed past a watermark -
         // matching the spec's "fire when ALL destinations have
         // committed past the batch's high-water offset".
         let coordinator = Arc::new(MinFlushCoordinator::new(self.inners.len(), observer));
@@ -375,7 +375,7 @@ impl MinFlushCoordinator {
             *per_sink.iter().min().unwrap()
         };
         // First-fire case: no `last_fired_to` yet, so `from` is the
-        // tee's *initial* combined head — `0` is acceptable for the
+        // tee's *initial* combined head; `0` is acceptable for the
         // bootstrap fire (the receiver only cares about `to`).
         let to_fire = {
             let mut last = self.last_fired_to.lock().unwrap();
@@ -739,15 +739,15 @@ mod tests {
             "outer must wait for the laggard"
         );
 
-        // b flushes 0..4. min(9, 4) = 4 — fire (0, 4).
+        // b flushes 0..4. min(9, 4) = 4; fire (0, 4).
         rb.simulate_flush(0, 4);
         assert_eq!(obs.fires.lock().unwrap().clone(), vec![(0, 4)]);
 
-        // b catches up to 9. min(9, 9) = 9 — fire (4, 9).
+        // b catches up to 9. min(9, 9) = 9; fire (4, 9).
         rb.simulate_flush(5, 9);
         assert_eq!(obs.fires.lock().unwrap().clone(), vec![(0, 4), (4, 9)]);
 
-        // a races ahead to 19. min(19, 9) = 9 — no advance, no fire.
+        // a races ahead to 19. min(19, 9) = 9; no advance, no fire.
         ra.simulate_flush(10, 19);
         assert_eq!(obs.fires.lock().unwrap().clone(), vec![(0, 4), (4, 9)]);
     }

@@ -8,22 +8,22 @@
 //!
 //! The server also exposes:
 //!
-//! - `GET /q/health/ready` — drop-in compat alias for the legacy
+//! - `GET /q/health/ready`: drop-in compat alias for the legacy
 //!   Quarkus kkv health endpoint. Returns `200 OK` with an empty
 //!   body once `CacheState::is_ready()`, `503 Service Unavailable`
 //!   otherwise. Kept off the OpenAPI spec because it's purely a
 //!   compat shim for the existing `@yolean/kafka-keyvalue` Node
 //!   client, whose `onReady()` polls
 //!   `KKV_CACHE_HOST_READINESS_ENDPOINT` (default `/q/health/ready`).
-//! - `POST /_admin/v1/shutdown` and `POST /_admin/v1/shutdown/{exitcode}` — operator hooks.
-//! - `GET /openapi.json` and `GET /openapi.yaml` — auto-generated OpenAPI 3.1 spec.
-//! - `GET /docs` — Scalar UI rendering the spec.
+//! - `POST /_admin/v1/shutdown` and `POST /_admin/v1/shutdown/{exitcode}`: operator hooks.
+//! - `GET /openapi.json` and `GET /openapi.yaml`: auto-generated OpenAPI 3.1 spec.
+//! - `GET /docs`: Scalar UI rendering the spec.
 //!
 //! Readiness: every endpoint under `/cache/v1` (and the
 //! `/q/health/ready` alias) returns `503 Service Unavailable` until
 //! `CacheState::is_ready()` flips to `true` (every registered mirror
 //! has caught up to its bootstrap high-watermark). The flag is
-//! sticky — once ready, always ready.
+//! sticky; once ready, always ready.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -149,7 +149,7 @@ pub fn build_router(cache: Arc<CacheState>, shutdown_tx: oneshot::Sender<i32>) -
         // drop-in: existing consumers work unmodified, no
         // `KKV_CACHE_HOST_READINESS_ENDPOINT` override needed.
         //
-        // Kept off the OpenAPI spec — it's purely a compat shim for
+        // Kept off the OpenAPI spec; it's purely a compat shim for
         // an existing client, not a public surface mirror-v3 wants
         // to commit to. The Quarkus `/q/...` path namespace is
         // unlikely to collide with anything else mirror-v3 might
@@ -216,7 +216,7 @@ pub enum ServeError {
 
 /// Aggregate OpenAPI 3.1 document. Endpoints are registered through
 /// `OpenApiRouter::routes!(...)` so the spec stays in lock-step with
-/// the actual handler set — adding or removing a route here without
+/// the actual handler set; adding or removing a route here without
 /// updating the router (or vice versa) is impossible.
 #[derive(OpenApi)]
 #[openapi(
@@ -238,7 +238,7 @@ pub enum ServeError {
 )]
 struct ApiDoc;
 
-// Allowed locally: the `Err` payload IS the response — boxing it
+// Allowed locally: the `Err` payload IS the response; boxing it
 // would force every readiness-gated handler to deref before
 // returning, with zero observable benefit.
 #[allow(clippy::result_large_err)]
@@ -263,7 +263,7 @@ fn offsets_header(state: &AppState) -> HeaderMap {
     headers
 }
 
-/// GET /cache/v1/raw/{key} — fetch a value by key.
+/// GET /cache/v1/raw/{key}; fetch a value by key.
 #[utoipa::path(
     get,
     path = "/cache/v1/raw/{key}",
@@ -298,7 +298,7 @@ async fn raw_by_key(State(state): State<AppState>, Path(key): Path<String>) -> R
     }
 }
 
-/// GET /cache/v1/offset/{topic}/{partition} — last-seen offset.
+/// GET /cache/v1/offset/{topic}/{partition}; last-seen offset.
 #[utoipa::path(
     get,
     path = "/cache/v1/offset/{topic}/{partition}",
@@ -335,14 +335,14 @@ async fn offset_for_partition(
         .into_response()
 }
 
-/// GET /cache/v1/keys — newline-separated key list, every line
+/// GET /cache/v1/keys; newline-separated key list, every line
 /// (including the last) terminated by `\n`. Order is the order each
 /// key was first seen by the cache (insertion order).
 ///
 /// `Content-Type` is `application/octet-stream` to match KKV's
 /// byte-for-byte response shape. A possible future enhancement (gated
 /// on operator demand) is to surface the topic schema in the content
-/// type — see the `values` handler for the same hook.
+/// type; see the `values` handler for the same hook.
 #[utoipa::path(
     get,
     path = "/cache/v1/keys",
@@ -369,15 +369,15 @@ async fn keys(State(state): State<AppState>) -> Response {
     (StatusCode::OK, headers, body).into_response()
 }
 
-/// GET /cache/v1/values — newline-separated values (raw bytes).
-/// Order matches `/cache/v1/keys`. Every line — including the last —
+/// GET /cache/v1/values; newline-separated values (raw bytes).
+/// Order matches `/cache/v1/keys`. Every line; including the last -
 /// is terminated by `\n`. Binary-safe **only** when none of the values
 /// contain a `0x0A` byte; binary topics should pin
 /// `values: { type: bytes-base64 }` so the cache returns the
 /// base64-encoded form here.
 ///
 /// `Content-Type` is `text/plain; charset=utf-8` regardless of the
-/// configured value type. Future work — gated on operator demand —
+/// configured value type. Future work; gated on operator demand -
 /// is to adapt the response content type to the topic schema:
 ///
 /// | `values.type`        | proposed `Content-Type`            |
@@ -415,7 +415,7 @@ async fn values(State(state): State<AppState>) -> Response {
     (StatusCode::OK, headers, body).into_response()
 }
 
-/// POST /_admin/v1/shutdown — request graceful exit.
+/// POST /_admin/v1/shutdown; request graceful exit.
 #[utoipa::path(
     post,
     path = "/_admin/v1/shutdown",
@@ -429,7 +429,7 @@ async fn admin_shutdown(State(state): State<AppState>) -> Response {
     StatusCode::ACCEPTED.into_response()
 }
 
-/// POST /_admin/v1/shutdown/{exitcode} — request graceful exit with a specific code.
+/// POST /_admin/v1/shutdown/{exitcode}; request graceful exit with a specific code.
 #[utoipa::path(
     post,
     path = "/_admin/v1/shutdown/{exitcode}",

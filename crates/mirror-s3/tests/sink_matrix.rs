@@ -5,9 +5,9 @@
 //!
 //! Diverges from the FS matrix only where the backend semantics
 //! genuinely differ:
-//!   - **No file path on disk** — the produced-object-name assertion
+//!   - **No file path on disk**; the produced-object-name assertion
 //!     reads the InMemory store's object list instead of `read_dir`.
-//!   - **Async open** — `S3Sink::open` is async; the rest of the
+//!   - **Async open**; `S3Sink::open` is async; the rest of the
 //!     trait surface is identical.
 
 use std::sync::Arc;

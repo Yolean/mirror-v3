@@ -30,7 +30,7 @@ pub use tee::TeeSink;
 
 /// Per-mirror Prometheus labels. `topic` and `partition` together
 /// uniquely identify the data stream and join cleanly with broker-
-/// side exporters (kafka_exporter, etc.) — the mirror's operator-
+/// side exporters (kafka_exporter, etc.) - the mirror's operator-
 /// chosen `name` is *not* a metric label, it lives in `tracing`
 /// logs only.
 #[derive(Debug, Clone)]
@@ -213,7 +213,7 @@ pub trait Source: Send {
     async fn seek(&mut self, next_offset: u64) -> Result<(), SourceError>;
 
     /// Wait up to an implementation-defined poll timeout for the next
-    /// record. `Ok(None)` means the window elapsed without one — the
+    /// record. `Ok(None)` means the window elapsed without one - the
     /// loop will use that as a heartbeat to revalidate the sink.
     async fn poll_one(&mut self) -> Result<Option<Record>, SourceError>;
 
@@ -230,7 +230,7 @@ pub trait Source: Send {
     /// Highest offset still retained by the source (Kafka "high
     /// watermark"; i.e. `last_offset + 1` if the source has any
     /// records, or `0` if it's empty). The run loop doesn't query
-    /// this today — the default `Ok(u64::MAX)` is the
+    /// this today - the default `Ok(u64::MAX)` is the
     /// "always-satisfiable" sentinel, so future spec changes (e.g.
     /// "fatal if sink_next_expected > source_high_watermark") can be
     /// added without breaking sources that don't implement it.
@@ -244,7 +244,7 @@ pub trait Source: Send {
 }
 
 /// A destination for exactly-once mirroring. The sink owns the truth
-/// about "where we are" — the loop trusts `next_expected_offset`.
+/// about "where we are" - the loop trusts `next_expected_offset`.
 #[async_trait]
 pub trait Sink: Send {
     /// The source offset the destination will accept next. Must be
@@ -317,7 +317,7 @@ pub trait Sink: Send {
     /// when records are durable on the destination side without
     /// scraping logs or polling `next_expected_offset`.
     ///
-    /// Default no-op — sinks without observable flushes (Kafka,
+    /// Default no-op - sinks without observable flushes (Kafka,
     /// mocks, in-memory) keep this default and the observer simply
     /// never fires for them. Blob sinks (FS, S3) override and call
     /// `observer.on_flushed(from, to)` after every successful
@@ -334,7 +334,7 @@ pub trait Sink: Send {
 /// dispatcher in `mirror-notify-kkv` implements this trait.
 ///
 /// Synchronous on purpose: a flush is rare relative to records, and
-/// the observer is expected to do something cheap — typically
+/// the observer is expected to do something cheap - typically
 /// enqueueing the `(from, to)` pair into an `mpsc` channel that a
 /// dedicated async task drains. Doing the HTTP POST inline would
 /// block the flush path and serialise destinations behind the
@@ -357,7 +357,7 @@ pub trait FlushObserver: Send + Sync {
 ///   The loop has already validated the source-offset gate, so the
 ///   record is guaranteed to be at the destination's authoritative
 ///   next-offset. A `NotifyError` returned here aborts the loop and
-///   surfaces as [`MirrorError::Notify`] — same fail-fast contract as
+///   surfaces as [`MirrorError::Notify`] - same fail-fast contract as
 ///   [`SinkError`].
 /// - `shutdown` is called once on graceful exit, after the final
 ///   `sink.flush`. Implementations should drain any buffered webhook
@@ -409,7 +409,7 @@ pub enum SinkError {
 
 /// Error produced by a [`Notifier`]. `Transport` carries a single
 /// underlying failure (timeout, connrefused, http status…); `Exhausted`
-/// signals that the retry budget was spent without success — the
+/// signals that the retry budget was spent without success - the
 /// `final` action in the `notify.outcomes.*` config table (`fail` for
 /// this variant) decides whether the run loop should propagate the
 /// error up. The notifier itself encodes that decision: an `accept` /
@@ -438,7 +438,7 @@ pub enum MirrorError {
     /// Source delivered an offset *above* `expected`. Hard error in
     /// append mode (would leave a gap in the destination chain).
     /// Recoverable under `compaction: log`: the run loop aligns the
-    /// sink to the delivered offset and continues — the broker's
+    /// sink to the delivered offset and continues - the broker's
     /// `LogStartOffset` reports 0 for a `cleanup.policy=compact`
     /// topic even when the earliest deliverable record is much later
     /// (compaction deduplicates by key but does not advance the
@@ -456,7 +456,7 @@ pub enum MirrorError {
     /// next-expected-offset, and the sink is not willing to skip
     /// records (i.e. it's not a compaction:log destination). This
     /// fires at bootstrap on a compacted or delete-records-trimmed
-    /// source topic when the mirror is configured for append mode —
+    /// source topic when the mirror is configured for append mode -
     /// it would leave a gap in the destination chain, which append
     /// mode forbids.
     #[error(
@@ -473,7 +473,7 @@ pub enum MirrorError {
 }
 
 /// How often the loop emits an INFO-level "heartbeat" log line. This
-/// is the operator's `kubectl logs` heartbeat — without it, a quiet
+/// is the operator's `kubectl logs` heartbeat - without it, a quiet
 /// mirror (no source traffic, or buffered records that haven't
 /// tripped a flush trigger yet) looks indistinguishable from a stuck
 /// one. Override via the `MIRROR_V3_HEARTBEAT_SECS` env var; set to
@@ -530,7 +530,7 @@ where
 /// [`Notifier`]. The loop calls `notifier.on_record(&record)` after
 /// every successful `sink.write`, and `notifier.shutdown()` once after
 /// the final `sink.flush` on graceful exit. `NotifyError`s propagate
-/// as [`MirrorError::Notify`] and abort the loop — the notifier itself
+/// as [`MirrorError::Notify`] and abort the loop - the notifier itself
 /// is responsible for distinguishing "retryable, eventually accept"
 /// from "fail loudly" per the `notify.outcomes.*` table.
 pub async fn run_mirror_with_notifier<S, K, N, F>(
@@ -688,7 +688,7 @@ where
                                 // log level here scales with millions
                                 // of lines per restart. Observability
                                 // for gap rate is the dedicated
-                                // counter below — plot a rate or
+                                // counter below - plot a rate or
                                 // alert on a threshold rather than
                                 // reading logs. The startup `loop
                                 // start … compaction="log"` INFO
@@ -788,7 +788,7 @@ mod column_type_tests {
 
     #[test]
     fn json_does_not_parse_payload() {
-        // Valid UTF-8 but not parseable JSON — Json must accept it.
+        // Valid UTF-8 but not parseable JSON - Json must accept it.
         assert!(ColumnType::Json
             .validate("value", 0, Some(b"{this is not json"))
             .is_ok());

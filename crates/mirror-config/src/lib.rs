@@ -196,7 +196,7 @@ pub struct Mirror {
     pub http_access: Option<HttpAccess>,
 
     /// Whether mirror-v3 should actually spawn this mirror at
-    /// startup. Defaults to `true`. Plain YAML boolean only —
+    /// startup. Defaults to `true`. Plain YAML boolean only -
     /// `true` / `false` (and the YAML-1.2 case variants
     /// `True`/`False`/`TRUE`/`FALSE`). The YAML-1.1 truthy/falsy
     /// strings (`yes`/`no`/`on`/`off`) are deliberately NOT
@@ -244,7 +244,7 @@ impl Mirror {
 }
 
 // ============================================================
-//   Notify (outbound webhook) — kkv-v1 drop-in for now
+//   Notify (outbound webhook) - kkv-v1 drop-in for now
 // ============================================================
 
 /// Per-mirror outbound notify block. Today only the `kkv-v1` API
@@ -273,7 +273,7 @@ pub struct Notify {
 
 /// The wire-contract variant this notify block speaks. Today only
 /// the legacy kkv shape exists. New variants must explicitly opt
-/// in — kkv-v1 is not the default to avoid silently changing
+/// in - kkv-v1 is not the default to avoid silently changing
 /// behaviour if we ever add e.g. a kkv-v2 with auth.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "kebab-case")]
@@ -300,7 +300,7 @@ pub struct NotifyTarget {
     /// How the URL's host is resolved. `none` (default) sends one
     /// POST to a single keep-alive connection; `dns-a` resolves
     /// the host to its full A/AAAA record set and POSTs to every
-    /// returned address concurrently — the K8s-headless-Service
+    /// returned address concurrently - the K8s-headless-Service
     /// fan-out path without a Kubernetes API dependency.
     #[serde(default)]
     pub fan_out: FanOut,
@@ -349,7 +349,7 @@ impl Default for NotifyTrigger {
 #[serde(rename_all = "kebab-case")]
 pub enum TriggerOn {
     /// POST as soon as the consume loop hands a record to the
-    /// mirror — bounded by the `debounce` window. Default;
+    /// mirror - bounded by the `debounce` window. Default;
     /// matches legacy kkv behaviour.
     #[default]
     SourceConsume,
@@ -408,17 +408,17 @@ pub struct NotifyOutcomes {
     pub timeout: NotifyOutcome,
     #[serde(default = "default_outcome_connrefused")]
     pub connrefused: NotifyOutcome,
-    /// HTTP 2xx — the only success outcome.
+    /// HTTP 2xx - the only success outcome.
     #[serde(rename = "2xx", default = "default_outcome_2xx")]
     pub two_xx: NotifyOutcome,
-    /// HTTP 3xx — almost always misconfiguration on a webhook.
+    /// HTTP 3xx - almost always misconfiguration on a webhook.
     #[serde(rename = "3xx", default = "default_outcome_3xx")]
     pub three_xx: NotifyOutcome,
-    /// HTTP 4xx — receiver says "your request is wrong";
+    /// HTTP 4xx - receiver says "your request is wrong";
     /// retrying the same payload doesn't help.
     #[serde(rename = "4xx", default = "default_outcome_4xx")]
     pub four_xx: NotifyOutcome,
-    /// HTTP 5xx — receiver is transiently broken; retry per
+    /// HTTP 5xx - receiver is transiently broken; retry per
     /// policy and fail on exhaustion.
     #[serde(rename = "5xx", default = "default_outcome_5xx")]
     pub five_xx: NotifyOutcome,
@@ -621,7 +621,7 @@ pub enum Compaction {
 #[serde(rename_all = "kebab-case")]
 pub enum DestinationFormat {
     /// Apache Parquet. Columnar, embedded schema, compressed.
-    /// Standard data-lake format — readable by DuckDB / Athena /
+    /// Standard data-lake format - readable by DuckDB / Athena /
     /// Spark out of the box.
     #[default]
     Parquet,
@@ -845,7 +845,7 @@ fn validate(cfg: &Config) -> Result<(), LoadError> {
 
 fn validate_mirror(m: &Mirror) -> Result<(), LoadError> {
     // Destinations-empty is allowed ONLY when notify is set with at
-    // least one target (the "notify-only mirror" shape — see
+    // least one target (the "notify-only mirror" shape - see
     // WEBHOOKS.md). Other rules in this function are then either
     // skipped (everything destination-shaped) or applied with
     // tighter restrictions (e.g. http-access forbidden).
@@ -1063,7 +1063,7 @@ fn validate_notify_shared(m: &Mirror, notify: &Notify) -> Result<(), LoadError> 
                 )));
             }
             // The spec also rejects `destination-flush` on kafka-only
-            // mirrors — kafka commits per-record and has no
+            // mirrors - kafka commits per-record and has no
             // observable batch flushes. That rule is enforced
             // transitively here: notify requires http-access, and
             // http-access is incompatible with kafka-only destinations

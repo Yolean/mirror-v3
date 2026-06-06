@@ -1,4 +1,4 @@
-//! Tests for the source-consume debounce buffer (Phase 3c).
+//! Tests for the source-consume debounce buffer.
 //!
 //! The buffer batches `(key, source_offset)` per record, emits a
 //! single POST when `max-records` records have arrived OR
@@ -58,7 +58,7 @@ async fn drains_when_max_records_reached() {
     assert_eq!(
         server.request_count(),
         0,
-        "no drain yet — only 2 of 3 records buffered"
+        "no drain yet; only 2 of 3 records buffered"
     );
     n.on_record(&rec(12, "c")).await.unwrap();
     assert_eq!(
@@ -99,7 +99,7 @@ async fn drains_when_max_time_ms_elapses() {
     assert_eq!(
         server.request_count(),
         0,
-        "no inline drain — record buffered"
+        "no inline drain; record buffered"
     );
 
     // Sleep comfortably past the window plus dispatch slop.

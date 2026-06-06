@@ -2,7 +2,7 @@
 //!
 //! Walks the (compaction-mode × buffer-state × action) grid from
 //! `REVIEW_TEST_STRATEGY.md §4` against a real sink backed by
-//! `tempfile::TempDir` — no mocks, so an invariant change in the
+//! `tempfile::TempDir`; no mocks, so an invariant change in the
 //! real sink surfaces here instead of slipping past a mock that
 //! quietly diverged from production. The full 16-cell table is in
 //! the `MATRIX` const at the bottom of this file; each row names
@@ -62,7 +62,7 @@ fn cfg(root: &std::path::Path, compaction: Option<CompactionMode>) -> Filesystem
         compaction,
         cache: None,
         // Huge thresholds so explicit `flush()` is the only thing
-        // that actually rotates a file — matrix rows that *don't*
+        // that actually rotates a file; matrix rows that *don't*
         // call flush get to control buffer state precisely.
         flush: FlushTriggers {
             max_time: Duration::from_secs(3600),
@@ -260,7 +260,7 @@ async fn matrix() {
 fn matrix_cases() -> Vec<Case> {
     vec![
         // ============================================================
-        //  APPEND MODE — every gap is fatal, equality is the only OK
+        //  APPEND MODE; every gap is fatal, equality is the only OK
         // ============================================================
 
         // append × empty × write at expected → OK
@@ -330,7 +330,7 @@ fn matrix_cases() -> Vec<Case> {
             },
         },
         // ============================================================
-        //  COMPACTION:LOG — forward gaps OK, backwards still fatal
+        //  COMPACTION:LOG; forward gaps OK, backwards still fatal
         // ============================================================
 
         // log × empty × write at expected (offset 0) → OK
@@ -395,7 +395,7 @@ fn matrix_cases() -> Vec<Case> {
             },
         },
         // ============================================================
-        //  ALIGN — bootstrap-only, empty-buffer precondition
+        //  ALIGN; bootstrap-only, empty-buffer precondition
         // ============================================================
 
         // log × empty × align(low_watermark=461) → OK
@@ -426,7 +426,7 @@ fn matrix_cases() -> Vec<Case> {
             expected: Outcome::TransportContains("non-compaction sink"),
         },
         // ============================================================
-        //  FLUSH — filename encodes the offset range correctly
+        //  FLUSH; filename encodes the offset range correctly
         // ============================================================
 
         // append × non-empty × flush → file `<dur>-<dur+len-1>` (contiguous)
@@ -442,7 +442,7 @@ fn matrix_cases() -> Vec<Case> {
             expected: Outcome::Ok,
         },
         // log × non-empty × flush after gap-spanning writes → file `<dur>-<max(offsets)>`
-        // The buffer carries offsets 0, 461, 466 — the snapshot file
+        // The buffer carries offsets 0, 461, 466; the snapshot file
         // must name `0-466.parquet` (not `0-2` from len-1).
         Case {
             name: "log/non_empty_with_gaps/flush/uses_max_offset_for_to",
@@ -456,7 +456,7 @@ fn matrix_cases() -> Vec<Case> {
             expected: Outcome::Ok,
         },
         // ============================================================
-        //  NEXT_EXPECTED_OFFSET — reflects buffered_head() correctly
+        //  NEXT_EXPECTED_OFFSET; reflects buffered_head() correctly
         // ============================================================
 
         // append × non-empty × next_expected → durable + buffer.len()

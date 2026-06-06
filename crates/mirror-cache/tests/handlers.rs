@@ -260,7 +260,7 @@ async fn q_health_ready_returns_503_until_caught_up_then_200() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    // Empty body — Quarkus's SmallRye-Health returns a JSON document,
+    // Empty body; Quarkus's SmallRye-Health returns a JSON document,
     // but the kkv Node client only checks the status code, so we
     // keep the body empty (200 implies ready, no further parsing).
     assert!(body_bytes(resp).await.is_empty());
@@ -268,7 +268,7 @@ async fn q_health_ready_returns_503_until_caught_up_then_200() {
 
 #[tokio::test]
 async fn q_health_ready_is_not_in_openapi_spec() {
-    // Compat shim, intentionally undocumented — public surface is
+    // Compat shim, intentionally undocumented; public surface is
     // `/cache/v1` and `/_admin/v1` only.
     let cache = Arc::new(CacheState::new());
     cache.register_mirror("m", 0);

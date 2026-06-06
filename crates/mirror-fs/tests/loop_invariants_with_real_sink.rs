@@ -19,7 +19,7 @@
 //! without creating a dev-dep cycle.
 //!
 //! The cases here are deliberately a curated subset of the mock-based
-//! suite — the ones where sink behaviour is the load-bearing
+//! suite; the ones where sink behaviour is the load-bearing
 //! invariant. Other cases (pure error-variant matching, MockSource's
 //! `Hang`/`Error` scripts) stay in `mirror-core/tests/loop_invariants.rs`
 //! where they're already cheap.
@@ -62,7 +62,7 @@ fn fs_cfg(root: &Path, compaction: Option<CompactionMode>) -> FilesystemSinkConf
         values: ColumnType::Utf8,
         compaction,
         cache: None,
-        // High thresholds — explicit flush_now is the only thing
+        // High thresholds; explicit flush_now is the only thing
         // that rotates a file during these tests so we can drive
         // buffer state precisely from the events list.
         flush: FlushTriggers {
@@ -128,7 +128,7 @@ fn append_mode_writes_records_in_order_to_real_disk() {
 
 #[test]
 fn append_mode_real_sink_rejects_source_gap() {
-    // Source skips from 0 to 5 — append mode must reject the gap
+    // Source skips from 0 to 5; append mode must reject the gap
     // via SourceGapAboveExpected from the run loop. Disk should
     // contain only the first record (or none, depending on whether
     // the buffer flushed before the error fired; we don't assert).
@@ -150,7 +150,7 @@ fn append_mode_real_sink_rejects_source_gap() {
 
 #[test]
 fn real_sink_rejects_source_going_backwards() {
-    // Source delivers 5 then 3 — always fatal, in any mode.
+    // Source delivers 5 then 3; always fatal, in any mode.
     let (result, _td) = drive_real_fs(
         Some(CompactionMode::Log),
         vec![
@@ -242,7 +242,7 @@ fn compaction_log_real_sink_accepts_repeated_midstream_gaps() {
         "the snapshot file's range must cover all three accepted records"
     );
     // The snapshot's compaction view is "latest per key". The
-    // three accepted records have keys `k{offset % 4}` — so
+    // three accepted records have keys `k{offset % 4}`; so
     // offsets 461, 466, 470 map to keys k1, k2, k2. The k2 entry
     // is deduplicated to its latest value (v470), leaving two
     // distinct keys in the snapshot.

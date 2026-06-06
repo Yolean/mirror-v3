@@ -1,7 +1,6 @@
 //! Invariant tests for the [`Notifier`] hook in `run_mirror`.
 //!
-//! These pin the contract that the kkv-v1 webhook dispatcher (and any
-//! future notifier impl) will be built against:
+//! These pin the contract every notifier implementation must honour:
 //!   * `on_record` fires exactly once per successful `sink.write`,
 //!     in source-offset order, *after* the destination has accepted
 //!     the record.
@@ -295,7 +294,7 @@ fn on_record_does_not_fire_when_sink_write_fails() {
 #[test]
 fn on_record_does_not_fire_on_source_went_backwards() {
     // Source delivers 10 then 9. Loop must error before ever calling
-    // sink.write — and therefore before on_record.
+    // sink.write; and therefore before on_record.
     let source = MockSource::new([
         MockSourceEvent::Record(rec(10)),
         MockSourceEvent::Record(rec(9)),

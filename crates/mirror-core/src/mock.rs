@@ -1,8 +1,8 @@
 //! Hand-written mocks for testing the mirror loop.
 //!
-//! These are public so downstream crates (notably the e2e harness in
-//! Phase 2) can reuse them, but the API is `#[doc(hidden)]`-ish: it
-//! exists to be shaped by the tests next to it.
+//! These are public so downstream crates (notably the e2e harness)
+//! can reuse them, but the API is `#[doc(hidden)]`-ish: it exists to
+//! be shaped by the tests next to it.
 
 use async_trait::async_trait;
 use std::collections::VecDeque;
@@ -35,7 +35,7 @@ impl MockSource {
             events: events.into_iter().collect(),
             seeks: Vec::new(),
             low_watermark: 0,
-            // Default `u64::MAX` matches the trait's default — no
+            // Default `u64::MAX` matches the trait's default; no
             // spec currently rejects on HWM, so the sentinel value
             // is "always satisfiable."
             high_watermark: u64::MAX,

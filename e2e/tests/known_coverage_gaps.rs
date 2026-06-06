@@ -7,7 +7,7 @@
 //!
 //! Several recent commits in this repo end up with a "the existing
 //! e2e doesn't catch this" or "the test was passing for the wrong
-//! reason" paragraph in their messages — useful prose, but it sits
+//! reason" paragraph in their messages; useful prose, but it sits
 //! in `git log` rather than the test suite. The reviewer's smaller
 //! observation §1 in `REVIEW_TEST_STRATEGY.md` calls this out and
 //! asks us to convert each known gap into a `cargo test --list`-able
@@ -29,11 +29,11 @@
 #![allow(unreachable_code, clippy::diverging_sub_expression)]
 
 #[tokio::test]
-#[ignore = "TODO: REVIEW_TEST_STRATEGY.md §3 — needs real-broker compaction (not delete-records)"]
+#[ignore = "TODO: REVIEW_TEST_STRATEGY.md §3; needs real-broker compaction (not delete-records)"]
 async fn kafka_source_low_watermark_after_pure_compaction_only() {
     //! Broker contract: a topic with `cleanup.policy=compact` (and
     //! *not* `compact,delete`) keeps `LogStartOffset = 0` after
-    //! compaction has deduplicated keys — the segment start hasn't
+    //! compaction has deduplicated keys; the segment start hasn't
     //! moved. From a consumer's point of view, `fetch_watermarks`
     //! returns `(0, high)` but `seek(0)` produces a record at some
     //! offset > 0 because the earlier records were dropped by
@@ -41,7 +41,7 @@ async fn kafka_source_low_watermark_after_pure_compaction_only() {
     //!
     //! The existing `e2e/tests/compacted_source_with_compaction_log.rs`
     //! claims to cover this case but is using `delete-records` as a
-    //! stand-in — that advances `LogStartOffset` and so doesn't
+    //! stand-in; that advances `LogStartOffset` and so doesn't
     //! reproduce the contract this test would assert.
     //!
     //! Implementation sketch:
@@ -55,9 +55,9 @@ async fn kafka_source_low_watermark_after_pure_compaction_only() {
     //!      segment.ms=1`, wait, restore).
     //!   4. Poll until the log cleaner runs and the segment on disk
     //!      is smaller than the original record count.
-    //!   5. Call `KafkaSource::low_watermark()` — assert it returns
+    //!   5. Call `KafkaSource::low_watermark()`; assert it returns
     //!      `0` (the contract this test exists to pin).
-    //!   6. Call `consumer.seek(0)` + poll one — assert the first
+    //!   6. Call `consumer.seek(0)` + poll one; assert the first
     //!      delivered offset is > 0 (the gap the mirror has to
     //!      tolerate under `compaction:log`).
     //!
@@ -70,7 +70,7 @@ async fn kafka_source_low_watermark_after_pure_compaction_only() {
 }
 
 #[tokio::test]
-#[ignore = "TODO: REVIEW_TEST_STRATEGY.md §2 — needs multi-broker Apache Kafka stack variant"]
+#[ignore = "TODO: REVIEW_TEST_STRATEGY.md §2; needs multi-broker Apache Kafka stack variant"]
 async fn kafka_source_low_watermark_against_realistic_metadata_latency() {
     //! Bug class: `StreamConsumer::fetch_watermarks` on a fresh
     //! consumer that has not yet completed broker connection /
@@ -97,7 +97,7 @@ async fn kafka_source_low_watermark_against_realistic_metadata_latency() {
     //! `low_watermark()`, assert the broker's actual value is
     //! returned. A second variant (or a parameterised run) calls
     //! `fetch_watermarks` *directly* on the StreamConsumer and
-    //! asserts it returns the broken `(0, 0)` — that becomes the
+    //! asserts it returns the broken `(0, 0)`; that becomes the
     //! regression guard so a future commit can't silently revert
     //! to the StreamConsumer path without this test failing.
     unimplemented!(
@@ -106,17 +106,17 @@ async fn kafka_source_low_watermark_against_realistic_metadata_latency() {
 }
 
 #[tokio::test]
-#[ignore = "TODO: REVIEW_TEST_STRATEGY.md smaller obs §2 — stress fixture, not per-PR CI"]
+#[ignore = "TODO: REVIEW_TEST_STRATEGY.md smaller obs §2; stress fixture, not per-PR CI"]
 async fn compaction_log_handles_production_scale_fixture() {
     //! Production reproducer the current 12-record e2e seeds don't
     //! exercise: 1.2M source offsets, multiple keys, real broker-
     //! side compaction work. Catches buffer-pressure issues, flush-
     //! trigger edge cases, and mid-stream-gap density patterns
     //! (compact-heavy topics deliver one gap per surviving key after
-    //! upstream dedup — at scale, that's hundreds of thousands of
+    //! upstream dedup; at scale, that's hundreds of thousands of
     //! gaps per restart) that small seeds don't surface.
     //!
-    //! Should NOT run on every PR — the data volume is the point.
+    //! Should NOT run on every PR; the data volume is the point.
     //! Gate on a schedule (nightly?), a label, or a manual workflow
     //! dispatch. The strategy document explicitly suggests not
     //! conflating this with bug-catching coverage (that's what the
@@ -136,7 +136,7 @@ async fn compaction_log_handles_production_scale_fixture() {
 }
 
 #[tokio::test]
-#[ignore = "TODO: REVIEW_TEST_STRATEGY.md §5 — restart matrix, builds on §3 harness"]
+#[ignore = "TODO: REVIEW_TEST_STRATEGY.md §5; restart matrix, builds on §3 harness"]
 async fn restart_correctness_across_cleanup_policies() {
     //! The seven-row matrix from REVIEW_TEST_STRATEGY.md §5:
     //!
@@ -151,7 +151,7 @@ async fn restart_correctness_across_cleanup_policies() {
     //! | `compact` only   | non-empty                  | mid-stream gaps |
     //!
     //! The two `compact only` rows are the cells the PR-#1 work
-    //! turned from "silently misbehaving" into "correct" — but
+    //! turned from "silently misbehaving" into "correct"; but
     //! there's no e2e test that exercises the full restart cycle
     //! against them. The other five rows are individually covered
     //! by existing tests; encoding them as one table catches "we

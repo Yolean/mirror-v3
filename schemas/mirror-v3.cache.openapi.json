@@ -15,7 +15,7 @@
         "tags": [
           "admin"
         ],
-        "summary": "POST /_admin/v1/shutdown — request graceful exit.",
+        "summary": "POST /_admin/v1/shutdown; request graceful exit.",
         "operationId": "admin_shutdown",
         "responses": {
           "202": {
@@ -29,7 +29,7 @@
         "tags": [
           "admin"
         ],
-        "summary": "POST /_admin/v1/shutdown/{exitcode} — request graceful exit with a specific code.",
+        "summary": "POST /_admin/v1/shutdown/{exitcode}; request graceful exit with a specific code.",
         "operationId": "admin_shutdown_with_exit_code",
         "parameters": [
           {
@@ -55,8 +55,8 @@
         "tags": [
           "cache"
         ],
-        "summary": "GET /cache/v1/keys — newline-separated key list, every line\n(including the last) terminated by `\\n`. Order is the order each\nkey was first seen by the cache (insertion order).",
-        "description": "`Content-Type` is `application/octet-stream` to match KKV's\nbyte-for-byte response shape. A possible future enhancement (gated\non operator demand) is to surface the topic schema in the content\ntype — see the `values` handler for the same hook.",
+        "summary": "GET /cache/v1/keys; newline-separated key list, every line\n(including the last) terminated by `\\n`. Order is the order each\nkey was first seen by the cache (insertion order).",
+        "description": "`Content-Type` is `application/octet-stream` to match KKV's\nbyte-for-byte response shape. A possible future enhancement (gated\non operator demand) is to surface the topic schema in the content\ntype; see the `values` handler for the same hook.",
         "operationId": "keys",
         "responses": {
           "200": {
@@ -85,7 +85,7 @@
         "tags": [
           "cache"
         ],
-        "summary": "GET /cache/v1/offset/{topic}/{partition} — last-seen offset.",
+        "summary": "GET /cache/v1/offset/{topic}/{partition}; last-seen offset.",
         "operationId": "offset_for_partition",
         "parameters": [
           {
@@ -131,7 +131,7 @@
         "tags": [
           "cache"
         ],
-        "summary": "GET /cache/v1/raw/{key} — fetch a value by key.",
+        "summary": "GET /cache/v1/raw/{key}; fetch a value by key.",
         "operationId": "raw_by_key",
         "parameters": [
           {
@@ -177,8 +177,8 @@
         "tags": [
           "cache"
         ],
-        "summary": "GET /cache/v1/values — newline-separated values (raw bytes).\nOrder matches `/cache/v1/keys`. Every line — including the last —\nis terminated by `\\n`. Binary-safe **only** when none of the values\ncontain a `0x0A` byte; binary topics should pin\n`values: { type: bytes-base64 }` so the cache returns the\nbase64-encoded form here.",
-        "description": "`Content-Type` is `text/plain; charset=utf-8` regardless of the\nconfigured value type. Future work — gated on operator demand —\nis to adapt the response content type to the topic schema:\n\n| `values.type`        | proposed `Content-Type`            |\n| -------------------- | ---------------------------------- |\n| `bytes-base64`       | `application/octet-stream`         |\n| `utf8`               | `text/plain; charset=utf-8`        |\n| `json` / `json-parseable` | `application/x-ndjson`        |\n\nNot implemented today to keep parity with KKV's\n`text/plain;charset=UTF-8` (mirror-v3 emits the RFC-normalised\nequivalent).",
+        "summary": "GET /cache/v1/values; newline-separated values (raw bytes).\nOrder matches `/cache/v1/keys`. Every line; including the last -\nis terminated by `\\n`. Binary-safe **only** when none of the values\ncontain a `0x0A` byte; binary topics should pin\n`values: { type: bytes-base64 }` so the cache returns the\nbase64-encoded form here.",
+        "description": "`Content-Type` is `text/plain; charset=utf-8` regardless of the\nconfigured value type. Future work; gated on operator demand -\nis to adapt the response content type to the topic schema:\n\n| `values.type`        | proposed `Content-Type`            |\n| -------------------- | ---------------------------------- |\n| `bytes-base64`       | `application/octet-stream`         |\n| `utf8`               | `text/plain; charset=utf-8`        |\n| `json` / `json-parseable` | `application/x-ndjson`        |\n\nNot implemented today to keep parity with KKV's\n`text/plain;charset=UTF-8` (mirror-v3 emits the RFC-normalised\nequivalent).",
         "operationId": "values",
         "responses": {
           "200": {

@@ -28,7 +28,7 @@ fn never() -> std::future::Pending<()> {
     std::future::pending::<()>()
 }
 
-/// Demonstration #1 — encode the committed `SourceWentBackwards`
+/// Demonstration #1; encode the committed `SourceWentBackwards`
 /// invariant entirely through the palette.
 ///
 /// The point isn't the test result (`mirror-core/tests/loop_invariants.rs`
@@ -37,7 +37,7 @@ fn never() -> std::future::Pending<()> {
 /// `InspectorSink`-style state plumbing.
 #[test]
 fn palette_encodes_source_went_backwards() {
-    // Sink reports it's at offset 5 — the loop's `expected` starts
+    // Sink reports it's at offset 5; the loop's `expected` starts
     // here.
     let sink = BlanketMockSink::builder()
         .with_next_expected_offset(5)
@@ -63,7 +63,7 @@ fn palette_encodes_source_went_backwards() {
     }
 }
 
-/// Demonstration #2 — encode an *idle-drift* invariant where the
+/// Demonstration #2; encode an *idle-drift* invariant where the
 /// sink's `next_expected_offset` changes across calls.
 ///
 /// The existing `MockSink::with_position_program` already supports
@@ -76,7 +76,7 @@ fn palette_encodes_source_went_backwards() {
 #[test]
 fn palette_encodes_destination_drift_via_sequence() {
     // Startup call returns 10; idle re-check (after the Idle event)
-    // returns 15 — out-of-band write detected.
+    // returns 15; out-of-band write detected.
     let sink = BlanketMockSink::builder().with_next_expected_offset_sequence(vec![10, 15]);
 
     let source = MockSource::new([
@@ -94,7 +94,7 @@ fn palette_encodes_destination_drift_via_sequence() {
     }
 }
 
-/// Demonstration #3 — encode a per-record decision via `with_write_fn`.
+/// Demonstration #3; encode a per-record decision via `with_write_fn`.
 ///
 /// Scenario: the spec under test is "the sink rejects exactly the
 /// fifth record." The closure captures a counter, decides per call.
@@ -102,7 +102,7 @@ fn palette_encodes_destination_drift_via_sequence() {
 #[test]
 fn palette_encodes_per_record_sink_decision() {
     // The closure captures a counter that drives the per-call
-    // decision — that's the demonstration. The fifth write call
+    // decision; that's the demonstration. The fifth write call
     // (regardless of record offset) is rejected.
     let mut written = 0u32;
     let sink = BlanketMockSink::builder()
@@ -124,7 +124,7 @@ fn palette_encodes_per_record_sink_decision() {
         MockSourceEvent::Record(rec(1)),
         MockSourceEvent::Record(rec(2)),
         MockSourceEvent::Record(rec(3)),
-        MockSourceEvent::Record(rec(4)), // the 5th write — rejected
+        MockSourceEvent::Record(rec(4)), // the 5th write; rejected
     ]);
 
     let result = drive(run_mirror(source, sink, never()));
@@ -136,7 +136,7 @@ fn palette_encodes_per_record_sink_decision() {
     }
 }
 
-/// Demonstration #4 — inspect call ordering after the loop exits.
+/// Demonstration #4; inspect call ordering after the loop exits.
 ///
 /// `BlanketMockSink::calls()` returns the full trait-method
 /// invocation history. Useful when the spec is about *what order*
@@ -161,12 +161,12 @@ fn palette_records_call_order_for_post_hoc_assertion() {
     // The contract `BlanketMockSink` upholds: every trait-method
     // call is recorded. We can't assert that the loop processed N
     // records (`tokio::select!` biases shutdown), but we CAN assert
-    // structural properties — every Write is preceded by a
+    // structural properties; every Write is preceded by a
     // NextExpectedOffset at startup, flush is called at most once,
     // etc. For a true post-hoc inspection the test holds the sink
     // by reference via Arc<Mutex> instead of moving into run_mirror.
     // The shape of that pattern lives in `tee.rs` already and isn't
-    // reproduced here — the point is the calls() accessor exists
+    // reproduced here; the point is the calls() accessor exists
     // and is the entrypoint.
     //
     // For this test, just confirm the discrimination works: a
@@ -175,11 +175,11 @@ fn palette_records_call_order_for_post_hoc_assertion() {
     assert_eq!(fresh.calls(), Vec::<Call>::new());
 }
 
-/// Demonstration #5 — TDD sketch for a future spec.
+/// Demonstration #5; TDD sketch for a future spec.
 ///
 /// This test is `#[ignore]`d because the spec it asserts on doesn't
 /// exist yet. It compiles, runs in `--include-ignored` mode, and
-/// fails with a clear panic naming the work to do — exactly the
+/// fails with a clear panic naming the work to do; exactly the
 /// red-green-refactor entrypoint a contributor wants when picking
 /// up the work.
 ///
@@ -208,7 +208,7 @@ fn palette_records_call_order_for_post_hoc_assertion() {
 /// assertion (see the commented sketch below) is the green-side
 /// landing.
 #[test]
-#[ignore = "TODO: spec not yet implemented — see body for the TDD pattern"]
+#[ignore = "TODO: spec not yet implemented; see body for the TDD pattern"]
 fn future_spec_sink_ahead_of_source_is_fatal() {
     // Palette setup that the future test would use:
     //

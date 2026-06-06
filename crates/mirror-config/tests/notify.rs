@@ -2,7 +2,7 @@
 //!
 //! Each rule from "Validation" in WEBHOOKS.md is one test. The
 //! positive-path tests are also worth keeping because they pin
-//! the spec's defaults — if a future commit changes
+//! the spec's defaults - if a future commit changes
 //! `notify.timeout-ms`'s default from 5000, `defaults_apply_when_omitted`
 //! fails and the operator-facing semantics get reviewed.
 
@@ -573,7 +573,7 @@ fn destination_flush_with_only_kafka_destination_is_rejected_transitively() {
     // Per WEBHOOKS.md: "A mirror with no blob destinations (kafka-
     // only) cannot use `destination-flush`". The validator enforces
     // this transitively: notify requires http-access, http-access
-    // requires ≥1 blob destination — so kafka-only + notify is
+    // requires ≥1 blob destination - so kafka-only + notify is
     // already rejected, regardless of trigger mode. This test pins
     // that the rejection happens.
     let yaml = r#"

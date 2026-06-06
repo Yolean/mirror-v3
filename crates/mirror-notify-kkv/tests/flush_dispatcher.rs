@@ -1,8 +1,8 @@
-//! Tests for `FlushDispatcher` (Phase 4b) — the destination-flush
-//! POST path. Drives the dispatcher from the
-//! [`mirror_core::FlushObserver`] interface (the same way a real
-//! mirror's TeeSink does) and asserts on what the receiver actually
-//! got: body shape, per-flush dispatch, drainer-task error surfacing.
+//! Tests for `FlushDispatcher`, the destination-flush POST path.
+//! Drives the dispatcher from the [`mirror_core::FlushObserver`]
+//! interface (the same way a real mirror's TeeSink does) and asserts
+//! on what the receiver actually got: body shape, per-flush
+//! dispatch, drainer-task error surfacing.
 
 mod common;
 
@@ -66,7 +66,7 @@ async fn fires_one_post_per_flush_event_with_empty_updates() {
     let mut dispatcher =
         FlushDispatcher::from_config(&cfg, "events".into(), 3).expect("must build");
 
-    // Drive the observer twice — simulates two real flushes from the
+    // Drive the observer twice; simulates two real flushes from the
     // TeeSink coordinator. `from` is ignored by the dispatcher.
     dispatcher.on_flushed(0, 9);
     dispatcher.on_flushed(10, 19);
@@ -105,7 +105,7 @@ async fn shutdown_surfaces_drainer_dispatch_error() {
     dispatcher.on_flushed(0, 9);
 
     // Wait for the drainer to actually exhaust retries before we
-    // shut down — otherwise shutdown's `abort()` could win and we'd
+    // shut down; otherwise shutdown's `abort()` could win and we'd
     // see Ok.
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
     loop {
@@ -125,7 +125,7 @@ async fn shutdown_surfaces_drainer_dispatch_error() {
     // observation. Since `last_error` already took it, push another
     // event to verify the dispatcher doesn't panic on a dead drainer.
     dispatcher.on_flushed(10, 19);
-    // Shutdown is a no-op for error state at this point — the
+    // Shutdown is a no-op for error state at this point; the
     // error was already taken. This test mainly verifies the
     // shutdown path is safe after the drainer exited.
     dispatcher

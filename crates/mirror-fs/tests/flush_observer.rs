@@ -4,7 +4,7 @@
 //! flushed file's bounds.
 //!
 //! This is the load-bearing test for the `notify.trigger.on:
-//! destination-flush` dispatch path — the webhook receiver gets one
+//! destination-flush` dispatch path; the webhook receiver gets one
 //! POST per (from, to) the observer fires.
 
 use std::sync::Arc;

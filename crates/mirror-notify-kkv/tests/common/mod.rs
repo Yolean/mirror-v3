@@ -39,7 +39,7 @@ pub struct CapturedRequest {
 pub enum Reply {
     /// Plain HTTP status reply.
     Status(u16),
-    /// Sleep for `Duration` then return 200 — used to trigger client
+    /// Sleep for `Duration` then return 200; used to trigger client
     /// timeouts when `notify.timeout-ms` is set below this.
     SlowOk(Duration),
 }

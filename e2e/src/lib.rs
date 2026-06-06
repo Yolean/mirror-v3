@@ -8,8 +8,8 @@
 //! wants new ways to provision an environment (different runners,
 //! different fault-injectors) added without rewriting the tests.
 //!
-//! The two trait seams below — [`Provisioner`] and
-//! [`ProvisionedStack`] — are that pluggable surface. The first impl
+//! The two trait seams below ([`Provisioner`] and
+//! [`ProvisionedStack`]) are that pluggable surface. The first impl
 //! is [`docker::DockerProvisioner`]; future impls (kind, real cloud)
 //! drop in next to it without touching the test files in
 //! `e2e/tests/`.
@@ -43,7 +43,7 @@ pub trait ProvisionedStack: Send + Sync {
         None
     }
 
-    /// S3 endpoint URL for S3-sink stacks (Phase 4). `None` otherwise.
+    /// S3 endpoint URL for S3-sink stacks. `None` otherwise.
     fn target_s3_endpoint(&self) -> Option<String> {
         None
     }

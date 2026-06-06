@@ -6,14 +6,14 @@
 # `@yolean/kafka-keyvalue` Node client.
 #
 # Per WEBHOOKS.md:
-#   * trigger.on: source-consume  — POST as records arrive (default).
-#   * debounce  {100, 250}        — at most 100 records per POST and
-#                                   no more than 250 ms of staleness.
+#   * trigger.on: source-consume   - POST as records arrive (default).
+#   * debounce  {100, 250}         - at most 100 records per POST and
+#                                    no more than 250 ms of staleness.
 #   * outcomes.5xx { retry: true, final: fail }
-#                                 — transient backend trouble retries
-#                                   per `notify.retry`; persistent
-#                                   trouble crashes the mirror so the
-#                                   orchestrator restarts it.
+#                                  - transient backend trouble retries
+#                                    per `notify.retry`; persistent
+#                                    trouble crashes the mirror so the
+#                                    orchestrator restarts it.
 
 mirrors:
   - name: user-states

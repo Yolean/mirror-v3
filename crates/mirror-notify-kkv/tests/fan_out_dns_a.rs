@@ -1,4 +1,4 @@
-//! Tests for `fan-out: dns-a` (Phase 3d).
+//! Tests for `fan-out: dns-a`.
 //!
 //! Each test stands up two axum servers on `127.0.0.1` with distinct
 //! ports, then injects a stub [`DnsAResolver`] that returns those
@@ -59,7 +59,7 @@ fn notify_dns_a() -> Notify {
     Notify {
         api: NotifyApi::KkvV1,
         targets: vec![NotifyTarget {
-            // Hostname is irrelevant — the stub resolver doesn't read
+            // Hostname is irrelevant; the stub resolver doesn't read
             // it. Port 80 is the default; the dispatcher rewrites
             // both host and port per resolved SocketAddr.
             url: "http://stub-host.invalid".into(),
@@ -188,7 +188,7 @@ async fn cached_addresses_reused_within_ttl_then_re_resolved_on_failure() {
     // Swap the resolver to point at the failing server. We can't
     // mutate the existing Arc; just construct a new notifier with a
     // new stub. The salient assertion in this segment is just that
-    // failure paths invalidate the cache — checked via the per-fail
+    // failure paths invalidate the cache; checked via the per-fail
     // resolver-call count.
     drop(n);
 
@@ -217,7 +217,7 @@ async fn cached_addresses_reused_within_ttl_then_re_resolved_on_failure() {
 async fn dispatches_concurrently_to_all_addresses() {
     // Both servers sleep 200ms before responding 200. If dispatch is
     // serial, total time is ~400ms+; if concurrent, ~200ms+. Use
-    // 500ms as the upper bound — comfortably above 200ms, well below
+    // 500ms as the upper bound; comfortably above 200ms, well below
     // 400ms.
     use std::time::{Duration, Instant};
     let server_a = TestServer::start(Reply::SlowOk(Duration::from_millis(200)), vec![]).await;
@@ -236,7 +236,7 @@ async fn dispatches_concurrently_to_all_addresses() {
 
     assert!(
         elapsed < Duration::from_millis(500),
-        "fan-out must dispatch concurrently — took {elapsed:?}, expected ~200ms"
+        "fan-out must dispatch concurrently; took {elapsed:?}, expected ~200ms"
     );
     assert_eq!(server_a.request_count(), 1);
     assert_eq!(server_b.request_count(), 1);

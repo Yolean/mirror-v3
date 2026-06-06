@@ -45,7 +45,11 @@ async fn posts_to_default_kkv_path_with_canonical_body() {
         .unwrap();
 
     let captured = server.captured().await;
-    assert_eq!(captured.len(), 1, "exactly one POST per record in 3a");
+    assert_eq!(
+        captured.len(),
+        1,
+        "one record, max_records=1 helper, expect one POST"
+    );
     let req = &captured[0];
 
     assert_eq!(
@@ -82,7 +86,7 @@ async fn posts_to_default_kkv_path_with_canonical_body() {
 async fn null_key_serializes_as_empty_string() {
     // The Node consumer keys cache invalidations by string; a missing
     // key turns into "" so it has SOMETHING to call `getValue("")`
-    // with — same as the legacy kkv null handling.
+    // with; same as the legacy kkv null handling.
     let server = TestServer::start(Reply::Status(200), vec![]).await;
     let cfg = notify_pointing_at(server.addr, NotifyOutcomes::default(), fast_retry(), 1000);
     let mut notifier = KkvV1Notifier::from_config(&cfg, "events".into(), 0).unwrap();

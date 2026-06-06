@@ -22,7 +22,7 @@ this manifests as records produced *after* a consumer service
 started up never reaching that service's local view: the source
 topic has the new record, mirror-v3's cache-v1 in-memory map sees
 it, but the consumer's own in-process cache is stuck on the value
-it snapshotted at startup — because nothing tells it to invalidate.
+it snapshotted at startup; because nothing tells it to invalidate.
 
 This proposal adds the missing push side as a per-mirror opt-in,
 without resurrecting any of kkv's other behaviour.
@@ -63,11 +63,11 @@ The deployment shape used by every observed kkv instance:
 
 | dimension                | shape                                                        |
 |--------------------------|--------------------------------------------------------------|
-| One mirror per…          | (source topic, partition) — same as mirror-v3 already         |
+| One mirror per…          | (source topic, partition); same as mirror-v3 already         |
 | Target discovery         | A Kubernetes *headless* Service named after the role          |
 | Target replica count     | 1–N consumer pods behind that Service                         |
 | Target route             | `POST /kafka-keyvalue/v1/updates` on each pod, port 8080      |
-| Consumer client library  | `@yolean/kafka-keyvalue` (Node) — mounts the route as-is      |
+| Consumer client library  | `@yolean/kafka-keyvalue` (Node); mounts the route as-is      |
 
 Consumer-side route mount, identical across every deployment seen:
 
@@ -143,20 +143,20 @@ Field-level notes:
   - `dns-a`: resolve the host to all A/AAAA records and POST to
     every address that comes back. Headless Kubernetes Services
     naturally return one A record per pod, so this gives the same
-    fan-out kkv used to do via the Endpoints API — without mirror-v3
+    fan-out kkv used to do via the Endpoints API; without mirror-v3
     needing K8s API access. Resolutions are cached up to the DNS
     record TTL.
 - **`notify.trigger`** decides what internal event causes a POST.
   See the dedicated section below; default is `source-consume` with
   small debounce, matching kkv's "as records arrive" behaviour.
-- **`notify.timeout-ms`** is the per-request HTTP timeout — strictly
+- **`notify.timeout-ms`** is the per-request HTTP timeout; strictly
   about how long to wait for *this* request before declaring it a
   `timeout` outcome. It does not influence retry decisions or
   exhaustion behaviour; those live in `notify.outcomes` and
   `notify.retry`.
 - **`notify.retry`** is one shared backoff/exhaust policy used by
   any outcome marked `retry: true`. There is intentionally no
-  per-outcome backoff override — heterogeneous retry shapes per
+  per-outcome backoff override; heterogeneous retry shapes per
   status class are scope creep for the MVP and can be added later
   if the four-outcome surface proves insufficient.
 - **`notify.outcomes`** decides what each of six distinct request
@@ -193,7 +193,7 @@ unmodified.
   - `topic` matches the header for double-check robustness.
   - `offsets` carries the highest source offset across the batch
     per partition. Single-partition mirrors send `{"0": <max>}`.
-  - `updates` is keyed by Kafka record key. Values are `null` —
+  - `updates` is keyed by Kafka record key. Values are `null` -
     consumers re-read via `GET /cache/v1/raw/<key>`. (The legacy
     kkv allowed a payload hint but the upstream client immediately
     re-fetches via `requireOffset: highestOffset` anyway, so the
@@ -225,7 +225,7 @@ the mirror loop. The record has already been applied to the
 cache-v1 in-memory view (`write()` does that per-record), so a
 consumer that re-fetches `/cache/v1/raw/<key>` immediately on
 notify sees the just-updated value. Destination flush cadence is
-irrelevant — flushes can lag minutes or hours and cache freshness
+irrelevant; flushes can lag minutes or hours and cache freshness
 on the consumer side is unaffected.
 
 This is what kkv did, and what every existing `@yolean/kafka-keyvalue`
@@ -258,13 +258,13 @@ land in the next batch's buffer.)
 ### `trigger.on: destination-flush`
 
 A POST is queued only after the destination(s) durably commit a
-batch — i.e. the same moment the `flushed batch` log line fires
+batch; i.e. the same moment the `flushed batch` log line fires
 in mirror-fs / mirror-s3. The notify body's offset range matches
 the flushed snapshot's `from`–`to` exactly. No `debounce` block
 applies (the destination's flush triggers ARE the debounce).
 
 Use case: downstream consumers that care about durability rather
-than freshness — e.g. an archival sync job that wants "tell me
+than freshness; e.g. an archival sync job that wants "tell me
 when a parquet file lands so I can copy it elsewhere". Not the
 right fit for cache invalidation, since destination flush cadence
 is typically minutes.
@@ -295,7 +295,7 @@ are status-class buckets.
 | `timeout`      | Request didn't complete within `notify.timeout-ms`.                                  |
 | `connrefused` | TCP refused fast (target's port is closed or the host is missing).                  |
 | `2xx`          | HTTP 200–299.                                                                        |
-| `3xx`          | HTTP 300–399 (redirects — unusual for a webhook).                                    |
+| `3xx`          | HTTP 300–399 (redirects; unusual for a webhook).                                    |
 | `4xx`          | HTTP 400–499 (target says "your request is wrong").                                  |
 | `5xx`          | HTTP 500–599 (target says "I'm broken").                                             |
 
@@ -317,7 +317,7 @@ or after retry exhaustion (if `retry: true`). Possible values:
 | `skip`   | Log a WARN, drop the batch silently, advance. No further action.       |
 | `fail`   | Mirror task errors out; orchestrator restarts; mirror replays the batch from durable state. |
 
-The matrix is intentionally orthogonal — every combination of
+The matrix is intentionally orthogonal; every combination of
 `retry × final` is valid and meaningful:
 
 | `retry` | `final`  | behaviour                                                          | typical use                                |
@@ -343,14 +343,14 @@ outcomes:
 
 Rationale:
 
-- **`timeout` and `connrefused`** are network-level — the target
+- **`timeout` and `connrefused`** are network-level; the target
   may be transiently slow / restarting / being rolled. Retry per
   policy; only exit when the operator's retry budget is exhausted.
 - **`2xx`** is the only success case. `accept`, no retry.
 - **`3xx`** is almost always a misconfiguration: webhook receivers
   shouldn't be redirecting. Fail loud so the operator notices.
 - **`4xx`** indicates the mirror is sending something the target
-  doesn't accept — retrying the same payload won't change that.
+  doesn't accept; retrying the same payload won't change that.
   Fail loud.
 - **`5xx`** is transient server-side trouble; retry per policy, then
   fail if it doesn't clear.
@@ -378,7 +378,7 @@ Rationale:
 - If the operator needs per-status-code overrides in future (e.g.
   `429 → always retry regardless of class default`), a `status` map
   layered ahead of the class buckets is the natural extension. Out
-  of scope for MVP — the six-outcome surface already covers every
+  of scope for MVP; the six-outcome surface already covers every
   current kkv use case.
 - `skip` advances the source-offset position (the batch is
   considered delivered for ordering purposes) but logs at WARN so
@@ -388,7 +388,7 @@ Rationale:
 
 A mirror with `destinations: []` and `notify: { … }` set MUST be
 valid. The use case is "consume from source, emit webhooks, don't
-keep anything durable" — a pure invalidation feed, or a fan-out of
+keep anything durable"; a pure invalidation feed, or a fan-out of
 record-change events into a non-mirror-v3 downstream system.
 
 ### Why webhook is not a destination
@@ -405,14 +405,14 @@ contract that lets mirror-v3 ask a webhook receiver "what's the
 highest source offset you've successfully processed?". Even a
 sophisticated receiver that tracked it internally would have no
 shared protocol for reporting it back to a generic webhook caller.
-The legacy kkv didn't even try — it relied on Kafka consumer-group
+The legacy kkv didn't even try; it relied on Kafka consumer-group
 offsets, which mirror-v3 explicitly does not use.
 
 So `notify` is a *side-effect* of consuming records, not a place
 records are stored. Classifying it as a destination would force
 either a fake `next_expected_offset()` (always 0, or always
 "current") or a separate "destinations don't have to report
-offsets" exception — both of which leak into every sink
+offsets" exception; both of which leak into every sink
 implementation. Keeping it on the mirror as a peer to `destinations`
 keeps the destination trait clean and lets webhook-only mirrors
 exist without distorting the model.
@@ -430,7 +430,7 @@ record from that point forward.
 For kkv-style cache invalidation this is the *correct* behaviour:
 when the mirror restarts, downstream consumers' caches that depend
 on it are themselves either restarting or holding stale data, and a
-full replay re-syncs them. The legacy kkv had the same shape — it
+full replay re-syncs them. The legacy kkv had the same shape; it
 held nothing durable and replayed on every restart.
 
 Operators should be aware that "notify-only on a busy topic"
@@ -450,7 +450,7 @@ When `destinations` is empty:
   ack, so `destination-flush` is meaningless and the validator
   rejects it).
 - `format`, `compression`, `keys`, `values`, `compaction`, `flush`
-  are forbidden — they all parameterise destinations that don't
+  are forbidden; they all parameterise destinations that don't
   exist. (`keys`/`values` may stay as a future opt-in for key/value
   validation on the source; out of scope for MVP.)
 - `http-access` is forbidden. The cache-v1 contract today requires
@@ -459,7 +459,7 @@ When `destinations` is empty:
   broker" mode is conceivable but adds complexity; defer.)
 
 When `destinations` is non-empty AND `notify` is set: no change
-from the rules already specified — both `trigger.on` values are
+from the rules already specified; both `trigger.on` values are
 allowed, and `http-access` works as before.
 
 ### Side note: combining notify with cache-v1 + destinations
@@ -468,7 +468,7 @@ The kkv replacement use case needs all three on the same mirror:
 a durable blob destination (parquet to S3 or filesystem), cache-v1
 for `GET /cache/v1/raw/<key>`, and notify so consumers know when
 to re-read. This proposal keeps that combination as the "full"
-shape and notify-only as the minimal one — the schema validator
+shape and notify-only as the minimal one; the schema validator
 doesn't need to choose between them.
 
 ## Discovery: why DNS-A is enough
@@ -528,7 +528,7 @@ path is:
    buffer asynchronously.
 
 The notify buffer is independent of the destination flush buffer.
-It does NOT depend on `flush.max-time-ms` etc. — consumers want
+It does NOT depend on `flush.max-time-ms` etc.; consumers want
 fresh invalidation; the destinations can buffer for hours if they
 want. Cache freshness on the consumer side is bounded by
 `notify.trigger.debounce.max-time-ms` (default 250 ms).
@@ -598,7 +598,7 @@ latency.
 - One ERROR on retry exhaustion (mirror-task-fatal):
   `notify exhausted mirror=<name> target=<addr> attempts=<n>`.
 
-Per-record DEBUG only — counters cover the operational signal.
+Per-record DEBUG only; counters cover the operational signal.
 
 ## Validation
 
@@ -631,9 +631,9 @@ Per-record DEBUG only — counters cover the operational signal.
 - **Selective subscription.** Subscribe to a key prefix or a header.
 - **Push-only mode for kkv-style consumers.** Notify *with* zero
   destinations (covered in "Notify-only mirrors") is in scope.
-  Notify without cache-v1 *but with destinations* — i.e. the
+  Notify without cache-v1 *but with destinations*; i.e. the
   consumer is expected to re-read from the durable destination
-  rather than from cache-v1 — is deferred. Requires a slightly
+  rather than from cache-v1; is deferred. Requires a slightly
   different body shape (record-data inline rather than
   null-valued `updates`) and is unrelated to the kkv replacement
   use case driving this proposal.

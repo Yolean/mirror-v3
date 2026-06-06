@@ -1,8 +1,8 @@
 //! Pin every (retry × final-action) combination across the six
 //! outcome buckets from `WEBHOOKS.md § Outcomes and retry policy`.
-//! The matrix is intentionally orthogonal — the user-facing knob is
+//! The matrix is intentionally orthogonal; the user-facing knob is
 //! "any of `accept | skip | fail` for any outcome, with or without
-//! retry first" — so each cell needs a test.
+//! retry first"; so each cell needs a test.
 
 mod common;
 
@@ -95,7 +95,7 @@ async fn outcome_4xx_default_fails_immediately() {
 #[tokio::test]
 async fn outcome_4xx_with_skip_drops_batch_silently() {
     // "Targets routinely 404 during rolling restart, don't crash on
-    // that" — the spec-named knob.
+    // that"; the spec-named knob.
     let outcomes = outcomes_overriding(
         TargetBucket::FourXx,
         NotifyOutcome {
@@ -176,7 +176,7 @@ async fn outcome_5xx_recovers_when_server_starts_returning_2xx() {
 
 #[tokio::test]
 async fn outcome_5xx_with_skip_drops_batch_after_exhaustion() {
-    // "Receiver is flaky, never fail the mirror on it" — pure
+    // "Receiver is flaky, never fail the mirror on it"; pure
     // best-effort notify.
     let outcomes = outcomes_overriding(
         TargetBucket::FiveXx,
@@ -234,7 +234,7 @@ async fn outcome_timeout_default_retries_then_fails() {
 #[tokio::test]
 async fn outcome_timeout_with_no_retry_fails_after_first_attempt() {
     // "Fail fast on slow receivers instead of waiting through retry"
-    // — the spec-named knob.
+    //; the spec-named knob.
     let outcomes = outcomes_overriding(
         TargetBucket::Timeout,
         NotifyOutcome {

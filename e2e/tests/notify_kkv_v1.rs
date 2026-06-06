@@ -225,7 +225,7 @@ async fn destination_flush_dispatches_one_post_per_flush_with_empty_updates() {
         .await
         .expect("produce");
 
-    // Two flushes expected — wait for both POSTs to land.
+    // Two flushes expected; wait for both POSTs to land.
     let captured = receiver.wait_for(2, Duration::from_secs(20)).await;
     assert_eq!(
         captured.len(),

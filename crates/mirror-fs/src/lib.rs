@@ -61,7 +61,7 @@ pub struct FilesystemSinkConfig {
     /// Optional shared HTTP-cache state. When `Some`, every record
     /// the sink receives is applied to the cache view from the
     /// consume loop (per-record, decoupled from flush cadence). The
-    /// mirror is also bootstrapped against this state at `open()` —
+    /// mirror is also bootstrapped against this state at `open()` -
     /// in compaction:log mode, the latest snapshot's keys are
     /// pre-loaded; in append mode, the entire on-disk chain is
     /// replayed (linear in total record count).
@@ -73,7 +73,7 @@ pub struct FilesystemSinkConfig {
 /// set on a `FilesystemSinkConfig`, the sink uses it on `open` to
 /// replay the durable destination state into the shared cache so
 /// HTTP readers see what's already on disk. The per-record `write()`
-/// path no longer touches the cache — that's the tee level's job
+/// path no longer touches the cache; that's the tee level's job
 /// ([`mirror_core::TeeSink`]) so a single record never gets applied
 /// twice when the same mirror feeds multiple destinations.
 pub use mirror_core::CacheBinding;
@@ -120,7 +120,7 @@ pub struct FilesystemSink {
     buffer_started: Option<Instant>,
     last_flush_at: Option<Instant>,
     /// Compaction-mode in-memory materialized view, sorted by key.
-    /// `None` when `compaction` is `None` — even with cache enabled,
+    /// `None` when `compaction` is `None`; even with cache enabled,
     /// the cache state is held in `CacheBinding`, not here.
     view: Option<BTreeMap<String, Record>>,
     /// Absolute unix-seconds for the next daily-flush boundary, or
@@ -178,13 +178,13 @@ impl FilesystemSink {
                 }
             }
         }
-        // NOTE: naive — computes the next future occurrence and
+        // NOTE: naive; computes the next future occurrence and
         // accepts that a mirror down at the boundary silently misses
         // it for that day. The richer version (planned alongside
         // debounce) inspects the destination chain (mtime / last
         // record timestamp) and uses last_flush_at to decide whether
         // the boundary was already honored. The shape of this
-        // computation — `(target_secs, now) -> next_unix` — does not
+        // computation; `(target_secs, now) -> next_unix`; does not
         // change.
         let next_daily_unix = cfg
             .flush
@@ -222,7 +222,7 @@ impl FilesystemSink {
         if now < next {
             return Ok(());
         }
-        // Boundary crossed. Flush only if there's data — an empty-
+        // Boundary crossed. Flush only if there's data; an empty-
         // buffer slot is silently skipped (no zero-record file). The
         // boundary is *always* advanced so we don't fire repeatedly
         // until tomorrow.
@@ -446,7 +446,7 @@ impl Sink for FilesystemSink {
         }
         // Append mode also rejects forward gaps (the destination
         // chain forbids holes). Under compaction:log forward gaps
-        // are legitimate — the upstream may have compacted the
+        // are legitimate; the upstream may have compacted the
         // intermediate offsets out and the snapshot only stores
         // latest-per-key.
         if !matches!(self.compaction, Some(CompactionMode::Log)) && record.source_offset != expected
@@ -482,7 +482,7 @@ impl Sink for FilesystemSink {
             }
         }
         // Apply to the local compaction view per-record (was per-flush
-        // before — moved here so view content tracks the consume loop
+        // before; moved here so view content tracks the consume loop
         // exactly, independent of the flush cadence).
         if let Some(view) = self.view.as_mut() {
             let key_bytes = record.key.as_ref().expect("checked non-null above");
@@ -564,7 +564,7 @@ pub fn schedule_next_daily_public(target_secs: u32, now_unix: u64) -> u64 {
 
 /// First future unix-seconds at which the daily wall-clock-UTC
 /// boundary should fire, given a target seconds-since-midnight and
-/// the current unix-seconds. Pure math, no I/O — kept as a free
+/// the current unix-seconds. Pure math, no I/O; kept as a free
 /// function so the smart-startup variant (which inspects the
 /// destination chain) can replace just this body.
 pub(crate) fn schedule_next_daily(target_secs: u32, now_unix: u64) -> u64 {
@@ -616,7 +616,7 @@ fn scan_validate(dir: &Path, format: Format) -> Result<u64, FsError> {
         if name.contains(".tmp.") {
             continue;
         }
-        // Files of the wrong extension are an error — mixed-format
+        // Files of the wrong extension are an error; mixed-format
         // dirs are forbidden.
         if let Some(other_ext) = file_extension(&name) {
             if other_ext != expected_ext && naming::parse_filename(&name, other_ext).is_some() {
@@ -722,7 +722,7 @@ fn scan_validate_compacted(dir: &Path, format: Format) -> Result<(u64, Option<Pa
 }
 
 /// Decode a snapshot file into the in-memory materialized view. Keys
-/// are required to be valid UTF-8 (we wrote them as Utf8 — a non-UTF-8
+/// are required to be valid UTF-8 (we wrote them as Utf8; a non-UTF-8
 /// key here would be data corruption).
 fn load_view(path: &Path, format: Format) -> Result<BTreeMap<String, Record>, FsError> {
     let bytes = std::fs::read(path).map_err(|e| FsError::Io {
