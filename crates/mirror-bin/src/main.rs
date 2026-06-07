@@ -5,6 +5,12 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use mirror_config::{Destination, HttpAccess, Mirror};
+
+mod ack_tracker;
+use ack_tracker::{
+    commit_interval_from_env, spawn_periodic_commit_task, AckTracker, DestAckSlot, FlushAckShim,
+    WriteAckShim,
+};
 use mirror_core::{
     heartbeat_interval_from_env, run_mirror_with_notifier, MetricLabels, NoOpNotifier, Record,
     Sink, SinkError, MIRROR_LABELS,
@@ -683,6 +689,10 @@ async fn spawn_mirror(
     );
     let source = KafkaSource::open(source_cfg)
         .with_context(|| format!("opening source for mirror {}", mirror.name))?;
+    // Snapshot the commit handle before the run loop takes ownership
+    // of the source; the periodic commit task drives commits via
+    // the handle (which clones an `Arc<StreamConsumer>` internally).
+    let commit_handle = source.commit_handle();
 
     let name = mirror.name.clone();
     let labels = MetricLabels {
@@ -705,12 +715,45 @@ async fn spawn_mirror(
         mirror.destinations.len().max(1),
     );
     let mut dest_descriptions: Vec<String> = Vec::with_capacity(mirror.destinations.len());
+    // Per-destination ack slots, shared by Arc with the shims
+    // installed on each inner sink and with the AckTracker that the
+    // periodic commit task reads. `affects_readiness = true` for now
+    // — the per-destination YAML field that overrides this lands in
+    // a later commit.
+    let mut dest_ack_slots: Vec<Arc<DestAckSlot>> = Vec::with_capacity(mirror.destinations.len());
     for dest in &mirror.destinations {
         let inner_name = dest.effective_name(&mirror.name);
         let kind = destination_type(dest);
         dest_descriptions.push(format!("{inner_name}({kind})"));
-        let sink: Box<dyn Sink> =
+        let mut sink: Box<dyn Sink> =
             open_inner_sink(dest, &mirror, &inner_name, cache.as_ref()).await?;
+        let slot = Arc::new(DestAckSlot::new(inner_name.clone(), true));
+        // Pick the right observer hook per destination type. Blob
+        // sinks fire `FlushObserver` per buffered flush; Kafka sinks
+        // commit per-record and fire `WriteObserver`. The shim feeds
+        // the destination ack slot in either case.
+        //
+        // Note: when destination-flush trigger is enabled (only on
+        // mirrors with at least one blob destination), the tee-level
+        // `set_flush_observer` call further down replaces the per-
+        // sink FlushObserver installed here with a tee-coordinated
+        // version. That's intentional: in destination-flush mode the
+        // notify ack is authoritative for source-side commits, so
+        // losing the per-destination ack signal for blob sinks is
+        // acceptable.
+        match dest {
+            Destination::Kafka(_) => {
+                sink.set_write_observer(Arc::new(WriteAckShim {
+                    dest: Arc::clone(&slot),
+                }));
+            }
+            Destination::Filesystem(_) | Destination::S3(_) => {
+                sink.set_flush_observer(Arc::new(FlushAckShim {
+                    dest: Arc::clone(&slot),
+                }));
+            }
+        }
+        dest_ack_slots.push(slot);
         inners.push((inner_name, sink));
     }
     if inners.is_empty() {
@@ -730,6 +773,12 @@ async fn spawn_mirror(
         .await
         .map_err(|e| anyhow::anyhow!("opening tee for mirror {name}: {e}"))?;
 
+    // Build the per-mirror ack tracker. Notify-side slot exists iff
+    // the mirror has a `notify:` block; destinations always
+    // contribute (commit 9 wires `affects-readiness` to filter).
+    let notify_present = mirror.notify.is_some();
+    let ack_tracker = Arc::new(AckTracker::new(notify_present, dest_ack_slots));
+
     // Branch on the notify trigger mode (validated upstream in
     // mirror-config; see WEBHOOKS.md § Trigger):
     //   * source-consume → build `KkvV1Notifier`, pass as the run
@@ -737,10 +786,17 @@ async fn spawn_mirror(
     //   * destination-flush → build `FlushDispatcher`, attach as the
     //     TeeSink's `FlushObserver`; the run loop's notifier is
     //     `NoOpNotifier` (records flow through unobserved).
+    //
+    // In both modes the notifier's `with_ack_sink` installs the
+    // per-mirror `AckTracker` so each successful drain/POST feeds
+    // the periodic commit task's view of "delivered through N".
     let trigger_mode = mirror.notify.as_ref().map(|n| n.trigger.on);
+    let ack_sink_for_notifier: Arc<dyn mirror_core::AckSink> =
+        Arc::clone(&ack_tracker) as Arc<dyn mirror_core::AckSink>;
     let notifier_opt = match trigger_mode {
         Some(mirror_config::TriggerOn::SourceConsume) => {
             build_source_consume_notifier(&mirror, cache.as_ref())?
+                .map(|n| n.with_ack_sink(Arc::clone(&ack_sink_for_notifier)))
         }
         _ => None,
     };
@@ -748,9 +804,24 @@ async fn spawn_mirror(
         trigger_mode,
         Some(mirror_config::TriggerOn::DestinationFlush)
     ) {
-        let dispatcher = build_flush_dispatcher(&mirror, cache.as_ref())?;
+        let dispatcher = build_flush_dispatcher(&mirror, cache.as_ref())?
+            .with_ack_sink(Arc::clone(&ack_sink_for_notifier));
         tee.set_flush_observer(std::sync::Arc::new(dispatcher));
     }
+
+    // Spawn the periodic source-commit task. It reads
+    // `AckTracker::commit_offset()` every
+    // `MIRROR_V3_OFFSET_COMMIT_INTERVAL_MS` (default 5 s), stages
+    // it via the Kafka commit handle, and flushes to the broker.
+    // The handle clones an `Arc<StreamConsumer>` internally so this
+    // task runs independently of the source-owning run loop.
+    let _commit_task = spawn_periodic_commit_task(
+        commit_handle,
+        Arc::clone(&ack_tracker),
+        commit_interval_from_env(),
+        name.clone(),
+        shutdown_rx.clone(),
+    );
 
     let destinations_log = dest_descriptions.join(",");
     let notify_log = match &mirror.notify {
