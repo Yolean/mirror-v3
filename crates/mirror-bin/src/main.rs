@@ -509,27 +509,27 @@ async fn run(path: PathBuf) -> Result<()> {
         }
     }
 
-    // Build a shared CacheState if any *enabled* mirror needs a
-    // readiness slot - either to host the per-mirror /cache/v1
-    // surface (`http_access`) or to gate the kkv-v1 notifier's
-    // bootstrap-hwm suppression (`notify`). Capture each registered
-    // mirror's source-partition high-watermark *now* so the gate
-    // flips only after we've consumed past whatever was already
-    // there at startup (KKV semantics: dependents must not see a
-    // partially-rebuilt cache, and webhook subscribers must not see
-    // historical-replay invalidations). Disabled mirrors never
-    // register: otherwise their slot would never flip ready and
-    // the aggregate /q/health/ready would sit at 503 forever.
-    let needs_slot = |m: &Mirror| m.http_access.is_some() || m.notify.is_some();
-    let cache_state = if enabled_mirrors.iter().copied().any(needs_slot) {
+    // Every *enabled* mirror gets a `CacheState` slot, regardless of
+    // whether it has `http_access` or `notify`. The slot is what the
+    // structured `/q/health/ready` body enumerates; downstream
+    // features (HTTP routes, notify suppression gate, source-commit
+    // task) only attach when the mirror opts into them. Disabled
+    // mirrors never register: otherwise their slot would never flip
+    // ready and the aggregate /q/health/ready would sit at 503
+    // forever. Capture each registered mirror's source-partition
+    // high-watermark *now* so the gate flips only after we've
+    // consumed past whatever was already there at startup (KKV
+    // semantics: dependents must not see a partially-rebuilt cache,
+    // and webhook subscribers must not see historical-replay
+    // invalidations).
+    let cache_state = if enabled_mirrors.is_empty() {
+        None
+    } else {
         let tolerance = readiness_lag_tolerance_from_env();
         let state = std::sync::Arc::new(
             mirror_core::CacheState::new().with_readiness_lag_tolerance(tolerance),
         );
         for m in &enabled_mirrors {
-            if !needs_slot(m) {
-                continue;
-            }
             let hwm = fetch_hwm_for_mirror(m).await?;
             let last_committed = fetch_committed_offset_for_mirror(m).await?;
             let is_main = m
@@ -556,8 +556,6 @@ async fn run(path: PathBuf) -> Result<()> {
             );
         }
         Some(state)
-    } else {
-        None
     };
 
     // Spawn the cache HTTP server if any mirror opted into a route
@@ -617,24 +615,22 @@ fn cache_listen_addr() -> std::net::SocketAddr {
     std::net::SocketAddr::from(([0, 0, 0, 0], port))
 }
 
-/// Materialise a `CacheBinding` for the given mirror if it has a
-/// registered slot in the shared CacheState. Slots are registered
-/// for any mirror that opts into `http_access` (for the HTTP read
-/// surface) or `notify` (for the bootstrap-hwm suppression gate);
-/// the binding wires the consume loop's TeeSink to that slot so
-/// `apply_record` flips the slot's `caught_up` at the right offset.
+/// Materialise a `CacheBinding` for the given mirror. Every enabled
+/// mirror now registers a slot in the shared CacheState (the
+/// supervisor enumerates them in the structured `/q/health/ready`
+/// body), so the binding is materialised whenever a `CacheState`
+/// exists at all. The binding wires the consume loop's TeeSink to
+/// that slot so `apply_record` advances the slot's
+/// `last_applied_offset` and flips the readiness gate at the right
+/// point.
 fn mirror_cache_binding(
     mirror: &Mirror,
     cache: Option<&std::sync::Arc<mirror_core::CacheState>>,
 ) -> Option<mirror_core::CacheBinding> {
-    let needs_slot = mirror.http_access.is_some() || mirror.notify.is_some();
-    match (needs_slot, cache) {
-        (true, Some(state)) => Some(mirror_core::CacheBinding {
-            state: std::sync::Arc::clone(state),
-            mirror_name: mirror.name.clone(),
-        }),
-        _ => None,
-    }
+    cache.map(|state| mirror_core::CacheBinding {
+        state: std::sync::Arc::clone(state),
+        mirror_name: mirror.name.clone(),
+    })
 }
 
 /// Per-mirror bootstrap watermark. Run in a `spawn_blocking` task
