@@ -97,6 +97,21 @@ pub enum MirrorStatus {
     DestinationLagging { name: String, lag: u64 },
 }
 
+/// One mirror's row in a [`CacheState::status_snapshot`] result.
+/// Serialised verbatim into the structured `/q/health/ready` body
+/// and into the per-mirror cache 503 body, so a downstream consumer
+/// can parse a single shape across both endpoints.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MirrorStatusSnapshot {
+    pub name: String,
+    pub topic: String,
+    pub partition: u32,
+    pub source_assigned: bool,
+    pub last_applied_offset: u64,
+    pub broker_end_offset: u64,
+    pub status: MirrorStatus,
+}
+
 #[derive(Debug)]
 struct MirrorSlot {
     bootstrap_hwm: u64,
@@ -504,12 +519,36 @@ impl CacheState {
 
     /// Snapshot the current status for a registered mirror. Returns
     /// `None` if the name is unknown. Used by the structured
-    /// `/q/health/ready` body (commit 10) and by tests.
+    /// `/q/health/ready` body and by tests.
     pub fn status_for(&self, mirror_name: &str) -> Option<MirrorStatus> {
         let mirrors = self.mirrors.read().expect("cache mirrors poisoned");
         mirrors
             .get(mirror_name)
             .map(|slot| slot.status.read().expect("status poisoned").clone())
+    }
+
+    /// Snapshot every registered mirror's per-mirror readiness state
+    /// in a single pass. Used by the structured `/q/health/ready`
+    /// HTTP handler and by the per-mirror cache 503 body, both of
+    /// which want a consistent view across mirrors without taking
+    /// the slot lock multiple times.
+    ///
+    /// Entries are emitted in arbitrary order; the caller sorts when
+    /// stable ordering matters (the readiness handler does).
+    pub fn status_snapshot(&self) -> Vec<MirrorStatusSnapshot> {
+        let mirrors = self.mirrors.read().expect("cache mirrors poisoned");
+        mirrors
+            .iter()
+            .map(|(name, slot)| MirrorStatusSnapshot {
+                name: name.clone(),
+                topic: slot.topic.clone(),
+                partition: slot.partition,
+                source_assigned: slot.source_assigned.load(Ordering::Acquire),
+                last_applied_offset: slot.last_applied_offset.load(Ordering::Acquire),
+                broker_end_offset: slot.broker_end_offset.load(Ordering::Acquire),
+                status: slot.status.read().expect("status poisoned").clone(),
+            })
+            .collect()
     }
 
     /// Name of the mirror that opted into `cache-v1-main`, or

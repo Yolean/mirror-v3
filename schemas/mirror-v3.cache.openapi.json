@@ -89,7 +89,14 @@
             "description": "Mirror unknown"
           },
           "503": {
-            "description": "Mirror is not yet caught up to its source"
+            "description": "Mirror is not currently Ready; body is a MirrorReadiness object",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MirrorReadiness"
+                }
+              }
+            }
           }
         }
       }
@@ -202,7 +209,14 @@
             "description": "Mirror unknown, or key not in cache"
           },
           "503": {
-            "description": "Mirror is not yet caught up to its source"
+            "description": "Mirror is not currently Ready; body is a MirrorReadiness object",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MirrorReadiness"
+                }
+              }
+            }
           }
         }
       }
@@ -245,7 +259,14 @@
             "description": "Mirror unknown"
           },
           "503": {
-            "description": "Mirror is not yet caught up to its source"
+            "description": "Mirror is not currently Ready; body is a MirrorReadiness object",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MirrorReadiness"
+                }
+              }
+            }
           }
         }
       }
@@ -253,6 +274,132 @@
   },
   "components": {
     "schemas": {
+      "AggregateReadiness": {
+        "type": "string",
+        "description": "Aggregate readiness state for the process. The discriminator\nstring lets a grep-friendly consumer distinguish \"warming up but\nexpected to clear shortly\" (a cold start) from \"something is\nwrong\" (a mirror went degraded after first reaching Ready).",
+        "enum": [
+          "ready",
+          "warming",
+          "degraded"
+        ]
+      },
+      "MirrorReadiness": {
+        "type": "object",
+        "description": "One mirror's slice of the readiness response. Returned both as\nan element of [`ReadinessReport::mirrors`] and as the standalone\nbody of the per-mirror `/cache/v1/{mirror}/...` 503 response so a\nclient library can surface the reason without a second request.",
+        "required": [
+          "name",
+          "status",
+          "source"
+        ],
+        "properties": {
+          "destination": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/MirrorReadinessDestination",
+                "description": "Status-specific detail: the lagging destination's name + lag\n(when `status == \"destination_lagging\"`), or the source lag\n(when `status == \"lag_behind_source\"`). `None` otherwise."
+              }
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "source": {
+            "$ref": "#/components/schemas/MirrorReadinessSource",
+            "description": "Source-side detail: topic, partition, assignment, offsets."
+          },
+          "status": {
+            "type": "string",
+            "description": "String discriminator for the status, easy to grep:\n`ready` | `warming` | `lag_behind_source` | `source_unassigned`\n| `destination_lagging`."
+          }
+        }
+      },
+      "MirrorReadinessDestination": {
+        "type": "object",
+        "required": [
+          "name",
+          "lag"
+        ],
+        "properties": {
+          "lag": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "name": {
+            "type": "string"
+          }
+        }
+      },
+      "MirrorReadinessSource": {
+        "type": "object",
+        "required": [
+          "topic",
+          "partition",
+          "assigned",
+          "end_offset",
+          "last_applied_offset",
+          "lag"
+        ],
+        "properties": {
+          "assigned": {
+            "type": "boolean"
+          },
+          "end_offset": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "lag": {
+            "type": "integer",
+            "format": "int64",
+            "description": "`end_offset - last_applied_offset`, saturating at 0 so a\nlate-arriving high-watermark fetch can't underflow.",
+            "minimum": 0
+          },
+          "last_applied_offset": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "partition": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "topic": {
+            "type": "string"
+          }
+        }
+      },
+      "ReadinessReport": {
+        "type": "object",
+        "description": "Full body of the readiness endpoint. Always serialised; the\nHTTP status code (200 vs 503) is determined by `ready`.",
+        "required": [
+          "ready",
+          "mirrors",
+          "unhealthy"
+        ],
+        "properties": {
+          "mirrors": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/MirrorReadiness"
+            }
+          },
+          "ready": {
+            "$ref": "#/components/schemas/AggregateReadiness"
+          },
+          "unhealthy": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Grep-friendly list of mirror names whose status is not\n`ready`. Empty when `ready == \"ready\"`."
+          }
+        }
+      },
       "TopicPartitionOffsetJson": {
         "type": "object",
         "description": "`{topic, partition, offset}` shape serialized into the\n`x-kkv-last-seen-offsets` header. Mirrors KKV's\n`TopicPartitionOffset`, including JSON property order.",

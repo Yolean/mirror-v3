@@ -5,8 +5,9 @@
 //! - `/cache/v1/{mirror}/...` is always mounted; one entry per
 //!   `http-access.cache-v1` opt-in mirror. Each path dispatches to
 //!   that mirror's own per-mirror view and gates on its per-mirror
-//!   `caught_up` flag (503 until the slot crosses
-//!   `bootstrap_hwm - 1`).
+//!   [`MirrorStatus`]: 503 (with a [`MirrorReadiness`] JSON body
+//!   naming the unhealthy state) whenever the mirror is not
+//!   `Ready`.
 //! - `/cache/v1/...` (unprefixed) is mounted iff some mirror opted
 //!   into `http-access.cache-v1-main`; the validator enforces
 //!   at-most-one and `[`CacheState::main_mirror`] tracks which one.
@@ -17,21 +18,22 @@
 //! The server also exposes:
 //!
 //! - `GET /q/health/ready`: drop-in compat alias for the legacy
-//!   Quarkus kkv health endpoint. Returns `200 OK` with an empty
-//!   body once `CacheState::is_ready()`, `503 Service Unavailable`
-//!   otherwise. Kept off the OpenAPI spec because it's purely a
-//!   compat shim for the existing `@yolean/kafka-keyvalue` Node
-//!   client, whose `onReady()` polls
-//!   `KKV_CACHE_HOST_READINESS_ENDPOINT` (default `/q/health/ready`).
+//!   Quarkus kkv health endpoint. Returns `200 OK` when every
+//!   registered mirror is `Ready`, `503 Service Unavailable`
+//!   otherwise. Body is a [`ReadinessReport`] in both cases — the
+//!   `@yolean/kafka-keyvalue` Node client inspects only the status
+//!   code, so the JSON body is transparent to it but greppable by
+//!   on-call.
 //! - `POST /_admin/v1/shutdown` and `POST /_admin/v1/shutdown/{exitcode}`: operator hooks.
 //! - `GET /openapi.json` and `GET /openapi.yaml`: auto-generated OpenAPI 3.1 spec.
 //! - `GET /docs`: Scalar UI rendering the spec.
 //!
 //! Readiness: every `/cache/v1` route gates on its target mirror's
-//! per-mirror `caught_up` flag and returns 503 until the flag flips.
-//! The aggregate `is_ready()` (every registered mirror caught up)
-//! backs `/q/health/ready`. Both flags are sticky-true today; the
-//! mirror-degraded re-suppression case is tracked as a follow-up.
+//! [`MirrorStatus`]. The aggregate `is_ready()` (every registered
+//! mirror in `Ready`) backs `/q/health/ready`. Status is non-sticky:
+//! a mirror that drops out of `Ready` (lag, source assignment loss,
+//! gating destination falls behind) flips both the per-mirror cache
+//! routes and the aggregate health endpoint back to 503.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -40,9 +42,10 @@ use axum::{
     extract::{Path, State},
     http::{HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
+    Json,
 };
 use mirror_core::cache::TopicPartitionOffset;
-use mirror_core::CacheState;
+use mirror_core::{CacheState, MirrorStatus, MirrorStatusSnapshot};
 use serde::Serialize;
 use tokio::sync::oneshot;
 use utoipa::OpenApi;
@@ -73,6 +76,156 @@ impl From<&TopicPartitionOffset> for TopicPartitionOffsetJson {
             topic: tpo.topic.clone(),
         }
     }
+}
+
+/// Aggregate readiness state for the process. The discriminator
+/// string lets a grep-friendly consumer distinguish "warming up but
+/// expected to clear shortly" (a cold start) from "something is
+/// wrong" (a mirror went degraded after first reaching Ready).
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, utoipa::ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum AggregateReadiness {
+    /// Every registered mirror is `Ready`. HTTP status 200.
+    Ready,
+    /// At least one mirror is `Warming` and no mirror is in any
+    /// non-warming non-ready state. HTTP status 503.
+    Warming,
+    /// At least one mirror is in a non-warming non-ready state
+    /// (lag, source unassigned, destination lagging). HTTP status 503.
+    Degraded,
+}
+
+/// One mirror's slice of the readiness response. Returned both as
+/// an element of [`ReadinessReport::mirrors`] and as the standalone
+/// body of the per-mirror `/cache/v1/{mirror}/...` 503 response so a
+/// client library can surface the reason without a second request.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, utoipa::ToSchema)]
+pub struct MirrorReadiness {
+    pub name: String,
+    /// String discriminator for the status, easy to grep:
+    /// `ready` | `warming` | `lag_behind_source` | `source_unassigned`
+    /// | `destination_lagging`.
+    pub status: &'static str,
+    /// Source-side detail: topic, partition, assignment, offsets.
+    pub source: MirrorReadinessSource,
+    /// Status-specific detail: the lagging destination's name + lag
+    /// (when `status == "destination_lagging"`), or the source lag
+    /// (when `status == "lag_behind_source"`). `None` otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub destination: Option<MirrorReadinessDestination>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, utoipa::ToSchema)]
+pub struct MirrorReadinessSource {
+    pub topic: String,
+    pub partition: u32,
+    pub assigned: bool,
+    pub end_offset: u64,
+    pub last_applied_offset: u64,
+    /// `end_offset - last_applied_offset`, saturating at 0 so a
+    /// late-arriving high-watermark fetch can't underflow.
+    pub lag: u64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, utoipa::ToSchema)]
+pub struct MirrorReadinessDestination {
+    pub name: String,
+    pub lag: u64,
+}
+
+/// Full body of the readiness endpoint. Always serialised; the
+/// HTTP status code (200 vs 503) is determined by `ready`.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, utoipa::ToSchema)]
+pub struct ReadinessReport {
+    pub ready: AggregateReadiness,
+    pub mirrors: Vec<MirrorReadiness>,
+    /// Grep-friendly list of mirror names whose status is not
+    /// `ready`. Empty when `ready == "ready"`.
+    pub unhealthy: Vec<String>,
+}
+
+impl MirrorReadiness {
+    fn from_snapshot(snap: MirrorStatusSnapshot) -> Self {
+        let (status, destination) = match &snap.status {
+            MirrorStatus::Ready => ("ready", None),
+            MirrorStatus::Warming => ("warming", None),
+            MirrorStatus::LagBehindSource { .. } => ("lag_behind_source", None),
+            MirrorStatus::SourceUnassigned { .. } => ("source_unassigned", None),
+            MirrorStatus::DestinationLagging { name, lag } => (
+                "destination_lagging",
+                Some(MirrorReadinessDestination {
+                    name: name.clone(),
+                    lag: *lag,
+                }),
+            ),
+        };
+        let lag = snap
+            .broker_end_offset
+            .saturating_sub(snap.last_applied_offset);
+        Self {
+            name: snap.name,
+            status,
+            source: MirrorReadinessSource {
+                topic: snap.topic,
+                partition: snap.partition,
+                assigned: snap.source_assigned,
+                end_offset: snap.broker_end_offset,
+                last_applied_offset: snap.last_applied_offset,
+                lag,
+            },
+            destination,
+        }
+    }
+}
+
+/// Build the structured readiness report from a `CacheState`
+/// snapshot. The report and the HTTP status code (200 iff every
+/// mirror is `Ready`) are computed together so they cannot drift.
+pub fn build_readiness_report(cache: &CacheState) -> (StatusCode, ReadinessReport) {
+    let mut snaps = cache.status_snapshot();
+    snaps.sort_by(|a, b| a.name.cmp(&b.name));
+    let mut mirrors = Vec::with_capacity(snaps.len());
+    let mut unhealthy = Vec::new();
+    let mut all_ready = !snaps.is_empty();
+    let mut any_warming = false;
+    let mut any_degraded = false;
+    for snap in snaps {
+        let entry = MirrorReadiness::from_snapshot(snap);
+        if entry.status != "ready" {
+            all_ready = false;
+            unhealthy.push(entry.name.clone());
+            if entry.status == "warming" {
+                any_warming = true;
+            } else {
+                any_degraded = true;
+            }
+        }
+        mirrors.push(entry);
+    }
+    let ready = if all_ready {
+        AggregateReadiness::Ready
+    } else if any_degraded {
+        AggregateReadiness::Degraded
+    } else if any_warming {
+        AggregateReadiness::Warming
+    } else {
+        // No registered mirrors: treat as warming, since the
+        // process is up but has nothing to be ready for yet.
+        AggregateReadiness::Warming
+    };
+    let code = if matches!(ready, AggregateReadiness::Ready) {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (
+        code,
+        ReadinessReport {
+            ready,
+            mirrors,
+            unhealthy,
+        },
+    )
 }
 
 /// Server-side state shared across handlers.
@@ -155,30 +308,23 @@ pub fn build_router(cache: Arc<CacheState>, shutdown_tx: oneshot::Sender<i32>) -
             }),
         )
         // Drop-in for the Yolean/kafka-keyvalue Quarkus binary's
-        // `/q/health/ready` SmallRye-Health endpoint. The default
-        // value of `KKV_CACHE_HOST_READINESS_ENDPOINT` in the
-        // `@yolean/kafka-keyvalue` Node client is `/q/health/ready`;
-        // that client's `onReady()` polls it every 3 s and gates
-        // downstream consumer-pod readiness on a `200`. Returning
-        // the same `200`/`503` shape here makes mirror-v3 a true
-        // drop-in: existing consumers work unmodified, no
-        // `KKV_CACHE_HOST_READINESS_ENDPOINT` override needed.
+        // `/q/health/ready` SmallRye-Health endpoint. The Node
+        // `@yolean/kafka-keyvalue` client's `onReady()` only inspects
+        // the HTTP status code, so a structured JSON body is
+        // transparent to it. The body names the unhealthy mirror(s)
+        // for on-call grep: see [`ReadinessReport`].
         //
-        // Kept off the OpenAPI spec; it's purely a compat shim for
-        // an existing client, not a public surface mirror-v3 wants
-        // to commit to. The Quarkus `/q/...` path namespace is
-        // unlikely to collide with anything else mirror-v3 might
-        // want to add.
+        // Kept off the OpenAPI spec because the route is a compat
+        // shim; the JSON shape is described by the
+        // `ReadinessReport` `ToSchema` impl exposed in the spec via
+        // its component reference under `/openapi.json`.
         .route(
             "/q/health/ready",
             axum::routing::get(move || {
                 let cache = Arc::clone(&cache_for_ready);
                 async move {
-                    if cache.is_ready() {
-                        StatusCode::OK.into_response()
-                    } else {
-                        StatusCode::SERVICE_UNAVAILABLE.into_response()
-                    }
+                    let (code, body) = build_readiness_report(&cache);
+                    (code, Json(body)).into_response()
                 }
             }),
         );
@@ -317,7 +463,14 @@ pub enum ServeError {
                        startup high-watermark.",
         version = "1.0.0",
     ),
-    components(schemas(TopicPartitionOffsetJson)),
+    components(schemas(
+        TopicPartitionOffsetJson,
+        AggregateReadiness,
+        MirrorReadiness,
+        MirrorReadinessSource,
+        MirrorReadinessDestination,
+        ReadinessReport,
+    )),
     tags(
         (name = "cache", description = "Read-only cache API (KKV-compatible)"),
         (name = "admin", description = "Operator endpoints"),
@@ -326,27 +479,35 @@ pub enum ServeError {
 struct ApiDoc;
 
 /// Decide which mirror a `/cache/v1/{mirror}/...` request hits and
-/// gate on its per-mirror readiness flag. Returns `Ok(mirror_name)`
-/// for the handler to use against the per-mirror getters, or an
-/// already-built response for the failure cases:
+/// gate on its per-mirror readiness state. Returns `Ok(())` for the
+/// handler to proceed, or an already-built response for the failure
+/// cases:
 ///
-/// - 404 if the named mirror is not registered (and so isn't an
-///   opt-in `cache-v1` mirror in this process);
-/// - 503 if the mirror is registered but has not yet crossed its
-///   bootstrap high-watermark.
+/// - 404 if the named mirror is not registered;
+/// - 503 with the matching [`MirrorReadiness`] JSON body if the
+///   mirror is registered but is not currently [`MirrorStatus::Ready`].
+///   Same shape as the corresponding element in
+///   `/q/health/ready`'s `mirrors` array, so a client library can
+///   surface the reason without a second request.
 ///
 /// Allowed locally: the `Err` payload IS the response; boxing it
 /// would force every readiness-gated handler to deref before
 /// returning, with zero observable benefit.
 #[allow(clippy::result_large_err)]
 fn resolve_mirror(state: &AppState, mirror: &str) -> Result<(), Response> {
-    if state.cache.snapshot_keys_for(mirror).is_none() {
+    let Some(snap) = state
+        .cache
+        .status_snapshot()
+        .into_iter()
+        .find(|s| s.name == mirror)
+    else {
         return Err(StatusCode::NOT_FOUND.into_response());
+    };
+    if matches!(snap.status, MirrorStatus::Ready) {
+        return Ok(());
     }
-    if !state.cache.is_mirror_ready(mirror) {
-        return Err(StatusCode::SERVICE_UNAVAILABLE.into_response());
-    }
-    Ok(())
+    let body = MirrorReadiness::from_snapshot(snap);
+    Err((StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response())
 }
 
 fn offsets_header_for(state: &AppState, mirror: &str) -> HeaderMap {
@@ -381,7 +542,7 @@ fn offsets_header_for(state: &AppState, mirror: &str) -> HeaderMap {
         (status = 200, description = "Value bytes for the requested key", body = Vec<u8>, content_type = "application/octet-stream"),
         (status = 400, description = "Empty or invalid key"),
         (status = 404, description = "Mirror unknown, or key not in cache"),
-        (status = 503, description = "Mirror is not yet caught up to its source"),
+        (status = 503, description = "Mirror is not currently Ready; body is a MirrorReadiness object", body = MirrorReadiness),
     ),
 )]
 async fn raw_by_key(
@@ -467,7 +628,7 @@ async fn offset_for_partition(
     responses(
         (status = 200, description = "Newline-separated keys (UTF-8, trailing newline included)", body = Vec<u8>, content_type = "application/octet-stream"),
         (status = 404, description = "Mirror unknown"),
-        (status = 503, description = "Mirror is not yet caught up to its source"),
+        (status = 503, description = "Mirror is not currently Ready; body is a MirrorReadiness object", body = MirrorReadiness),
     ),
 )]
 async fn keys(State(state): State<AppState>, Path(mirror): Path<String>) -> Response {
@@ -505,7 +666,7 @@ async fn keys(State(state): State<AppState>, Path(mirror): Path<String>) -> Resp
     responses(
         (status = 200, description = "Newline-separated raw values with trailing newline; binary-safe iff no value contains 0x0A", body = Vec<u8>, content_type = "text/plain"),
         (status = 404, description = "Mirror unknown"),
-        (status = 503, description = "Mirror is not yet caught up to its source"),
+        (status = 503, description = "Mirror is not currently Ready; body is a MirrorReadiness object", body = MirrorReadiness),
     ),
 )]
 async fn values(State(state): State<AppState>, Path(mirror): Path<String>) -> Response {

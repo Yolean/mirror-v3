@@ -246,7 +246,7 @@ async fn q_health_ready_returns_503_until_caught_up_then_200() {
     // every 3 s; consumer pods that don't see a `200` never become
     // Ready themselves. Same readiness gate as `/cache/v1`.
     let cache = Arc::new(CacheState::new());
-    cache.register_mirror("userstate", 2, None, true); // needs offsets 0..=1; main mirror
+    cache.register_mirror_with_topic("userstate", 2, None, true, "userstate", 0);
     let app = router_with(Arc::clone(&cache));
 
     let resp = app
@@ -255,6 +255,13 @@ async fn q_health_ready_returns_503_until_caught_up_then_200() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body: serde_json::Value =
+        serde_json::from_slice(&body_bytes(resp).await).expect("body must be JSON");
+    assert_eq!(body["ready"], "warming");
+    assert_eq!(body["mirrors"][0]["name"], "userstate");
+    assert_eq!(body["mirrors"][0]["status"], "warming");
+    assert_eq!(body["mirrors"][0]["source"]["topic"], "userstate");
+    assert_eq!(body["unhealthy"], serde_json::json!(["userstate"]));
 
     cache.apply_record("userstate", &rec("userstate", 0, 0, "k0", Some(b"v0")));
     cache.apply_record("userstate", &rec("userstate", 0, 1, "k1", Some(b"v1")));
@@ -264,10 +271,78 @@ async fn q_health_ready_returns_503_until_caught_up_then_200() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    // Empty body; Quarkus's SmallRye-Health returns a JSON document,
-    // but the kkv Node client only checks the status code, so we
-    // keep the body empty (200 implies ready, no further parsing).
-    assert!(body_bytes(resp).await.is_empty());
+    let body: serde_json::Value =
+        serde_json::from_slice(&body_bytes(resp).await).expect("body must be JSON");
+    assert_eq!(body["ready"], "ready");
+    assert_eq!(body["mirrors"][0]["status"], "ready");
+    assert_eq!(body["unhealthy"], serde_json::json!([]));
+}
+
+#[tokio::test]
+async fn q_health_ready_body_distinguishes_warming_from_degraded() {
+    // Aggregate discriminator: only Warming when every unhealthy
+    // mirror is still warming up; flips to Degraded once at least one
+    // is in a post-warming non-ready state (lag, source unassigned,
+    // destination lagging).
+    let cache = Arc::new(CacheState::new());
+    cache.register_mirror_with_topic("warming-only", 2, None, false, "t", 0);
+    let app = router_with(Arc::clone(&cache));
+    let resp = app
+        .clone()
+        .oneshot(Request::get("/q/health/ready").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+    assert_eq!(body["ready"], "warming");
+
+    // Drive past the warming window so the slot is Ready, then push
+    // the broker end-offset out so it flips to LagBehindSource.
+    cache.apply_record("warming-only", &rec("t", 0, 0, "k0", Some(b"v0")));
+    cache.apply_record("warming-only", &rec("t", 0, 1, "k1", Some(b"v1")));
+    cache.set_broker_end_offset("warming-only", 50);
+    let resp = app
+        .oneshot(Request::get("/q/health/ready").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+    assert_eq!(body["ready"], "degraded");
+    assert_eq!(body["mirrors"][0]["status"], "lag_behind_source");
+    assert_eq!(body["mirrors"][0]["source"]["lag"], 48);
+}
+
+#[tokio::test]
+async fn cache_503_body_matches_readiness_mirror_entry() {
+    // The per-mirror cache 503 body must equal the corresponding
+    // `mirrors[i]` element of `/q/health/ready`. A consumer hitting
+    // either endpoint can parse the same shape.
+    let cache = Arc::new(CacheState::new());
+    cache.register_mirror_with_topic("warming", 2, None, false, "t", 7);
+    let app = router_with(Arc::clone(&cache));
+
+    let resp = app
+        .clone()
+        .oneshot(Request::get("/q/health/ready").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let ready_body: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+    let expected_entry = &ready_body["mirrors"][0];
+
+    let resp = app
+        .oneshot(
+            Request::get("/cache/v1/warming/keys")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let cache_body: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+    assert_eq!(
+        &cache_body, expected_entry,
+        "503 body must be the same MirrorReadiness object as /q/health/ready returns"
+    );
 }
 
 #[tokio::test]

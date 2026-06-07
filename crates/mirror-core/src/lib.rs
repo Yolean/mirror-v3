@@ -25,7 +25,7 @@ pub mod mock;
 pub mod tee;
 pub mod testing;
 
-pub use cache::{CacheBinding, CacheState};
+pub use cache::{CacheBinding, CacheState, MirrorStatus, MirrorStatusSnapshot};
 pub use tee::TeeSink;
 
 /// Per-mirror Prometheus labels. `topic` and `partition` together
