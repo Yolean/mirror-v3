@@ -103,7 +103,7 @@ async fn cache_v1_serves_latest_per_key_and_honours_tombstones() {
     // Build CacheState and register the mirror against the captured
     // watermark.
     let cache_state = Arc::new(CacheState::new());
-    cache_state.register_mirror("cache-mirror", bootstrap_hwm);
+    cache_state.register_mirror("cache-mirror", bootstrap_hwm, true);
     let binding = mirror_fs::CacheBinding {
         state: Arc::clone(&cache_state),
         mirror_name: "cache-mirror".into(),

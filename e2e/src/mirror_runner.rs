@@ -378,8 +378,24 @@ pub async fn spawn_kafka_to_fs_with_notify(
     };
     let source = KafkaSource::open(src_cfg).context("open KafkaSource")?;
     let dest_name = spec.destination_name.clone();
+    let topic = spec.source_topic.clone();
+    let partition = spec.partition;
+    let mirror_name = dest_name.clone();
+    // `KkvV1Notifier::from_config` and `FlushDispatcher::from_config`
+    // need a `CacheState` so the per-mirror suppression gate can read
+    // `is_mirror_ready`. If the caller didn't pass one we build a
+    // fresh state and register this mirror at `bootstrap_hwm = 0` so
+    // the slot is immediately ready — the test scenarios that opt
+    // out of cache binding don't care about suppression timing.
+    let (cache_state, cache_for_tee) = match spec.cache.clone() {
+        Some(binding) => (Arc::clone(&binding.state), Some(binding)),
+        None => {
+            let state = Arc::new(mirror_core::CacheState::new());
+            state.register_mirror(&mirror_name, 0, false);
+            (state, None)
+        }
+    };
     let cache_for_bootstrap = spec.cache.clone();
-    let cache_for_tee = spec.cache.clone();
     let sink_cfg = FilesystemSinkConfig {
         root: spec.root,
         destination_name: spec.destination_name,
@@ -393,8 +409,6 @@ pub async fn spawn_kafka_to_fs_with_notify(
         flush: spec.flush,
     };
     let sink = FilesystemSink::open(sink_cfg).context("open FilesystemSink")?;
-    let topic = spec.source_topic.clone();
-    let partition = spec.partition;
     let trigger_mode = notify.trigger.on;
     let (shutdown, signal) = shutdown_pair();
     let handle = tokio::spawn(async move {
@@ -407,11 +421,14 @@ pub async fn spawn_kafka_to_fs_with_notify(
 
         match trigger_mode {
             mirror_config::TriggerOn::SourceConsume => {
-                let notifier =
-                    mirror_notify_kkv::KkvV1Notifier::from_config(&notify, topic, partition)
-                        .map_err(|e| {
-                            MirrorError::Sink(mirror_core::SinkError::Transport(e.to_string()))
-                        })?;
+                let notifier = mirror_notify_kkv::KkvV1Notifier::from_config(
+                    &notify,
+                    topic,
+                    partition,
+                    cache_state,
+                    mirror_name,
+                )
+                .map_err(|e| MirrorError::Sink(mirror_core::SinkError::Transport(e.to_string())))?;
                 run_mirror_with_notifier(
                     source,
                     tee,
@@ -422,11 +439,14 @@ pub async fn spawn_kafka_to_fs_with_notify(
                 .await
             }
             mirror_config::TriggerOn::DestinationFlush => {
-                let dispatcher =
-                    mirror_notify_kkv::FlushDispatcher::from_config(&notify, topic, partition)
-                        .map_err(|e| {
-                            MirrorError::Sink(mirror_core::SinkError::Transport(e.to_string()))
-                        })?;
+                let dispatcher = mirror_notify_kkv::FlushDispatcher::from_config(
+                    &notify,
+                    topic,
+                    partition,
+                    cache_state,
+                    mirror_name,
+                )
+                .map_err(|e| MirrorError::Sink(mirror_core::SinkError::Transport(e.to_string())))?;
                 tee.set_flush_observer(std::sync::Arc::new(dispatcher));
                 run_mirror_with_notifier(
                     source,
