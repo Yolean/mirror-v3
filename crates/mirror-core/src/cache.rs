@@ -30,7 +30,7 @@
 //! drop-in.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use indexmap::IndexMap;
@@ -69,12 +69,34 @@ pub struct TopicPartitionOffset {
     pub offset: u64,
 }
 
-/// Per-mirror slot. The supervisor (mirror-bin) creates one per
-/// opt-in mirror at startup, populates `bootstrap_hwm`, and stores
-/// the slot in [`CacheState`]. The sink's per-record path applies
-/// records into this slot's `view` / `offsets` and flips the slot
-/// to `caught_up` once its last-seen offset has crossed
-/// `bootstrap_hwm`.
+/// Enum status for a registered mirror. Carries the names + lag
+/// values needed for the structured `/q/health/ready` body so an
+/// on-call engineer can grep the response for the unhealthy source
+/// or destination.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MirrorStatus {
+    /// Has not yet reached `bootstrap_hwm` for the first time since
+    /// this process started. Cache HTTP returns 503; notify
+    /// dispatcher continues to suppress per the per-record
+    /// threshold check.
+    Warming,
+    /// Source assignment OK, lag within tolerance, no gating
+    /// destination is behind. Cache HTTP returns 200.
+    Ready,
+    /// Source-side lag exceeds the readiness tolerance. Cache HTTP
+    /// returns 503. `lag = broker_end_offset - last_applied_offset`.
+    LagBehindSource { lag: u64 },
+    /// The Kafka consumer's `assignment()` doesn't include this
+    /// mirror's (topic, partition). Set by the supervisor's
+    /// assignment poller (lands in commit 8); cleared when the
+    /// partition reappears.
+    SourceUnassigned { topic: String, partition: u32 },
+    /// A gating destination is behind on its `flushed_through`.
+    /// Reported by the supervisor's per-destination ack tracker
+    /// (mirror-bin); never set by `CacheState` itself.
+    DestinationLagging { name: String, lag: u64 },
+}
+
 #[derive(Debug)]
 struct MirrorSlot {
     bootstrap_hwm: u64,
@@ -97,7 +119,29 @@ struct MirrorSlot {
     /// Set once at registration; read-only thereafter. Stored as
     /// `u64` rather than `AtomicU64` because it never mutates.
     suppression_threshold: u64,
-    caught_up: AtomicBool,
+    /// Source-partition identity. Used by the assignment-loss path
+    /// and the structured readiness response body.
+    topic: String,
+    partition: u32,
+    /// Atomically updated by [`apply_record`]. The slot's view of
+    /// "highest source offset I've applied" for this mirror,
+    /// independent of the per-`TopicPartition` `offsets` map (which
+    /// has finer granularity but isn't read on the readiness path).
+    last_applied_offset: AtomicU64,
+    /// Broker end offset for the mirror's source partition. Initial
+    /// value `bootstrap_hwm`; updated by the supervisor's end-offset
+    /// poller (commit 8). Used by the readiness predicate as
+    /// `lag = broker_end_offset - last_applied_offset`.
+    broker_end_offset: AtomicU64,
+    /// `true` when the Kafka consumer reports the mirror's
+    /// `(topic, partition)` in its `assignment()`. Set by the
+    /// supervisor's assignment poller (commit 8); flipped to `false`
+    /// transitions the slot to [`MirrorStatus::SourceUnassigned`].
+    source_assigned: AtomicBool,
+    /// Cached current status. Recomputed by the supervisor or by
+    /// `apply_record` whenever an input atom changes. The HTTP
+    /// handlers take a read lock here on every probe.
+    status: RwLock<MirrorStatus>,
     /// `key → latest-value` for this mirror only. Iteration order is
     /// insertion order (the position a key gets the *first* time
     /// it's seen). Overwrites don't change position. Tombstones
@@ -119,15 +163,26 @@ pub struct CacheState {
     /// them to. Sticky for the lifetime of the process — set at
     /// startup, never re-assigned. Validator enforces at-most-one.
     main_mirror: RwLock<Option<String>>,
-    /// Sticky aggregate ready flag. Flips to `true` once every
-    /// registered mirror has caught up; never flips back. Backs the
-    /// `/q/health/ready` kkv-compat shim.
-    ready: AtomicBool,
+    /// Lag (in offsets) tolerated before [`MirrorStatus::Ready`]
+    /// flips to [`MirrorStatus::LagBehindSource`]. Default is
+    /// `0` (any positive lag fires); the supervisor overrides via
+    /// [`Self::with_readiness_lag_tolerance`] from
+    /// `MIRROR_V3_READINESS_LAG`.
+    readiness_lag_tolerance: u64,
 }
 
 impl CacheState {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Override the per-`MirrorSlot` lag tolerance. The supervisor
+    /// reads `MIRROR_V3_READINESS_LAG` and calls this before
+    /// registering any mirror. Tests use it to construct a slot that
+    /// tolerates a deliberately-injected lag value.
+    pub fn with_readiness_lag_tolerance(mut self, tolerance: u64) -> Self {
+        self.readiness_lag_tolerance = tolerance;
+        self
     }
 
     /// Register an opt-in mirror with its source-partition high
@@ -157,32 +212,65 @@ impl CacheState {
         last_committed_offset: Option<u64>,
         is_main: bool,
     ) {
-        let caught_up = bootstrap_hwm == 0;
+        self.register_mirror_with_topic(
+            mirror_name,
+            bootstrap_hwm,
+            last_committed_offset,
+            is_main,
+            "",
+            0,
+        );
+    }
+
+    /// Same as [`Self::register_mirror`] plus the source identity
+    /// (`topic`, `partition`). The identity is surfaced in the
+    /// [`MirrorStatus::SourceUnassigned`] body so the structured
+    /// readiness response names the partition that disappeared.
+    /// `register_mirror` calls this with placeholder identity so
+    /// tests that don't care can keep the shorter signature.
+    pub fn register_mirror_with_topic(
+        &self,
+        mirror_name: &str,
+        bootstrap_hwm: u64,
+        last_committed_offset: Option<u64>,
+        is_main: bool,
+        topic: &str,
+        partition: u32,
+    ) {
         // Returning-deploy commit wins when present; otherwise the
         // fresh-deploy fallback skips historical backlog up to the
         // broker's high-watermark.
         let suppression_threshold = last_committed_offset.unwrap_or(bootstrap_hwm);
-        {
-            let mut m = self.mirrors.write().expect("cache mirrors poisoned");
-            m.insert(
-                mirror_name.to_string(),
-                MirrorSlot {
-                    bootstrap_hwm,
-                    suppression_threshold,
-                    caught_up: AtomicBool::new(caught_up),
-                    view: RwLock::new(IndexMap::new()),
-                    offsets: RwLock::new(HashMap::new()),
-                },
-            );
-        }
+        // Empty topic (`bootstrap_hwm = 0`) is immediately ready;
+        // every other case starts in `Warming` and transitions via
+        // `apply_record` / the supervisor's pollers.
+        let initial_status = if bootstrap_hwm == 0 {
+            MirrorStatus::Ready
+        } else {
+            MirrorStatus::Warming
+        };
+        let mut m = self.mirrors.write().expect("cache mirrors poisoned");
+        m.insert(
+            mirror_name.to_string(),
+            MirrorSlot {
+                bootstrap_hwm,
+                suppression_threshold,
+                topic: topic.to_string(),
+                partition,
+                last_applied_offset: AtomicU64::new(0),
+                broker_end_offset: AtomicU64::new(bootstrap_hwm),
+                source_assigned: AtomicBool::new(true),
+                status: RwLock::new(initial_status),
+                view: RwLock::new(IndexMap::new()),
+                offsets: RwLock::new(HashMap::new()),
+            },
+        );
+        drop(m);
         if is_main {
             *self
                 .main_mirror
                 .write()
                 .expect("cache main_mirror poisoned") = Some(mirror_name.to_string());
-        }
-        if caught_up {
-            self.recheck_ready();
         }
     }
 
@@ -263,62 +351,165 @@ impl CacheState {
                 }
             }
         }
-        // Readiness check after the view update so observers seeing
-        // ready=true also see the record applied. `slot` reference
-        // and the outer mirrors-read lock are still live; pass the
-        // slot directly to avoid a re-lookup.
-        if !self.ready.load(Ordering::Acquire) {
-            self.maybe_flip_slot_ready(slot, record.source_offset, &mirrors);
+        // Advance the per-mirror `last_applied_offset` and recompute
+        // the status. Both the per-`TopicPartition` `offsets` map
+        // above and this atom are kept; the atom is what the
+        // readiness predicate reads.
+        slot.last_applied_offset
+            .fetch_max(record.source_offset + 1, Ordering::AcqRel);
+        Self::recompute_status_locked(slot, self.readiness_lag_tolerance);
+    }
+
+    /// Compute the current status of a slot from its atomic
+    /// counters. Called by every input mutator: `apply_record`,
+    /// `set_broker_end_offset`, `mark_source_assigned`. Holds the
+    /// status RwLock briefly.
+    ///
+    /// Order of precedence (highest wins):
+    ///   1. `SourceUnassigned` — the consume loop is effectively dead
+    ///      until the partition reappears in the assignment.
+    ///   2. `Warming` — never caught up to `bootstrap_hwm` since
+    ///      process start.
+    ///   3. `DestinationLagging` — already encoded in the current
+    ///      status by the mirror-bin setter; preserved here so
+    ///      destination-side state doesn't get clobbered by a
+    ///      source-side recompute.
+    ///   4. `LagBehindSource` — lag exceeds tolerance.
+    ///   5. `Ready`.
+    fn recompute_status_locked(slot: &MirrorSlot, tolerance: u64) {
+        let mut current = slot.status.write().expect("status poisoned");
+        // Preserve a destination-lagging signal — only mirror-bin's
+        // destination-lag setter can set or clear that variant. The
+        // source-side recompute leaves it alone so a destination
+        // problem isn't masked by a fresh source-side ack.
+        if matches!(*current, MirrorStatus::DestinationLagging { .. }) {
+            return;
+        }
+        if !slot.source_assigned.load(Ordering::Acquire) {
+            *current = MirrorStatus::SourceUnassigned {
+                topic: slot.topic.clone(),
+                partition: slot.partition,
+            };
+            return;
+        }
+        let last_applied = slot.last_applied_offset.load(Ordering::Acquire);
+        let broker_end = slot.broker_end_offset.load(Ordering::Acquire);
+        if last_applied < slot.bootstrap_hwm {
+            *current = MirrorStatus::Warming;
+            return;
+        }
+        let lag = broker_end.saturating_sub(last_applied);
+        if lag > tolerance {
+            *current = MirrorStatus::LagBehindSource { lag };
+        } else {
+            *current = MirrorStatus::Ready;
         }
     }
 
-    /// Inner: flip the given slot if its bootstrap watermark has
-    /// been reached, then recompute the aggregate flag. Caller holds
-    /// the `mirrors` read lock.
-    fn maybe_flip_slot_ready(
-        &self,
-        slot: &MirrorSlot,
-        last_offset: u64,
-        all_slots: &HashMap<String, MirrorSlot>,
-    ) {
-        if !slot.caught_up.load(Ordering::Acquire) && last_offset + 1 >= slot.bootstrap_hwm {
-            slot.caught_up.store(true, Ordering::Release);
-        }
-        let all_ready = all_slots
-            .values()
-            .all(|s| s.caught_up.load(Ordering::Acquire));
-        if all_ready {
-            self.ready.store(true, Ordering::Release);
-        }
-    }
-
-    fn recheck_ready(&self) {
+    /// Set the broker's current end offset for `mirror_name`. The
+    /// supervisor's end-offset poller (commit 8) calls this every
+    /// `MIRROR_V3_READINESS_POLL_MS`; the resulting recompute may
+    /// flip the slot into [`MirrorStatus::LagBehindSource`] or back
+    /// to [`MirrorStatus::Ready`].
+    pub fn set_broker_end_offset(&self, mirror_name: &str, end_offset: u64) {
         let mirrors = self.mirrors.read().expect("cache mirrors poisoned");
-        let all_ready = mirrors
-            .values()
-            .all(|s| s.caught_up.load(Ordering::Acquire));
-        drop(mirrors);
-        if all_ready {
-            self.ready.store(true, Ordering::Release);
-        }
+        let Some(slot) = mirrors.get(mirror_name) else {
+            return;
+        };
+        // Monotonic — broker end-offset only advances.
+        slot.broker_end_offset
+            .fetch_max(end_offset, Ordering::AcqRel);
+        Self::recompute_status_locked(slot, self.readiness_lag_tolerance);
     }
 
-    /// Cross-cluster readiness gate. Sticky once flipped to `true`.
+    /// Mark the source partition as unassigned. The supervisor's
+    /// assignment poller (commit 8) calls this when
+    /// `consumer.assignment()` no longer includes the mirror's
+    /// partition.
+    pub fn mark_source_unassigned(&self, mirror_name: &str) {
+        let mirrors = self.mirrors.read().expect("cache mirrors poisoned");
+        let Some(slot) = mirrors.get(mirror_name) else {
+            return;
+        };
+        slot.source_assigned.store(false, Ordering::Release);
+        Self::recompute_status_locked(slot, self.readiness_lag_tolerance);
+    }
+
+    /// Mark the source partition as re-assigned. Inverse of
+    /// [`Self::mark_source_unassigned`].
+    pub fn mark_source_assigned(&self, mirror_name: &str) {
+        let mirrors = self.mirrors.read().expect("cache mirrors poisoned");
+        let Some(slot) = mirrors.get(mirror_name) else {
+            return;
+        };
+        slot.source_assigned.store(true, Ordering::Release);
+        Self::recompute_status_locked(slot, self.readiness_lag_tolerance);
+    }
+
+    /// Record that a gating destination is behind. The supervisor's
+    /// per-destination lag check sets this; clearing it requires a
+    /// follow-up call to [`Self::clear_destination_lagging`].
+    pub fn mark_destination_lagging(&self, mirror_name: &str, dest_name: &str, lag: u64) {
+        let mirrors = self.mirrors.read().expect("cache mirrors poisoned");
+        let Some(slot) = mirrors.get(mirror_name) else {
+            return;
+        };
+        let mut s = slot.status.write().expect("status poisoned");
+        *s = MirrorStatus::DestinationLagging {
+            name: dest_name.to_string(),
+            lag,
+        };
+    }
+
+    /// Clear a destination-lagging signal and let the next
+    /// source-side recompute pick a fresh status. The supervisor
+    /// calls this when every gating destination is back within
+    /// tolerance.
+    pub fn clear_destination_lagging(&self, mirror_name: &str) {
+        let mirrors = self.mirrors.read().expect("cache mirrors poisoned");
+        let Some(slot) = mirrors.get(mirror_name) else {
+            return;
+        };
+        // Reset to Warming so the next recompute picks the right
+        // source-side status. Direct write here so the existing
+        // DestinationLagging guard in `recompute_status_locked`
+        // doesn't see a stale DestinationLagging.
+        *slot.status.write().expect("status poisoned") = MirrorStatus::Warming;
+        Self::recompute_status_locked(slot, self.readiness_lag_tolerance);
+    }
+
+    /// Cross-mirror readiness gate. Non-sticky: returns `true` iff
+    /// at least one mirror is registered and every registered
+    /// mirror currently reports [`MirrorStatus::Ready`].
     pub fn is_ready(&self) -> bool {
-        self.ready.load(Ordering::Acquire)
+        let mirrors = self.mirrors.read().expect("cache mirrors poisoned");
+        !mirrors.is_empty()
+            && mirrors.values().all(|slot| {
+                matches!(
+                    *slot.status.read().expect("status poisoned"),
+                    MirrorStatus::Ready
+                )
+            })
     }
 
-    /// Per-mirror readiness gate. Returns the slot's `caught_up`
-    /// value if `mirror_name` was registered; `false` for unknown
-    /// names so callers that read the flag through the wrong key
-    /// cannot accidentally fire before the supervisor wires up.
-    /// Sticky on `true` per the same invariant `is_ready` relies on.
+    /// Per-mirror readiness gate. Returns `true` iff `mirror_name`
+    /// is registered AND its current status is
+    /// [`MirrorStatus::Ready`]. Non-sticky: a mirror that drops out
+    /// of Ready (lag, assignment loss, destination problem) flips
+    /// this to `false`.
     pub fn is_mirror_ready(&self, mirror_name: &str) -> bool {
+        self.status_for(mirror_name)
+            .is_some_and(|s| matches!(s, MirrorStatus::Ready))
+    }
+
+    /// Snapshot the current status for a registered mirror. Returns
+    /// `None` if the name is unknown. Used by the structured
+    /// `/q/health/ready` body (commit 10) and by tests.
+    pub fn status_for(&self, mirror_name: &str) -> Option<MirrorStatus> {
         let mirrors = self.mirrors.read().expect("cache mirrors poisoned");
         mirrors
             .get(mirror_name)
-            .map(|m| m.caught_up.load(Ordering::Acquire))
-            .unwrap_or(false)
+            .map(|slot| slot.status.read().expect("status poisoned").clone())
     }
 
     /// Name of the mirror that opted into `cache-v1-main`, or
@@ -665,5 +856,166 @@ mod threshold_tests {
         s.register_mirror("m", 0, None, false);
         assert!(!s.is_record_suppressed("m", 0));
         assert!(!s.is_record_suppressed("m", 99));
+    }
+}
+
+#[cfg(test)]
+mod status_transition_tests {
+    use super::*;
+
+    fn rec(topic: &str, partition: i32, offset: u64, key: &str) -> Record {
+        Record {
+            topic: topic.into(),
+            partition,
+            source_offset: offset,
+            timestamp_ms: Some(1_700_000_000_000),
+            timestamp_type: crate::TimestampType::CreateTime,
+            key: Some(key.as_bytes().to_vec()),
+            value: Some(b"v".to_vec()),
+            headers: Vec::<crate::Header>::new(),
+        }
+    }
+
+    #[test]
+    fn empty_topic_starts_ready() {
+        let s = CacheState::new();
+        s.register_mirror_with_topic("m", 0, None, false, "t", 0);
+        assert_eq!(s.status_for("m"), Some(MirrorStatus::Ready));
+        assert!(s.is_mirror_ready("m"));
+        assert!(s.is_ready(), "aggregate is true once every mirror is Ready");
+    }
+
+    #[test]
+    fn non_empty_topic_starts_warming_and_flips_on_catch_up() {
+        let s = CacheState::new();
+        s.register_mirror_with_topic("m", 5, None, false, "t", 0);
+        assert_eq!(s.status_for("m"), Some(MirrorStatus::Warming));
+        assert!(!s.is_mirror_ready("m"));
+
+        // Apply offsets 0..3 — still Warming because last_applied (= 4 after offset 3 sets `last_applied_offset = 4`) is below bootstrap_hwm 5.
+        for off in 0..4 {
+            s.apply_record("m", &rec("t", 0, off, &format!("k{off}")));
+        }
+        assert_eq!(s.status_for("m"), Some(MirrorStatus::Warming));
+
+        // Apply offset 4 — last_applied = 5, which equals bootstrap_hwm → Ready.
+        s.apply_record("m", &rec("t", 0, 4, "k4"));
+        assert_eq!(s.status_for("m"), Some(MirrorStatus::Ready));
+        assert!(s.is_mirror_ready("m"));
+    }
+
+    #[test]
+    fn poller_pushes_lag_then_recovers() {
+        // After warming, the broker advances. With tolerance=0, even
+        // one offset of lag flips the slot to LagBehindSource. A
+        // follow-up apply_record at the new end offset recovers to
+        // Ready.
+        let s = CacheState::new();
+        s.register_mirror_with_topic("m", 1, None, false, "t", 0);
+        s.apply_record("m", &rec("t", 0, 0, "k0")); // catch up; last_applied = 1
+        assert_eq!(s.status_for("m"), Some(MirrorStatus::Ready));
+
+        s.set_broker_end_offset("m", 5);
+        assert_eq!(
+            s.status_for("m"),
+            Some(MirrorStatus::LagBehindSource { lag: 4 })
+        );
+        assert!(!s.is_mirror_ready("m"));
+        assert!(!s.is_ready());
+
+        s.apply_record("m", &rec("t", 0, 1, "k1"));
+        s.apply_record("m", &rec("t", 0, 2, "k2"));
+        s.apply_record("m", &rec("t", 0, 3, "k3"));
+        s.apply_record("m", &rec("t", 0, 4, "k4"));
+        assert_eq!(s.status_for("m"), Some(MirrorStatus::Ready));
+        assert!(s.is_mirror_ready("m"));
+    }
+
+    #[test]
+    fn source_unassigned_overrides_other_states() {
+        let s = CacheState::new();
+        s.register_mirror_with_topic("m", 0, None, false, "user-states", 7);
+        assert_eq!(s.status_for("m"), Some(MirrorStatus::Ready));
+
+        s.mark_source_unassigned("m");
+        match s.status_for("m") {
+            Some(MirrorStatus::SourceUnassigned { topic, partition }) => {
+                assert_eq!(topic, "user-states");
+                assert_eq!(partition, 7);
+            }
+            other => panic!("expected SourceUnassigned, got {other:?}"),
+        }
+        assert!(!s.is_mirror_ready("m"));
+
+        // Source comes back; recompute returns to Ready (empty
+        // topic, no lag).
+        s.mark_source_assigned("m");
+        assert_eq!(s.status_for("m"), Some(MirrorStatus::Ready));
+    }
+
+    #[test]
+    fn destination_lagging_is_set_and_cleared_externally() {
+        let s = CacheState::new();
+        s.register_mirror_with_topic("m", 0, None, false, "t", 0);
+        assert_eq!(s.status_for("m"), Some(MirrorStatus::Ready));
+
+        s.mark_destination_lagging("m", "users-gcs", 42);
+        match s.status_for("m") {
+            Some(MirrorStatus::DestinationLagging { name, lag }) => {
+                assert_eq!(name, "users-gcs");
+                assert_eq!(lag, 42);
+            }
+            other => panic!("expected DestinationLagging, got {other:?}"),
+        }
+        assert!(!s.is_mirror_ready("m"));
+
+        // An incoming apply_record must NOT clobber DestinationLagging.
+        s.apply_record("m", &rec("t", 0, 0, "k0"));
+        assert!(matches!(
+            s.status_for("m"),
+            Some(MirrorStatus::DestinationLagging { .. })
+        ));
+
+        // Clearing returns to source-side state.
+        s.clear_destination_lagging("m");
+        assert_eq!(s.status_for("m"), Some(MirrorStatus::Ready));
+    }
+
+    #[test]
+    fn aggregate_is_ready_ands_every_slot() {
+        let s = CacheState::new();
+        s.register_mirror_with_topic("ready", 0, None, false, "t1", 0);
+        s.register_mirror_with_topic("warming", 5, None, false, "t2", 0);
+        assert!(
+            !s.is_ready(),
+            "aggregate is false while one slot is Warming"
+        );
+        for off in 0..5 {
+            s.apply_record("warming", &rec("t2", 0, off, &format!("k{off}")));
+        }
+        assert!(s.is_ready(), "aggregate flips to true when both Ready");
+    }
+
+    #[test]
+    fn aggregate_is_not_ready_when_no_mirrors_are_registered() {
+        let s = CacheState::new();
+        assert!(
+            !s.is_ready(),
+            "aggregate is false when nothing has been registered"
+        );
+    }
+
+    #[test]
+    fn lag_tolerance_lets_a_small_lag_stay_ready() {
+        let s = CacheState::new().with_readiness_lag_tolerance(10);
+        s.register_mirror_with_topic("m", 1, None, false, "t", 0);
+        s.apply_record("m", &rec("t", 0, 0, "k0")); // Ready, lag=0
+        s.set_broker_end_offset("m", 8); // lag=7 <= 10
+        assert_eq!(s.status_for("m"), Some(MirrorStatus::Ready));
+        s.set_broker_end_offset("m", 100); // lag=99 > 10
+        assert_eq!(
+            s.status_for("m"),
+            Some(MirrorStatus::LagBehindSource { lag: 99 })
+        );
     }
 }
