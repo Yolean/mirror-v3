@@ -97,6 +97,16 @@ pub(crate) struct DrainedBatch {
     pub updates: IndexMap<String, serde_json::Value>,
 }
 
+impl DrainedBatch {
+    /// The highest source offset across every partition in the batch.
+    /// Mirrors are pinned to one `(topic, partition)` today so the
+    /// map holds one entry; the iteration generalises cleanly if a
+    /// future multi-partition mirror is added.
+    pub fn high_offset(&self) -> u64 {
+        self.offsets.values().copied().max().unwrap_or(0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

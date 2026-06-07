@@ -22,7 +22,7 @@
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -31,7 +31,7 @@ use indexmap::IndexMap;
 use mirror_config::{
     FanOut, FinalAction, NotifyApi, NotifyOutcome, NotifyOutcomes, NotifyRetry, NotifyTarget,
 };
-use mirror_core::{current_labels, CacheState, Notifier, NotifyError, Record};
+use mirror_core::{current_labels, AckSink, CacheState, Notifier, NotifyError, Record};
 use reqwest::Client;
 use serde::Serialize;
 use thiserror::Error;
@@ -147,6 +147,11 @@ struct NotifierState {
     new_data: TokioNotify,
     shutting_down: AtomicBool,
     error_state: TokioMutex<Option<NotifyError>>,
+    /// Set once, before any record is dispatched, via
+    /// [`KkvV1Notifier::with_ack_sink`]. Shared between
+    /// `drain_now` (inline path) and the background timer task so
+    /// both paths feed the supervisor's per-mirror ack tracker.
+    ack_sink: OnceLock<Arc<dyn AckSink>>,
 }
 
 /// Notifier implementing the kkv-v1 wire contract. One instance per
@@ -228,6 +233,7 @@ impl KkvV1Notifier {
             new_data: TokioNotify::new(),
             shutting_down: AtomicBool::new(false),
             error_state: TokioMutex::new(None),
+            ack_sink: OnceLock::new(),
         });
 
         // Always spawn the timer task. For `max_records: 1` it just
@@ -245,6 +251,22 @@ impl KkvV1Notifier {
         })
     }
 
+    /// Install an [`AckSink`]. The notifier calls
+    /// `ack.note_through(high_offset + 1)` after every successful
+    /// batch drain, where `high_offset` is the largest source offset
+    /// in the just-delivered batch. Idempotent if called twice;
+    /// `OnceLock::set` returns `Err` on the second call which we
+    /// drop intentionally (the first install wins).
+    ///
+    /// Builder shape so callers don't have to add yet another
+    /// constructor argument; supervisors install the ack sink
+    /// immediately after `from_config` and before handing the
+    /// notifier to the run loop.
+    pub fn with_ack_sink(self, ack: Arc<dyn AckSink>) -> Self {
+        let _ = self.state.ack_sink.set(ack);
+        self
+    }
+
     /// Drain the current buffer (if any) and dispatch it. Used from
     /// both the on_record max-records path and shutdown.
     async fn drain_now(&self) -> Result<(), NotifyError> {
@@ -255,7 +277,16 @@ impl KkvV1Notifier {
         let Some(batch) = batch else {
             return Ok(());
         };
-        self.inner.dispatch_drained(batch).await
+        let high = batch.high_offset();
+        self.inner.dispatch_drained(batch).await?;
+        // Successful dispatch through every endpoint => the batch is
+        // delivered. Tell the supervisor's ack tracker so the
+        // periodic source-commit task can advance the broker-side
+        // committed offset.
+        if let Some(ack) = self.state.ack_sink.get() {
+            ack.note_through(high + 1);
+        }
+        Ok(())
     }
 }
 
@@ -718,12 +749,18 @@ async fn timer_loop(inner: Arc<Inner>, state: Arc<NotifierState>, max_time: Dura
             buf.take(inner.partition)
         };
         if let Some(batch) = batch {
+            let high = batch.high_offset();
             if let Err(e) = inner.dispatch_drained(batch).await {
                 // Stash for the next on_record / shutdown to surface;
                 // exit so the buffer doesn't grow further behind a
                 // broken receiver.
                 *state.error_state.lock().await = Some(e);
                 return;
+            }
+            // Same ack semantics as `drain_now`: successful POST
+            // through every endpoint => the batch is delivered.
+            if let Some(ack) = state.ack_sink.get() {
+                ack.note_through(high + 1);
             }
         }
     }
@@ -794,6 +831,11 @@ pub struct FlushDispatcher {
     mirror_name: String,
     topic: String,
     partition: i32,
+    /// Set once via [`Self::with_ack_sink`]. Shared with the drainer
+    /// task at construction; the drainer calls
+    /// `note_through(to + 1)` after a successful POST so the
+    /// supervisor's per-mirror ack tracker can advance.
+    ack_sink: Arc<OnceLock<Arc<dyn AckSink>>>,
 }
 
 enum FlushEvent {
@@ -830,10 +872,12 @@ impl FlushDispatcher {
         let inner = Arc::new(build_inner(notify, topic.clone(), partition, resolver)?);
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let error_state = Arc::new(TokioMutex::new(None));
+        let ack_sink: Arc<OnceLock<Arc<dyn AckSink>>> = Arc::new(OnceLock::new());
         let drainer = tokio::spawn(flush_drainer_loop(
             Arc::clone(&inner),
             rx,
             Arc::clone(&error_state),
+            Arc::clone(&ack_sink),
         ));
         Ok(Self {
             inner,
@@ -844,7 +888,18 @@ impl FlushDispatcher {
             mirror_name,
             topic,
             partition,
+            ack_sink,
         })
+    }
+
+    /// Install an [`AckSink`]. The drainer calls
+    /// `ack.note_through(to + 1)` after every successful POST,
+    /// where `to` is the high-water offset of the flushed batch the
+    /// blob sink reported. Idempotent if called twice; the first
+    /// install wins.
+    pub fn with_ack_sink(self, ack: Arc<dyn AckSink>) -> Self {
+        let _ = self.ack_sink.set(ack);
+        self
     }
 
     /// Drain pending events and stop the background task. Returns
@@ -908,6 +963,7 @@ async fn flush_drainer_loop(
     inner: Arc<Inner>,
     mut rx: tokio::sync::mpsc::UnboundedReceiver<FlushEvent>,
     error_state: Arc<TokioMutex<Option<NotifyError>>>,
+    ack_sink: Arc<OnceLock<Arc<dyn AckSink>>>,
 ) {
     while let Some(event) = rx.recv().await {
         let to = match event {
@@ -924,6 +980,14 @@ async fn flush_drainer_loop(
         if let Err(e) = inner.dispatch_batch(&payload).await {
             *error_state.lock().await = Some(e);
             return;
+        }
+        // Successful POST => the batch is delivered. The flush event
+        // already represents a durable destination boundary on the
+        // blob sink side, so this also reflects the supervisor's
+        // notion of "highest offset acked through every gating
+        // pathway" for the destination-flush trigger.
+        if let Some(ack) = ack_sink.get() {
+            ack.note_through(to + 1);
         }
     }
 }
