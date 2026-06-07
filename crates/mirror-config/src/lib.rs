@@ -67,6 +67,16 @@ pub struct KafkaDestination {
     /// the source.
     #[serde(default)]
     pub topic: Option<String>,
+    /// Whether this destination gates the mirror's readiness. When
+    /// `true` (default), the supervisor reports
+    /// `MirrorStatus::DestinationLagging` if this destination falls
+    /// behind the source by more than the configured tolerance,
+    /// and the structured `/q/health/ready` body names the
+    /// destination by `name`. Set `false` for best-effort secondary
+    /// destinations (observability replicas, archival sync) that
+    /// should not flip the mirror's status.
+    #[serde(default = "default_true")]
+    pub affects_readiness: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -79,6 +89,9 @@ pub struct FilesystemDestination {
     pub name: Option<String>,
     /// Absolute path to the destination root directory.
     pub root: PathBuf,
+    /// See [`KafkaDestination::affects_readiness`].
+    #[serde(default = "default_true")]
+    pub affects_readiness: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -99,6 +112,13 @@ pub struct S3Destination {
     /// Key prefix prepended to all written object keys.
     #[serde(default)]
     pub prefix: Option<String>,
+    /// See [`KafkaDestination::affects_readiness`].
+    #[serde(default = "default_true")]
+    pub affects_readiness: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Destination {
@@ -120,6 +140,18 @@ impl Destination {
     /// Kafka destinations, which commit per-record.
     pub fn is_blob(&self) -> bool {
         !matches!(self, Destination::Kafka(_))
+    }
+
+    /// Whether this destination's progress gates the mirror's
+    /// readiness status. When false, the supervisor still tracks
+    /// `flushed_through` for observability but skips the destination
+    /// when computing `MirrorStatus::DestinationLagging`.
+    pub fn affects_readiness(&self) -> bool {
+        match self {
+            Destination::Kafka(k) => k.affects_readiness,
+            Destination::Filesystem(fs) => fs.affects_readiness,
+            Destination::S3(s3) => s3.affects_readiness,
+        }
     }
 }
 

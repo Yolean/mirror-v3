@@ -35,6 +35,7 @@ fn parses_minimal_kafka_config() {
                     name: None,
                     bootstrap_servers: "redpanda:9092".into(),
                     topic: None,
+                    affects_readiness: true,
                 })],
                 format: None,
                 compression: None,
@@ -120,6 +121,7 @@ mirrors:
         Destination::Filesystem(FilesystemDestination {
             name: None,
             root: PathBuf::from("/var/mirror-v3"),
+            affects_readiness: true,
         })
     );
     let m = &cfg.mirrors[0];
@@ -167,7 +169,37 @@ mirrors:
             region: "us-east-1".into(),
             bucket: "mirror-v3".into(),
             prefix: Some("archive/".into()),
+            affects_readiness: true,
         })
+    );
+}
+
+#[test]
+fn affects_readiness_defaults_true_and_overrides() {
+    let yaml = r#"
+mirrors:
+  - name: dual
+    source: { bootstrap-servers: source:9092 }
+    topic: dual
+    partition: 0
+    destinations:
+      - type: kafka
+        name: primary
+        bootstrap-servers: primary:9092
+      - type: kafka
+        name: ghost
+        bootstrap-servers: ghost:9092
+        affects-readiness: false
+"#;
+    let cfg = load_from_str(yaml).expect("must parse");
+    let dests = &cfg.mirrors[0].destinations;
+    assert!(
+        dests[0].affects_readiness(),
+        "default must be true when omitted"
+    );
+    assert!(
+        !dests[1].affects_readiness(),
+        "explicit affects-readiness: false must round-trip"
     );
 }
 

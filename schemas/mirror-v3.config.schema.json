@@ -205,6 +205,11 @@
               ],
               "default": null
             },
+            "affects-readiness": {
+              "description": "Whether this destination gates the mirror's readiness. When\n`true` (default), the supervisor reports\n`MirrorStatus::DestinationLagging` if this destination falls\nbehind the source by more than the configured tolerance,\nand the structured `/q/health/ready` body names the\ndestination by `name`. Set `false` for best-effort secondary\ndestinations (observability replicas, archival sync) that\nshould not flip the mirror's status.",
+              "type": "boolean",
+              "default": true
+            },
             "type": {
               "type": "string",
               "const": "kafka"
@@ -230,6 +235,11 @@
             "root": {
               "description": "Absolute path to the destination root directory.",
               "type": "string"
+            },
+            "affects-readiness": {
+              "description": "See [`KafkaDestination::affects_readiness`].",
+              "type": "boolean",
+              "default": true
             },
             "type": {
               "type": "string",
@@ -274,6 +284,11 @@
                 "null"
               ],
               "default": null
+            },
+            "affects-readiness": {
+              "description": "See [`KafkaDestination::affects_readiness`].",
+              "type": "boolean",
+              "default": true
             },
             "type": {
               "type": "string",

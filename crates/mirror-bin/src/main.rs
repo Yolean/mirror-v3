@@ -767,9 +767,11 @@ async fn spawn_mirror(
     let mut dest_descriptions: Vec<String> = Vec::with_capacity(mirror.destinations.len());
     // Per-destination ack slots, shared by Arc with the shims
     // installed on each inner sink and with the AckTracker that the
-    // periodic commit task reads. `affects_readiness = true` for now
-    // — the per-destination YAML field that overrides this lands in
-    // a later commit.
+    // periodic commit task reads. `affects_readiness` is set from the
+    // YAML `affects-readiness:` field on each destination (default
+    // true): a destination with `affects-readiness: false` still
+    // records `flushed_through` for observability but is skipped when
+    // computing `MirrorStatus::DestinationLagging`.
     let mut dest_ack_slots: Vec<Arc<DestAckSlot>> = Vec::with_capacity(mirror.destinations.len());
     for dest in &mirror.destinations {
         let inner_name = dest.effective_name(&mirror.name);
@@ -777,7 +779,10 @@ async fn spawn_mirror(
         dest_descriptions.push(format!("{inner_name}({kind})"));
         let mut sink: Box<dyn Sink> =
             open_inner_sink(dest, &mirror, &inner_name, cache.as_ref()).await?;
-        let slot = Arc::new(DestAckSlot::new(inner_name.clone(), true));
+        let slot = Arc::new(DestAckSlot::new(
+            inner_name.clone(),
+            dest.affects_readiness(),
+        ));
         // Pick the right observer hook per destination type. Blob
         // sinks fire `FlushObserver` per buffered flush; Kafka sinks
         // commit per-record and fire `WriteObserver`. The shim feeds
