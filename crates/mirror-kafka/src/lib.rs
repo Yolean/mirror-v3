@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use mirror_core::{
-    ColumnType, Header, Record, Sink, SinkError, Source, SourceError, TimestampType,
+    ColumnType, Header, Record, Sink, SinkError, Source, SourceError, TimestampType, WriteObserver,
 };
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{BaseConsumer, CommitMode, Consumer, StreamConsumer};
@@ -442,6 +442,11 @@ pub struct KafkaSink {
     timestamp_mode: TimestampMode,
     keys: ColumnType,
     values: ColumnType,
+    /// Optional observer fired after every successful produce. Wired
+    /// in by the supervisor via [`Sink::set_write_observer`]; default
+    /// `None` so production code unaware of ack tracking keeps the
+    /// existing single-write behaviour.
+    write_observer: Option<Arc<dyn WriteObserver>>,
 }
 
 impl KafkaSink {
@@ -470,6 +475,7 @@ impl KafkaSink {
             timestamp_mode: cfg.timestamp_mode,
             keys: cfg.keys,
             values: cfg.values,
+            write_observer: None,
         })
     }
 
@@ -562,7 +568,18 @@ impl Sink for KafkaSink {
             "partition" => partition,
         )
         .set((delivery.offset as u64 + 1) as f64);
+        // Per-write ack signal. The supervisor's installed observer
+        // bumps the per-destination ack tracker; the source-side
+        // commit task then advances the broker-committed offset up
+        // to the AND of every destination's ack and any notify ack.
+        if let Some(obs) = self.write_observer.as_ref() {
+            obs.on_written(record.source_offset);
+        }
         Ok(())
+    }
+
+    fn set_write_observer(&mut self, observer: Arc<dyn WriteObserver>) {
+        self.write_observer = Some(observer);
     }
 }
 

@@ -360,6 +360,15 @@ pub trait Sink: Send {
     /// observer is supported per sink instance; later installs
     /// replace earlier ones.
     fn set_flush_observer(&mut self, _observer: Arc<dyn FlushObserver>) {}
+
+    /// Install a [`WriteObserver`] that fires after every successful
+    /// `write`. Default no-op for sinks where the per-record signal
+    /// is uninteresting or already covered by [`FlushObserver`]
+    /// (FS/S3 buffer multiple records into one flush; the flush
+    /// observer is the right granularity there). Kafka destination
+    /// sinks override and fire on every accepted record, so the
+    /// supervisor's per-destination ack tracker advances per write.
+    fn set_write_observer(&mut self, _observer: Arc<dyn WriteObserver>) {}
 }
 
 /// Observer notified when a sink durably commits a batch. Lives in
@@ -380,6 +389,40 @@ pub trait FlushObserver: Send + Sync {
     /// (the min across inner sinks); the observer fires only when
     /// that min strictly increases.
     fn on_flushed(&self, from: u64, to: u64);
+}
+
+/// Observer notified after a sink successfully writes a record.
+/// Parallel to [`FlushObserver`] but for per-record signals; Kafka
+/// destination sinks fire this after each accepted produce. Blob
+/// sinks buffer writes so they use `FlushObserver` instead.
+///
+/// Synchronous; implementations are expected to do something cheap
+/// (typically: bump an `AtomicU64` on the supervisor's per-
+/// destination ack tracker).
+pub trait WriteObserver: Send + Sync {
+    /// `source_offset` is the offset the record carried; the
+    /// destination is durable through `source_offset + 1` by the
+    /// time this fires.
+    fn on_written(&self, source_offset: u64);
+}
+
+/// Acknowledgement sink. Receives "everything strictly below
+/// `through` has been delivered" signals from either:
+/// * a notify dispatcher (after a successful drain / POST), or
+/// * a supervisor-installed [`FlushObserver`] / [`WriteObserver`]
+///   shim that translates per-destination flush / write events into
+///   `note_through` calls.
+///
+/// The supervisor's per-mirror ack tracker is the canonical
+/// implementation. The trait lives in `mirror-core` so notify
+/// dispatchers (in `mirror-notify-kkv`) can take a
+/// `Box<dyn AckSink>` without depending on `mirror-bin`.
+///
+/// Synchronous and idempotent. Implementations must guard against
+/// regressions (callers may not be monotonic at the trait surface;
+/// the AckTracker keeps a running maximum).
+pub trait AckSink: Send + Sync {
+    fn note_through(&self, through: u64);
 }
 
 /// Per-mirror observer of records as they flow through the loop.

@@ -6,8 +6,9 @@
 
 use async_trait::async_trait;
 use std::collections::VecDeque;
+use std::sync::Arc;
 
-use crate::{Record, Sink, SinkError, Source, SourceError, TimestampType};
+use crate::{Record, Sink, SinkError, Source, SourceError, TimestampType, WriteObserver};
 
 /// Scriptable [`Source`] that returns canned events. Records seek
 /// calls and poll results so tests can assert on them.
@@ -119,6 +120,10 @@ pub struct MockSink {
     /// to false (append-mode behaviour) and is set true by tests
     /// simulating a compaction:log destination.
     pub allows_compacted_source: bool,
+    /// Observer fired after every successful `write`. Tests use this
+    /// to assert the per-write ack hook is wired correctly through
+    /// whichever code path is under test.
+    pub write_observer: Option<Arc<dyn WriteObserver>>,
 }
 
 impl MockSink {
@@ -129,6 +134,7 @@ impl MockSink {
             write_error: None,
             running_position: offset,
             allows_compacted_source: false,
+            write_observer: None,
         }
     }
 
@@ -172,8 +178,12 @@ impl Sink for MockSink {
                 actual: record.source_offset,
             });
         }
+        let offset = record.source_offset;
         self.running_position += 1;
         self.writes.push(record);
+        if let Some(obs) = self.write_observer.as_ref() {
+            obs.on_written(offset);
+        }
         Ok(())
     }
 
@@ -186,6 +196,10 @@ impl Sink for MockSink {
         // the next `write()` accepts a record at `low_watermark`.
         self.running_position = low_watermark;
         Ok(())
+    }
+
+    fn set_write_observer(&mut self, observer: Arc<dyn WriteObserver>) {
+        self.write_observer = Some(observer);
     }
 }
 
