@@ -611,7 +611,7 @@ mod tests {
         let (a, _ra) = Recording::new(0);
         let (b, _rb) = Recording::new(0);
         let cache_state = Arc::new(CacheState::new());
-        cache_state.register_mirror("m", 0, false);
+        cache_state.register_mirror("m", 0, None, false);
         let binding = CacheBinding {
             state: Arc::clone(&cache_state),
             mirror_name: "m".into(),

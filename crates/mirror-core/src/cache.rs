@@ -78,6 +78,25 @@ pub struct TopicPartitionOffset {
 #[derive(Debug)]
 struct MirrorSlot {
     bootstrap_hwm: u64,
+    /// Offset strictly below which the notify dispatcher suppresses
+    /// records. Computed at register time as
+    /// `max(last_committed_offset, bootstrap_hwm if no commit)`:
+    ///
+    ///   * Fresh deploy (no broker-committed offset for the group):
+    ///     `suppression_threshold = bootstrap_hwm`. Records during
+    ///     the first replay-to-current window don't fan webhooks
+    ///     out to consumers.
+    ///   * Returning deploy (group has a previously-committed
+    ///     offset `C`): `suppression_threshold = C`. Records `[C,
+    ///     bootstrap_hwm)` represent the between-pods gap and DO
+    ///     fire webhooks — the previous pod was supposed to deliver
+    ///     them but exited before doing so. Records below `C` are
+    ///     suppressed because the previous pod already delivered
+    ///     them.
+    ///
+    /// Set once at registration; read-only thereafter. Stored as
+    /// `u64` rather than `AtomicU64` because it never mutates.
+    suppression_threshold: u64,
     caught_up: AtomicBool,
     /// `key → latest-value` for this mirror only. Iteration order is
     /// insertion order (the position a key gets the *first* time
@@ -117,19 +136,39 @@ impl CacheState {
     ///
     /// `bootstrap_hwm` is the Kafka high-watermark (one past the last
     /// existing offset). An empty topic has `bootstrap_hwm = 0` and
-    /// the mirror is immediately considered caught up. `is_main`
-    /// selects this mirror as the one `cache-v1-main` mounts the
-    /// unprefixed `/cache/v1/...` paths onto; the validator enforces
-    /// at-most-one, so the supervisor's last call wins if it ever
-    /// passes multiple `true`s (defensive — should never happen).
-    pub fn register_mirror(&self, mirror_name: &str, bootstrap_hwm: u64, is_main: bool) {
+    /// the mirror is immediately considered caught up.
+    ///
+    /// `last_committed_offset` is the value the supervisor read from
+    /// the broker's `__consumer_offsets` for this group at startup
+    /// (`Source::fetch_committed_offset`). `Some(c)` means the prior
+    /// pod committed through `c` and webhook suppression resumes at
+    /// `c` rather than at `bootstrap_hwm`; `None` is a fresh group
+    /// and suppression uses `bootstrap_hwm`.
+    ///
+    /// `is_main` selects this mirror as the one `cache-v1-main`
+    /// mounts the unprefixed `/cache/v1/...` paths onto; the
+    /// validator enforces at-most-one, so the supervisor's last call
+    /// wins if it ever passes multiple `true`s (defensive — should
+    /// never happen).
+    pub fn register_mirror(
+        &self,
+        mirror_name: &str,
+        bootstrap_hwm: u64,
+        last_committed_offset: Option<u64>,
+        is_main: bool,
+    ) {
         let caught_up = bootstrap_hwm == 0;
+        // Returning-deploy commit wins when present; otherwise the
+        // fresh-deploy fallback skips historical backlog up to the
+        // broker's high-watermark.
+        let suppression_threshold = last_committed_offset.unwrap_or(bootstrap_hwm);
         {
             let mut m = self.mirrors.write().expect("cache mirrors poisoned");
             m.insert(
                 mirror_name.to_string(),
                 MirrorSlot {
                     bootstrap_hwm,
+                    suppression_threshold,
                     caught_up: AtomicBool::new(caught_up),
                     view: RwLock::new(IndexMap::new()),
                     offsets: RwLock::new(HashMap::new()),
@@ -145,6 +184,20 @@ impl CacheState {
         if caught_up {
             self.recheck_ready();
         }
+    }
+
+    /// True iff the notify dispatcher should drop a record at
+    /// `source_offset` for `mirror_name`. Compared against the
+    /// per-mirror `suppression_threshold` set at register time. An
+    /// unknown mirror returns `false` (no info, don't suppress) so
+    /// the legacy behaviour of "fire if not registered" is
+    /// preserved.
+    pub fn is_record_suppressed(&self, mirror_name: &str, source_offset: u64) -> bool {
+        let mirrors = self.mirrors.read().expect("cache mirrors poisoned");
+        mirrors
+            .get(mirror_name)
+            .map(|slot| source_offset < slot.suppression_threshold)
+            .unwrap_or(false)
     }
 
     /// Apply a record from the source consume loop to the named
@@ -375,7 +428,7 @@ mod tests {
             "unknown name must report false so an uninstrumented \
              notifier can't accidentally fire"
         );
-        s.register_mirror("warming", 3, false);
+        s.register_mirror("warming", 3, None, false);
         assert!(!s.is_mirror_ready("warming"), "hwm 3, no records yet");
         s.apply_record("warming", &rec("warming", 0, 0, "k0", Some(b"v")));
         s.apply_record("warming", &rec("warming", 0, 1, "k1", Some(b"v")));
@@ -383,7 +436,7 @@ mod tests {
         s.apply_record("warming", &rec("warming", 0, 2, "k2", Some(b"v")));
         assert!(s.is_mirror_ready("warming"), "offset hwm-1 flips the slot");
         // Independent slot stays at its own state.
-        s.register_mirror("empty", 0, false);
+        s.register_mirror("empty", 0, None, false);
         assert!(
             s.is_mirror_ready("empty"),
             "hwm 0 = immediately ready, independent of other mirrors"
@@ -405,14 +458,14 @@ mod tests {
     #[test]
     fn register_empty_topic_marks_mirror_ready_immediately() {
         let s = CacheState::new();
-        s.register_mirror("ops", 0, false);
+        s.register_mirror("ops", 0, None, false);
         assert!(s.is_ready(), "empty topic = hwm 0 = immediately ready");
     }
 
     #[test]
     fn readiness_flips_only_after_bootstrap_hwm_reached() {
         let s = CacheState::new();
-        s.register_mirror("ops", 3, false); // need offsets 0..=2
+        s.register_mirror("ops", 3, None, false); // need offsets 0..=2
         assert!(!s.is_ready());
         s.apply_record("ops", &rec("ops", 0, 0, "k0", Some(b"v0")));
         assert!(!s.is_ready());
@@ -425,8 +478,8 @@ mod tests {
     #[test]
     fn multiple_mirrors_all_must_catch_up() {
         let s = CacheState::new();
-        s.register_mirror("a", 2, false);
-        s.register_mirror("b", 1, false);
+        s.register_mirror("a", 2, None, false);
+        s.register_mirror("b", 1, None, false);
         assert!(!s.is_ready());
         s.apply_record("a", &rec("topic-a", 0, 0, "ka0", Some(b"va0")));
         s.apply_record("a", &rec("topic-a", 0, 1, "ka1", Some(b"va1")));
@@ -438,7 +491,7 @@ mod tests {
     #[test]
     fn tombstone_removes_key() {
         let s = CacheState::new();
-        s.register_mirror("ops", 2, false);
+        s.register_mirror("ops", 2, None, false);
         s.apply_record("ops", &rec("ops", 0, 0, "user-1", Some(br#"{"v":1}"#)));
         assert_eq!(
             s.get_value_for("ops", "user-1").as_deref(),
@@ -451,7 +504,7 @@ mod tests {
     #[test]
     fn rewind_does_not_overwrite_or_remove() {
         let s = CacheState::new();
-        s.register_mirror("ops", 1, false);
+        s.register_mirror("ops", 1, None, false);
         s.apply_record("ops", &rec("ops", 0, 0, "k", Some(b"first")));
         s.apply_record("ops", &rec("ops", 0, 1, "k", Some(b"second")));
         // Now feed a record with an older offset (simulated rewind).
@@ -473,7 +526,7 @@ mod tests {
     #[test]
     fn snapshot_offsets_is_deterministic_order() {
         let s = CacheState::new();
-        s.register_mirror("m", 10, false);
+        s.register_mirror("m", 10, None, false);
         s.apply_record("m", &rec("z-topic", 1, 5, "k", Some(b"v")));
         s.apply_record("m", &rec("a-topic", 3, 4, "k2", Some(b"v")));
         s.apply_record("m", &rec("a-topic", 1, 6, "k3", Some(b"v")));
@@ -495,7 +548,7 @@ mod tests {
     #[test]
     fn snapshot_keys_in_insertion_order() {
         let s = CacheState::new();
-        s.register_mirror("m", 0, false);
+        s.register_mirror("m", 0, None, false);
         s.apply_record("m", &rec("t", 0, 0, "c", Some(b"v")));
         s.apply_record("m", &rec("t", 0, 1, "a", Some(b"v")));
         s.apply_record("m", &rec("t", 0, 2, "b", Some(b"v")));
@@ -505,7 +558,7 @@ mod tests {
     #[test]
     fn overwrite_keeps_position_in_listing() {
         let s = CacheState::new();
-        s.register_mirror("m", 0, false);
+        s.register_mirror("m", 0, None, false);
         s.apply_record("m", &rec("t", 0, 0, "x", Some(b"v0")));
         s.apply_record("m", &rec("t", 0, 1, "y", Some(b"v1")));
         s.apply_record("m", &rec("t", 0, 2, "x", Some(b"v0-updated")));
@@ -519,7 +572,7 @@ mod tests {
     #[test]
     fn tombstone_preserves_order_of_remaining() {
         let s = CacheState::new();
-        s.register_mirror("m", 0, false);
+        s.register_mirror("m", 0, None, false);
         s.apply_record("m", &rec("t", 0, 0, "a", Some(b"va")));
         s.apply_record("m", &rec("t", 0, 1, "b", Some(b"vb")));
         s.apply_record("m", &rec("t", 0, 2, "c", Some(b"vc")));
@@ -533,8 +586,8 @@ mod tests {
         // mirror A must not show up in mirror B's view, and an
         // unregistered mirror name returns None across the board.
         let s = CacheState::new();
-        s.register_mirror("a", 0, false);
-        s.register_mirror("b", 0, false);
+        s.register_mirror("a", 0, None, false);
+        s.register_mirror("b", 0, None, false);
         s.apply_record("a", &rec("topic-a", 0, 0, "k-a", Some(b"va")));
         s.apply_record("b", &rec("topic-b", 0, 0, "k-b", Some(b"vb")));
         assert_eq!(s.get_value_for("a", "k-a").as_deref(), Some(b"va".as_ref()));
@@ -548,12 +601,69 @@ mod tests {
     fn register_mirror_tracks_main_mirror_singleton() {
         let s = CacheState::new();
         assert!(s.main_mirror().is_none());
-        s.register_mirror("ops", 0, false);
+        s.register_mirror("ops", 0, None, false);
         assert!(
             s.main_mirror().is_none(),
             "is_main=false does not assign the singleton"
         );
-        s.register_mirror("users", 0, true);
+        s.register_mirror("users", 0, None, true);
         assert_eq!(s.main_mirror().as_deref(), Some("users"));
+    }
+}
+
+#[cfg(test)]
+mod threshold_tests {
+    use super::*;
+
+    #[test]
+    fn fresh_deploy_suppresses_below_bootstrap_hwm() {
+        let s = CacheState::new();
+        s.register_mirror("m", 10, None, false);
+        for off in 0..10 {
+            assert!(
+                s.is_record_suppressed("m", off),
+                "fresh deploy must suppress offset {off} (< hwm 10)"
+            );
+        }
+        assert!(
+            !s.is_record_suppressed("m", 10),
+            "offset == hwm must NOT be suppressed (first live record)"
+        );
+        assert!(!s.is_record_suppressed("m", 50));
+    }
+
+    #[test]
+    fn returning_deploy_suppresses_below_committed_offset() {
+        let s = CacheState::new();
+        s.register_mirror("m", 10, Some(5), false);
+        for off in 0..5 {
+            assert!(
+                s.is_record_suppressed("m", off),
+                "returning deploy must suppress offset {off} below committed 5"
+            );
+        }
+        for off in 5..15 {
+            assert!(
+                !s.is_record_suppressed("m", off),
+                "offset {off} must fire (>= committed 5)"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_mirror_is_not_suppressed() {
+        let s = CacheState::new();
+        assert!(
+            !s.is_record_suppressed("never-registered", 0),
+            "unknown mirror returns false (no info, don't suppress)"
+        );
+    }
+
+    #[test]
+    fn empty_topic_no_committed_suppresses_nothing() {
+        let s = CacheState::new();
+        s.register_mirror("m", 0, None, false);
+        assert!(!s.is_record_suppressed("m", 0));
+        assert!(!s.is_record_suppressed("m", 99));
     }
 }

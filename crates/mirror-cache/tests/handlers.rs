@@ -40,7 +40,7 @@ async fn body_bytes(resp: axum::http::Response<Body>) -> Vec<u8> {
 #[tokio::test]
 async fn raw_returns_503_until_caught_up() {
     let cache = Arc::new(CacheState::new());
-    cache.register_mirror("ops", 2, true); // needs offsets 0..=1; main mirror
+    cache.register_mirror("ops", 2, None, true); // needs offsets 0..=1; main mirror
     let app = router_with(Arc::clone(&cache));
     let resp = app
         .clone()
@@ -71,7 +71,7 @@ async fn raw_returns_503_until_caught_up() {
 #[tokio::test]
 async fn raw_404_for_missing_key() {
     let cache = Arc::new(CacheState::new());
-    cache.register_mirror("m", 0, true); // empty topic → immediately ready
+    cache.register_mirror("m", 0, None, true); // empty topic → immediately ready
     let app = router_with(Arc::clone(&cache));
     let resp = app
         .oneshot(
@@ -87,7 +87,7 @@ async fn raw_404_for_missing_key() {
 #[tokio::test]
 async fn tombstone_makes_key_404() {
     let cache = Arc::new(CacheState::new());
-    cache.register_mirror("m", 2, true);
+    cache.register_mirror("m", 2, None, true);
     cache.apply_record("m", &rec("t", 0, 0, "alice", Some(br#"{"v":1}"#)));
     cache.apply_record("m", &rec("t", 0, 1, "alice", None)); // tombstone
     let app = router_with(Arc::clone(&cache));
@@ -105,7 +105,7 @@ async fn tombstone_makes_key_404() {
 #[tokio::test]
 async fn keys_and_values_are_newline_terminated_in_insertion_order() {
     let cache = Arc::new(CacheState::new());
-    cache.register_mirror("m", 0, true);
+    cache.register_mirror("m", 0, None, true);
     cache.apply_record("m", &rec("t", 0, 0, "b", Some(b"vb")));
     cache.apply_record("m", &rec("t", 0, 1, "a", Some(b"va")));
     cache.apply_record("m", &rec("t", 0, 2, "c", Some(b"vc")));
@@ -147,7 +147,7 @@ async fn keys_and_values_are_newline_terminated_in_insertion_order() {
 #[tokio::test]
 async fn offset_endpoint_returns_decimal_or_empty() {
     let cache = Arc::new(CacheState::new());
-    cache.register_mirror("m", 0, true);
+    cache.register_mirror("m", 0, None, true);
     cache.apply_record("m", &rec("orders", 1, 7, "k", Some(b"v")));
     let app = router_with(Arc::clone(&cache));
 
@@ -181,7 +181,7 @@ async fn offset_endpoint_returns_decimal_or_empty() {
 #[tokio::test]
 async fn openapi_json_and_yaml_are_served() {
     let cache = Arc::new(CacheState::new());
-    cache.register_mirror("m", 0, true);
+    cache.register_mirror("m", 0, None, true);
     let app = router_with(Arc::clone(&cache));
 
     let resp = app
@@ -214,7 +214,7 @@ async fn openapi_json_and_yaml_are_served() {
 #[tokio::test]
 async fn offsets_header_contents_match_snapshot() {
     let cache = Arc::new(CacheState::new());
-    cache.register_mirror("m", 0, true);
+    cache.register_mirror("m", 0, None, true);
     cache.apply_record("m", &rec("orders", 0, 5, "k", Some(b"v")));
     cache.apply_record("m", &rec("orders", 1, 3, "k2", Some(b"v")));
     let app = router_with(Arc::clone(&cache));
@@ -246,7 +246,7 @@ async fn q_health_ready_returns_503_until_caught_up_then_200() {
     // every 3 s; consumer pods that don't see a `200` never become
     // Ready themselves. Same readiness gate as `/cache/v1`.
     let cache = Arc::new(CacheState::new());
-    cache.register_mirror("userstate", 2, true); // needs offsets 0..=1; main mirror
+    cache.register_mirror("userstate", 2, None, true); // needs offsets 0..=1; main mirror
     let app = router_with(Arc::clone(&cache));
 
     let resp = app
@@ -276,8 +276,8 @@ async fn per_mirror_paths_serve_only_that_mirrors_view() {
     // /raw/{key} must not surface the other's keys, and vice-versa.
     // Neither is `cache-v1-main`; the unprefixed paths must 404.
     let cache = Arc::new(CacheState::new());
-    cache.register_mirror("a", 0, false);
-    cache.register_mirror("b", 0, false);
+    cache.register_mirror("a", 0, None, false);
+    cache.register_mirror("b", 0, None, false);
     cache.apply_record("a", &rec("topic-a", 0, 0, "k-a", Some(b"va")));
     cache.apply_record("b", &rec("topic-b", 0, 0, "k-b", Some(b"vb")));
     let app = router_with(Arc::clone(&cache));
@@ -325,7 +325,7 @@ async fn per_mirror_paths_serve_only_that_mirrors_view() {
 #[tokio::test]
 async fn per_mirror_path_unknown_mirror_is_404() {
     let cache = Arc::new(CacheState::new());
-    cache.register_mirror("real", 0, false);
+    cache.register_mirror("real", 0, None, false);
     let app = router_with(Arc::clone(&cache));
     let resp = app
         .oneshot(
@@ -343,8 +343,8 @@ async fn per_mirror_path_503_until_that_mirror_caught_up() {
     // Per-mirror readiness gates each route independently: one
     // mirror can already serve while the other is still warming up.
     let cache = Arc::new(CacheState::new());
-    cache.register_mirror("ready-now", 0, false); // hwm 0 => ready
-    cache.register_mirror("warming", 2, false); // needs offsets 0..=1
+    cache.register_mirror("ready-now", 0, None, false); // hwm 0 => ready
+    cache.register_mirror("warming", 2, None, false); // needs offsets 0..=1
     let app = router_with(Arc::clone(&cache));
 
     let resp = app
@@ -375,8 +375,8 @@ async fn unprefixed_paths_dispatch_to_main_mirror_view() {
     // Two mirrors; `main-m` is cache-v1-main. The unprefixed
     // /cache/v1/keys must return main-m's keys only.
     let cache = Arc::new(CacheState::new());
-    cache.register_mirror("main-m", 0, true);
-    cache.register_mirror("other", 0, false);
+    cache.register_mirror("main-m", 0, None, true);
+    cache.register_mirror("other", 0, None, false);
     cache.apply_record("main-m", &rec("t", 0, 0, "main-key", Some(b"vm")));
     cache.apply_record("other", &rec("t", 0, 0, "other-key", Some(b"vo")));
     let app = router_with(Arc::clone(&cache));
@@ -409,7 +409,7 @@ async fn q_health_ready_is_not_in_openapi_spec() {
     // Compat shim, intentionally undocumented; public surface is
     // `/cache/v1` and `/_admin/v1` only.
     let cache = Arc::new(CacheState::new());
-    cache.register_mirror("m", 0, true);
+    cache.register_mirror("m", 0, None, true);
     let app = router_with(Arc::clone(&cache));
     let resp = app
         .oneshot(Request::get("/openapi.json").body(Body::empty()).unwrap())

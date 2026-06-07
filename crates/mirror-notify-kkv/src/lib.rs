@@ -623,16 +623,23 @@ impl Notifier for KkvV1Notifier {
             return Err(err);
         }
 
-        // Suppress records whose source offset hasn't crossed this
-        // mirror's bootstrap high-watermark yet. CacheState's
-        // per-mirror `caught_up` flag flips in the destination write
-        // path once `last_offset + 1 >= bootstrap_hwm`; the first
-        // post-watermark record falls through to dispatch as normal.
-        // Sticky once true, no flip-back. Matches the legacy kkv
-        // `KafkaCache` Stage gate which suppresses push notifications
-        // until `Polling`. The suppressed counter is the operator's
-        // visibility into how much of a backlog was skipped.
-        if !self.cache_state.is_mirror_ready(&self.mirror_name) {
+        // Suppress records below this mirror's
+        // `suppression_threshold` (set at register time as
+        // `max(last_committed_offset, bootstrap_hwm if no commit)`).
+        // Two regimes:
+        //   * Returning deploy (group has a committed value `C`):
+        //     threshold = C. Records below C were already delivered
+        //     by the previous pod; records in `[C, bootstrap_hwm)`
+        //     are the between-pods gap and DO fire.
+        //   * Fresh deploy (no committed value): threshold =
+        //     bootstrap_hwm. Records during the first-replay window
+        //     don't fan webhook out to consumers.
+        // The suppressed counter is the operator's visibility into
+        // how many records were skipped.
+        if self
+            .cache_state
+            .is_record_suppressed(&self.mirror_name, record.source_offset)
+        {
             let (topic_l, partition_l) = current_labels();
             metrics::counter!(
                 "mirror_v3_notify_suppressed_records_total",
@@ -928,14 +935,14 @@ impl FlushDispatcher {
 
 impl mirror_core::FlushObserver for FlushDispatcher {
     fn on_flushed(&self, _from: u64, to: u64) {
-        // Suppress flush events arriving before this mirror's
-        // bootstrap high-watermark is crossed. Symmetric with the
-        // source-consume gate in [`KkvV1Notifier::on_record`] so a
-        // cold restart doesn't fan a backlog catch-up notify out to
-        // every consumer pod. `on_flushed` is a sync trait method
-        // outside the `MIRROR_LABELS` task-local scope, so labels
-        // come from the fields populated at construction.
-        if !self.cache_state.is_mirror_ready(&self.mirror_name) {
+        // Suppress flush events whose high-water offset hasn't
+        // reached this mirror's `suppression_threshold`. The
+        // threshold compares against `to` (the flush event's high
+        // offset): if `to < threshold` the whole flushed batch is
+        // in the suppression window. `on_flushed` is a sync trait
+        // method outside the `MIRROR_LABELS` task-local scope, so
+        // labels come from the fields populated at construction.
+        if self.cache_state.is_record_suppressed(&self.mirror_name, to) {
             metrics::counter!(
                 "mirror_v3_notify_suppressed_records_total",
                 "topic" => self.topic.clone(),

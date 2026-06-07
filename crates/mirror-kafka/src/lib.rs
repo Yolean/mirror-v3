@@ -55,6 +55,45 @@ pub fn fetch_low_watermark(
     Ok(low)
 }
 
+/// Read the broker's `__consumer_offsets` entry for the
+/// `(group_id, topic, partition)` tuple. `Ok(None)` is the
+/// "no committed value yet" sentinel (a fresh group, or a group
+/// that hasn't committed for this partition). Sync; wrap in
+/// `spawn_blocking` for async contexts. Mirrors the `fetch_*_watermark`
+/// pattern so the supervisor can read the per-mirror committed
+/// offset at startup without instantiating a full `KafkaSource`.
+pub fn fetch_committed_offset(
+    bootstrap: &str,
+    group_id: &str,
+    topic: &str,
+    partition: i32,
+    timeout: Duration,
+) -> Result<Option<u64>, KafkaError> {
+    let consumer: BaseConsumer = ClientConfig::new()
+        .set("bootstrap.servers", bootstrap)
+        .set("group.id", group_id)
+        .set("enable.auto.commit", "false")
+        .create()
+        .map_err(|e| KafkaError::Init(e.to_string()))?;
+    let mut tpl = TopicPartitionList::new();
+    tpl.add_partition(topic, partition);
+    let filled = consumer
+        .committed_offsets(tpl, Timeout::After(timeout))
+        .map_err(|e| KafkaError::Init(format!("committed_offsets: {e}")))?;
+    let elem = filled.find_partition(topic, partition).ok_or_else(|| {
+        KafkaError::Init(format!(
+            "committed_offsets returned no entry for {topic}/{partition}"
+        ))
+    })?;
+    match elem.offset() {
+        Offset::Offset(n) if n >= 0 => Ok(Some(n as u64)),
+        // `Invalid` is librdkafka's "no committed offset for this
+        // group". The other `Offset::*` variants don't appear in a
+        // `committed_offsets` result; treat them as `None`.
+        _ => Ok(None),
+    }
+}
+
 fn fetch_watermarks(
     bootstrap: &str,
     topic: &str,
@@ -309,44 +348,26 @@ impl Source for KafkaSource {
     async fn fetch_committed_offset(&mut self) -> Result<Option<u64>, SourceError> {
         // Mirrors the `low_watermark` pattern: a fresh `BaseConsumer`
         // with the same `group.id` drives the metadata + offset
-        // lookup inside a `spawn_blocking`. Using a fresh client
-        // here side-steps any state the run loop's `StreamConsumer`
-        // may not yet have warmed up (this method is called once at
-        // supervisor startup, before the loop assigns).
+        // lookup inside a `spawn_blocking`. Delegates to the free
+        // `fetch_committed_offset` helper so the supervisor's
+        // startup path can read the value without instantiating a
+        // full `KafkaSource`.
         let bootstrap = self.bootstrap_servers.clone();
         let group_id = self.group_id.clone();
         let topic = self.topic.clone();
         let partition = self.partition;
-        let result = tokio::task::spawn_blocking(move || {
-            let consumer: BaseConsumer = ClientConfig::new()
-                .set("bootstrap.servers", &bootstrap)
-                .set("group.id", &group_id)
-                .set("enable.auto.commit", "false")
-                .create()
-                .map_err(|e| SourceError::Transport(format!("committed init: {e}")))?;
-            let mut tpl = TopicPartitionList::new();
-            tpl.add_partition(&topic, partition);
-            let filled = consumer
-                .committed_offsets(tpl, Timeout::After(DEFAULT_WATERMARK_TIMEOUT))
-                .map_err(|e| SourceError::Transport(format!("committed_offsets: {e}")))?;
-            let elem = filled.find_partition(&topic, partition).ok_or_else(|| {
-                SourceError::Transport(format!(
-                    "committed_offsets returned no entry for {topic}/{partition}"
-                ))
-            })?;
-            match elem.offset() {
-                Offset::Offset(n) if n >= 0 => Ok::<_, SourceError>(Some(n as u64)),
-                // `Invalid` is what librdkafka maps "no committed
-                // offset for this group" to. Any other variant
-                // (Beginning, End, Stored, OffsetTail) shouldn't
-                // come back from `committed_offsets`; treat them as
-                // "no committed value" to stay safe.
-                _ => Ok(None),
-            }
+        tokio::task::spawn_blocking(move || {
+            fetch_committed_offset(
+                &bootstrap,
+                &group_id,
+                &topic,
+                partition,
+                DEFAULT_WATERMARK_TIMEOUT,
+            )
+            .map_err(|e| SourceError::Transport(format!("fetch_committed_offset: {e}")))
         })
         .await
-        .map_err(|e| SourceError::Transport(format!("committed join: {e}")))?;
-        result
+        .map_err(|e| SourceError::Transport(format!("committed join: {e}")))?
     }
 }
 

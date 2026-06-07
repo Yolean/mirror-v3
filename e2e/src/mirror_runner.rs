@@ -391,7 +391,7 @@ pub async fn spawn_kafka_to_fs_with_notify(
         Some(binding) => (Arc::clone(&binding.state), Some(binding)),
         None => {
             let state = Arc::new(mirror_core::CacheState::new());
-            state.register_mirror(&mirror_name, 0, false);
+            state.register_mirror(&mirror_name, 0, None, false);
             (state, None)
         }
     };

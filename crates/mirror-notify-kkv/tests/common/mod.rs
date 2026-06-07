@@ -147,7 +147,7 @@ async fn handle_post(
 /// `false`.
 pub fn ready_cache(mirror_name: &str) -> Arc<CacheState> {
     let state = Arc::new(CacheState::new());
-    state.register_mirror(mirror_name, 0, false);
+    state.register_mirror(mirror_name, 0, None, false);
     state
 }
 

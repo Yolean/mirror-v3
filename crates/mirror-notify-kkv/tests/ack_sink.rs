@@ -29,13 +29,13 @@ impl AckSink for RecordingAck {
 fn ready_cache(name: &str) -> Arc<CacheState> {
     let s = Arc::new(CacheState::new());
     // bootstrap_hwm = 0 => the slot is immediately ready.
-    s.register_mirror(name, 0, false);
+    s.register_mirror(name, 0, None, false);
     s
 }
 
 fn warming_cache(name: &str, hwm: u64) -> Arc<CacheState> {
     let s = Arc::new(CacheState::new());
-    s.register_mirror(name, hwm, false);
+    s.register_mirror(name, hwm, None, false);
     s
 }
 

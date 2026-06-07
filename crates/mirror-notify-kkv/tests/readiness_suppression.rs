@@ -1,11 +1,12 @@
-//! Pin the per-mirror bootstrap-hwm suppression gate for both notify
+//! Pin the per-mirror suppression-threshold gate for both notify
 //! triggers. `KkvV1Notifier::on_record` and
-//! `FlushDispatcher::on_flushed` must drop events whose mirror slot
-//! in `CacheState` has not yet flipped to `caught_up`. Maps onto the
-//! legacy kkv `KafkaCache` Stage gate that suppressed push
-//! notifications until `Polling`. Without this, a cold restart fans
-//! historical-replay updates out to every consumer pod and breaks
-//! the cache-invalidation contract for the live view.
+//! `FlushDispatcher::on_flushed` must drop events whose source
+//! offset is strictly below the mirror's `suppression_threshold` in
+//! `CacheState`. The threshold is `max(last_committed_offset,
+//! bootstrap_hwm if no commit)`, set at register time. Without this,
+//! a cold restart fans historical-replay updates out to every
+//! consumer pod (fresh deploy) or re-fires updates the previous pod
+//! already delivered (returning deploy).
 
 mod common;
 
@@ -41,62 +42,99 @@ fn fast_retry() -> NotifyRetry {
 }
 
 #[tokio::test]
-async fn source_consume_suppresses_until_caught_up() {
-    // Mirror "m" needs to see offset hwm-1 (100) before its slot
-    // flips. Records at 50 and 99 (both pre-flip) must be silently
-    // dropped; the record at 100 flips the slot via the destination
-    // write path's `apply_record` (100 + 1 >= 101), after which 100
-    // and 101 dispatch as single-record POSTs (debounce.max_records=1
-    // in the helper).
+async fn source_consume_suppresses_below_threshold_fresh_deploy() {
+    // Fresh deploy: no committed offset, threshold = bootstrap_hwm.
+    // Mirror "m" has hwm=101. Records 50, 99, 100 (all < 101) are
+    // suppressed; records 101 onward fire.
     let server = TestServer::start(Reply::Status(200), vec![]).await;
     let cfg = notify_pointing_at(server.addr, NotifyOutcomes::default(), fast_retry(), 1000);
 
     let cache = Arc::new(CacheState::new());
-    cache.register_mirror("m", 101, false);
+    cache.register_mirror("m", 101, None, false);
     let mut notifier =
         KkvV1Notifier::from_config(&cfg, "t".into(), 0, Arc::clone(&cache), "m".into()).unwrap();
 
-    // Pre-watermark: simulate the run loop driving both the cache
-    // (via TeeSink.apply_record) and the notifier per record. Below
-    // the hwm both are no-ops on the wire.
-    for offset in [50_u64, 99] {
+    // Below the threshold the dispatcher accepts the call but drops
+    // the record. `apply_record` keeps the cache's per-mirror view
+    // in sync (unrelated to the suppression check).
+    for offset in [50_u64, 99, 100] {
         let r = rec(offset, &format!("k{offset}"));
         cache.apply_record("m", &r);
         notifier.on_record(&r).await.expect("suppressed: Ok(())");
     }
-    assert!(
-        !cache.is_mirror_ready("m"),
-        "still 1 offset short of hwm 101 (last_offset+1 = 101 needed)"
-    );
     assert_eq!(
         server.request_count(),
         0,
-        "no POST may go out before caught_up"
+        "no POST may go out for offsets below threshold 101"
     );
 
-    // Offset 100 crosses the threshold (100 + 1 >= 101). apply_record
-    // flips the slot, on_record then dispatches the record.
-    let r100 = rec(100, "k100");
-    cache.apply_record("m", &r100);
-    assert!(cache.is_mirror_ready("m"), "offset 100 flips the slot");
-    notifier.on_record(&r100).await.expect("post-hwm dispatch");
-
+    // Offset 101 == threshold; first record that fires.
     let r101 = rec(101, "k101");
     cache.apply_record("m", &r101);
-    notifier.on_record(&r101).await.expect("post-hwm dispatch");
+    notifier
+        .on_record(&r101)
+        .await
+        .expect("at threshold dispatch");
+
+    let r102 = rec(102, "k102");
+    cache.apply_record("m", &r102);
+    notifier
+        .on_record(&r102)
+        .await
+        .expect("above threshold dispatch");
 
     let captured = server.captured().await;
     assert_eq!(
         captured.len(),
         2,
-        "exactly the two post-hwm records must POST"
+        "exactly the two at-or-above-threshold records must POST"
     );
     let body0: Value = serde_json::from_slice(&captured[0].body).unwrap();
-    assert_eq!(body0["updates"], serde_json::json!({"k100": null}));
-    assert_eq!(body0["offsets"], serde_json::json!({"0": 100}));
+    assert_eq!(body0["updates"], serde_json::json!({"k101": null}));
+    assert_eq!(body0["offsets"], serde_json::json!({"0": 101}));
     let body1: Value = serde_json::from_slice(&captured[1].body).unwrap();
-    assert_eq!(body1["updates"], serde_json::json!({"k101": null}));
-    assert_eq!(body1["offsets"], serde_json::json!({"0": 101}));
+    assert_eq!(body1["updates"], serde_json::json!({"k102": null}));
+    assert_eq!(body1["offsets"], serde_json::json!({"0": 102}));
+}
+
+#[tokio::test]
+async fn source_consume_suppresses_below_threshold_returning_deploy() {
+    // Returning deploy: committed=5, bootstrap_hwm=20. Threshold = 5.
+    // Records 0..4 suppressed (prior pod delivered them); 5..19 fire
+    // (between-pods gap); 20+ fires (live). This is the dev2-bug fix
+    // — without the committed-offset threshold this test would have
+    // suppressed records 5..19 too, dropping every between-pods
+    // record on the floor.
+    let server = TestServer::start(Reply::Status(200), vec![]).await;
+    let cfg = notify_pointing_at(server.addr, NotifyOutcomes::default(), fast_retry(), 1000);
+
+    let cache = Arc::new(CacheState::new());
+    cache.register_mirror("m", 20, Some(5), false);
+    let mut notifier =
+        KkvV1Notifier::from_config(&cfg, "t".into(), 0, Arc::clone(&cache), "m".into()).unwrap();
+
+    for offset in [0_u64, 1, 4] {
+        let r = rec(offset, &format!("k{offset}"));
+        cache.apply_record("m", &r);
+        notifier.on_record(&r).await.unwrap();
+    }
+    assert_eq!(
+        server.request_count(),
+        0,
+        "offsets below committed 5 must suppress"
+    );
+
+    // The between-pods gap: 5..19. All must fire.
+    for offset in 5..10 {
+        let r = rec(offset, &format!("k{offset}"));
+        cache.apply_record("m", &r);
+        notifier.on_record(&r).await.unwrap();
+    }
+    assert_eq!(
+        server.request_count(),
+        5,
+        "the between-pods gap (5..10) must fire one POST per record"
+    );
 }
 
 fn notify_dest_flush(addr: std::net::SocketAddr) -> Notify {
@@ -137,22 +175,24 @@ async fn wait_for_requests(
 }
 
 #[tokio::test]
-async fn destination_flush_suppresses_until_caught_up() {
-    // Same gate, different trigger surface. `on_flushed` is sync; the
-    // drainer is a background task. Flushes arriving before the
-    // mirror's slot flips must never make it onto the channel; the
-    // post-flip flush must POST.
+async fn destination_flush_suppresses_below_threshold() {
+    // Same gate, different trigger surface. `on_flushed` is sync;
+    // the drainer is a background task. Flushes whose high-water
+    // offset `to` is below the suppression threshold must never
+    // make it onto the channel; flushes at or above the threshold
+    // POST normally.
     let server = TestServer::start(Reply::Status(200), vec![]).await;
     let cfg = notify_dest_flush(server.addr);
 
     let cache = Arc::new(CacheState::new());
-    cache.register_mirror("m", 101, false);
+    // Fresh deploy with bootstrap_hwm=101 ⇒ threshold = 101.
+    cache.register_mirror("m", 101, None, false);
     let dispatcher =
         FlushDispatcher::from_config(&cfg, "t".into(), 0, Arc::clone(&cache), "m".into())
             .expect("must build");
 
-    // Two pre-watermark flushes are dropped at the gate; channel
-    // never sees them, drainer task stays idle.
+    // Two flushes whose `to` < 101 are dropped at the gate; the
+    // channel never sees them, the drainer task stays idle.
     dispatcher.on_flushed(0, 49);
     dispatcher.on_flushed(50, 99);
     // Give the (idle) drainer a moment to prove no POST happens.
@@ -160,19 +200,18 @@ async fn destination_flush_suppresses_until_caught_up() {
     assert_eq!(
         server.request_count(),
         0,
-        "no POST may go out before caught_up"
+        "no POST may go out for `to` below threshold 101"
     );
 
-    // Flip the slot via apply_record at offset hwm-1 (100 + 1 >= 101),
-    // matching what TeeSink does on the production write path. Then
-    // drive a flush.
-    let r100 = rec(100, "k100");
-    cache.apply_record("m", &r100);
-    assert!(cache.is_mirror_ready("m"));
+    // `to`=109 is above the threshold — fires.
     dispatcher.on_flushed(100, 109);
 
     let captured = wait_for_requests(&server, 1, Duration::from_secs(2)).await;
-    assert_eq!(captured.len(), 1, "only the post-hwm flush dispatches");
+    assert_eq!(
+        captured.len(),
+        1,
+        "only the at-or-above-threshold flush dispatches"
+    );
     let body: Value = serde_json::from_slice(&captured[0].body).unwrap();
     assert_eq!(body["offsets"], serde_json::json!({"0": 109}));
     assert_eq!(body["updates"], serde_json::json!({}));

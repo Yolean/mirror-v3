@@ -523,6 +523,7 @@ async fn run(path: PathBuf) -> Result<()> {
                 continue;
             }
             let hwm = fetch_hwm_for_mirror(m).await?;
+            let last_committed = fetch_committed_offset_for_mirror(m).await?;
             let is_main = m
                 .http_access
                 .as_ref()
@@ -532,10 +533,11 @@ async fn run(path: PathBuf) -> Result<()> {
                 topic = %m.topic,
                 partition = m.partition,
                 bootstrap_hwm = hwm,
+                last_committed = ?last_committed,
                 is_main,
                 "registering mirror with cache readiness gate"
             );
-            state.register_mirror(&m.name, hwm, is_main);
+            state.register_mirror(&m.name, hwm, last_committed, is_main);
         }
         Some(state)
     } else {
@@ -639,6 +641,36 @@ async fn fetch_hwm_for_mirror(mirror: &Mirror) -> Result<u64> {
     .with_context(|| format!("mirror {mirror_name}: hwm task join"))?
     .with_context(|| format!("mirror {mirror_name}: fetch high watermark"))?;
     Ok(hwm.max(0) as u64)
+}
+
+/// Read the broker's `__consumer_offsets` for this mirror's group
+/// at startup. `Ok(None)` means the group has no committed value yet
+/// (fresh deploy); the `CacheState` then falls back to
+/// `bootstrap_hwm` for the suppression threshold. Like `fetch_hwm_for_mirror`,
+/// this hits `BaseConsumer` synchronously under `spawn_blocking`.
+async fn fetch_committed_offset_for_mirror(mirror: &Mirror) -> Result<Option<u64>> {
+    let bootstrap = mirror.source.bootstrap_servers.clone();
+    let group_id = mirror
+        .source
+        .group_id
+        .clone()
+        .unwrap_or_else(|| format!("mirror-v3-{}", mirror.name));
+    let topic = mirror.topic.clone();
+    let partition = mirror.partition as i32;
+    let mirror_name = mirror.name.clone();
+    let committed = tokio::task::spawn_blocking(move || {
+        mirror_kafka::fetch_committed_offset(
+            &bootstrap,
+            &group_id,
+            &topic,
+            partition,
+            std::time::Duration::from_secs(10),
+        )
+    })
+    .await
+    .with_context(|| format!("mirror {mirror_name}: committed task join"))?
+    .with_context(|| format!("mirror {mirror_name}: fetch committed offset"))?;
+    Ok(committed)
 }
 
 async fn shutdown_signal(mut rx: tokio::sync::watch::Receiver<bool>) {
