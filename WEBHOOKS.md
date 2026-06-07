@@ -284,30 +284,45 @@ high-water offset. Single-destination mirrors fire on every flush.
 A mirror with no blob destinations (kafka-only) cannot use
 `destination-flush`; validator rejects.
 
-### Bootstrap-hwm suppression
+### Suppression threshold (fresh deploy vs. returning deploy)
 
-Both triggers suppress dispatch for any event whose mirror has not
-yet crossed its bootstrap high-watermark. At supervisor startup,
-each opt-in mirror's source-partition high-watermark is captured
-into `CacheState`'s per-mirror readiness slot; the destination
-write path flips the slot to `caught_up` once the mirror's
-last-applied offset reaches `bootstrap_hwm - 1`. Until that flip,
-`KkvV1Notifier::on_record` drops records on the floor and
-`FlushDispatcher::on_flushed` drops flush events; both bump the
-`mirror_v3_notify_suppressed_records_total{topic,partition}` counter
-so operators can see how much catch-up backlog was skipped. Sticky
-once true.
+Both triggers suppress dispatch for any event below the mirror's
+**suppression threshold**, computed at supervisor startup as:
 
-This matches the legacy kkv Quarkus `KafkaCache.Stage` gate which
-suppressed push notifications until `Polling`, and prevents a cold
-restart against a compacted topic from fanning historical-replay
-updates out to every consumer pod. The same per-mirror slot already
-gates the cache-v1 HTTP surface (503 until ready), so a webhook
-consumer that re-fetches via `/cache/v1/raw/<key>` on the first
-post-flip notify sees a consistent view.
+```
+suppression_threshold = match broker_committed_offset {
+  Some(committed) => committed,   // returning deploy
+  None            => bootstrap_hwm, // fresh deploy
+}
+```
 
-The gate is per-mirror: one mirror can begin emitting webhooks
-while another is still warming up against its own `bootstrap_hwm`.
+- **Fresh deploy** (group has no committed offset on the broker):
+  threshold = source-partition high-watermark. Records during the
+  cold-start replay-to-current window don't fan webhooks out, the
+  same gate the legacy kkv Quarkus `KafkaCache.Stage` provided.
+- **Returning deploy** (group has a previously-committed offset
+  `C`): threshold = `C`. Records in `[C, bootstrap_hwm)` represent
+  the gap between the previous pod's last commit and this pod's
+  startup; they fire webhooks because the previous pod was supposed
+  to deliver them but exited first. Records below `C` are suppressed
+  because the previous pod already delivered them.
+
+The supervisor's periodic commit task writes the consumer's
+progress back to the broker every
+`MIRROR_V3_OFFSET_COMMIT_INTERVAL_MS` (default 5s) so this works
+across restarts. See `DELIVERY_SEMANTICS_REVISIT.md` for the
+original incident report from the first downstream maintainer.
+
+Suppression bumps
+`mirror_v3_notify_suppressed_records_total{topic,partition}` so
+operators see how much was skipped. The gate is per-mirror: one
+mirror can begin emitting webhooks while another is still warming
+up against its own threshold.
+
+A webhook consumer that re-fetches via `/cache/v1/raw/<key>` on the
+first notify is guaranteed a consistent view because the cache
+HTTP surface is gated on the same per-mirror `MirrorStatus::Ready`
+predicate (see `README.md#readiness`).
 
 ### Compatibility / defaults
 

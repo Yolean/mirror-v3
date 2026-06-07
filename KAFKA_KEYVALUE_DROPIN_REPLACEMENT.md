@@ -188,9 +188,9 @@ parity with KKV.
 | ------------------------------------------- | ------------------------------------- |
 | onupdate webhook dispatcher                 | mirror-v3 does not implement (deferred to a future PR). If a current dependent uses Yolean's KKV in sidecar mode and relies on onupdate, mirror-v3 is **not** a drop-in for them yet. |
 | `POST /_admin/v1/shutdown[/{exitcode}]`     | mirror-v3 has it; not compared        |
-| `/q/health` / `/q/health/ready` (Quarkus)   | mirror-v3 does not implement; we expose `/metrics` (Prometheus) on the metrics port instead |
+| `/q/health/ready` (Quarkus)                 | mirror-v3 implements as a drop-in: same path, same `200`/`503` codes, plus a structured `ReadinessReport` JSON body that names any unhealthy mirror by status enum. Existing `@yolean/kafka-keyvalue` Node clients work unchanged. `/q/health` (the wider SmallRye umbrella) is not implemented; we expose `/metrics` (Prometheus) on the metrics port instead |
 | Multi-partition `/cache/v1/offset/{t}/{p}`  | the fixture topic uses 1 partition; the multi-partition case is unit-tested in `mirror-cache`'s handler tests |
-| Readiness 503 timing                        | both serve 503 before catch-up, sticky after; deeper compare would need a controlled-rate producer |
+| Readiness 503 timing                        | KKV: `caught_up` flips false→true once and sticks. mirror-v3: non-sticky — tracks per-mirror lag against the broker high-watermark, source-partition assignment, and per-destination flush progress; falls back to 503 if any of those degrades. Plus a per-destination YAML opt-out (`affects-readiness: false`) for best-effort secondary sinks. |
 
 ## Open
 

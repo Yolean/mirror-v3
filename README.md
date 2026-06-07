@@ -155,7 +155,56 @@ docker run --rm -v "$PWD/examples:/cfg" mirror-v3:dev validate --config /cfg/kaf
 
 ## Operational invariants
 
-- **One process owns at most one mirror per `(topic, partition)`.** Run with `replicas: 1` and `strategy.type: Recreate` in Kubernetes for every mirror-v3 deployment. This is non-negotiable — two writers will race on destination naming and trip the corrupt-chain detector on the next restart.
+- **One process owns at most one mirror per `(topic, partition)`.** Run with `replicas: 1` and either `strategy.type: Recreate` or `RollingUpdate` with `maxSurge: 0` and `maxUnavailable: 1` for every mirror-v3 deployment. This is non-negotiable on two counts:
+    1. **Destination races.** Two writers will race on destination naming and trip the corrupt-chain detector on the next restart.
+    2. **Source-side coordination.** mirror-v3 uses `assign()` instead of `subscribe()` for its Kafka consumer, so there is no consumer-group coordinator deciding which pod owns the partition. Two pods up at once would both consume the same partition and race the consumer-offset commit log.
 - **VersityGW specifically:** `If-None-Match: *` is silently ignored (v1.4.1, POSIX backend, verified in e2e), so the deployment guarantee is the *only* atomicity layer for the cross-process race. AWS S3 honors `If-None-Match: *` and gives API-level atomicity on top of the deployment guarantee.
 - **Any unrecoverable error in any mirror exits the entire process.** Restart correctness is the recovery mechanism; supervision belongs to the orchestrator.
 - **For blob destinations, a `(from, to)` filename/key is the durable "offset"** — atomic rename (FS) or single-shot `PutObject` (S3) makes it visible. The destination listing is the source of truth on startup.
+
+## Readiness
+
+`GET /q/health/ready` returns a structured JSON body in every state:
+
+```json
+{
+  "ready": "ready" | "warming" | "degraded",
+  "mirrors": [
+    {
+      "name": "userstate",
+      "status": "ready" | "warming" | "lag_behind_source"
+              | "source_unassigned" | "destination_lagging",
+      "source": {
+        "topic": "userstate", "partition": 0, "assigned": true,
+        "end_offset": 12345, "last_applied_offset": 12345, "lag": 0
+      },
+      "destination": { "name": "userstate-gcs", "lag": 5 }
+    }
+  ],
+  "unhealthy": ["userstate"]
+}
+```
+
+HTTP status is `200` iff every mirror is `ready`; `503` otherwise. The drop-in `@yolean/kafka-keyvalue` Node client only inspects the status code, so the body is transparent to legacy consumers but greppable for on-call.
+
+Per-mirror `/cache/v1/{mirror}/...` routes return the matching `mirrors[i]` element as the `503` body, so a polling consumer sees a meaningful retry signal instead of opaque `503`.
+
+Tuning:
+
+- `MIRROR_V3_READINESS_LAG` (default `0`) — offsets of lag tolerated before `LagBehindSource` fires.
+- `MIRROR_V3_READINESS_POLL_MS` (default `2000`) — how often each mirror's broker high-watermark + consumer assignment is re-checked. `0` disables the poller.
+- `MIRROR_V3_OFFSET_COMMIT_INTERVAL_MS` (default `5000`) — how often the supervisor commits the consumer's progress back to the broker. `0` disables (the mirror still works but loses the between-pods notify guarantee on the next restart).
+
+Per-destination opt-out:
+
+```yaml
+destinations:
+  - type: filesystem
+    root: /var/lib/mirror-v3
+    # affects-readiness: true   # default
+  - type: kafka
+    bootstrap-servers: ghost-cluster:9092
+    affects-readiness: false   # best-effort secondary
+```
+
+A destination with `affects-readiness: false` still records its `flushed_through` for observability but is skipped when computing `DestinationLagging`. Use it for observability replicas or archival sinks that must not flip consumer-pod readiness when they fall behind.
