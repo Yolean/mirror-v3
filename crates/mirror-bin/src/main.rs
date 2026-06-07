@@ -7,6 +7,7 @@ use clap::{Parser, Subcommand};
 use mirror_config::{Destination, HttpAccess, Mirror};
 
 mod ack_tracker;
+mod readiness_poller;
 use ack_tracker::{
     commit_interval_from_env, spawn_periodic_commit_task, AckTracker, DestAckSlot, FlushAckShim,
     WriteAckShim,
@@ -18,6 +19,10 @@ use mirror_core::{
 use mirror_fs::{FilesystemSink, FilesystemSinkConfig};
 use mirror_kafka::{KafkaSink, KafkaSinkConfig, KafkaSource, KafkaSourceConfig};
 use mirror_s3::{S3Sink, S3SinkConfig};
+use readiness_poller::{
+    readiness_lag_tolerance_from_env, readiness_poll_interval_from_env, spawn_readiness_poller,
+    PollSpec,
+};
 use tracing::Instrument;
 use tracing_subscriber::EnvFilter;
 
@@ -517,7 +522,10 @@ async fn run(path: PathBuf) -> Result<()> {
     // the aggregate /q/health/ready would sit at 503 forever.
     let needs_slot = |m: &Mirror| m.http_access.is_some() || m.notify.is_some();
     let cache_state = if enabled_mirrors.iter().copied().any(needs_slot) {
-        let state = std::sync::Arc::new(mirror_core::CacheState::new());
+        let tolerance = readiness_lag_tolerance_from_env();
+        let state = std::sync::Arc::new(
+            mirror_core::CacheState::new().with_readiness_lag_tolerance(tolerance),
+        );
         for m in &enabled_mirrors {
             if !needs_slot(m) {
                 continue;
@@ -535,9 +543,17 @@ async fn run(path: PathBuf) -> Result<()> {
                 bootstrap_hwm = hwm,
                 last_committed = ?last_committed,
                 is_main,
+                lag_tolerance = tolerance,
                 "registering mirror with cache readiness gate"
             );
-            state.register_mirror(&m.name, hwm, last_committed, is_main);
+            state.register_mirror_with_topic(
+                &m.name,
+                hwm,
+                last_committed,
+                is_main,
+                &m.topic,
+                m.partition,
+            );
         }
         Some(state)
     } else {
@@ -721,10 +737,12 @@ async fn spawn_mirror(
     );
     let source = KafkaSource::open(source_cfg)
         .with_context(|| format!("opening source for mirror {}", mirror.name))?;
-    // Snapshot the commit handle before the run loop takes ownership
-    // of the source; the periodic commit task drives commits via
-    // the handle (which clones an `Arc<StreamConsumer>` internally).
+    // Snapshot two commit handles before the run loop takes
+    // ownership of the source. Each `KafkaCommitHandle` clones the
+    // underlying `Arc<StreamConsumer>` (cheap); the periodic commit
+    // task and the readiness poller each get their own.
     let commit_handle = source.commit_handle();
+    let commit_handle_for_poller = source.commit_handle();
 
     let name = mirror.name.clone();
     let labels = MetricLabels {
@@ -854,6 +872,29 @@ async fn spawn_mirror(
         name.clone(),
         shutdown_rx.clone(),
     );
+
+    // Spawn the per-mirror readiness poller when a cache slot
+    // exists (i.e. the mirror has `http_access` or `notify`). The
+    // poller refreshes the broker end offset for the lag-based
+    // readiness predicate and detects source-assignment loss.
+    if let Some(binding) = cache.as_ref() {
+        let _poller = spawn_readiness_poller(
+            PollSpec {
+                mirror_name: name.clone(),
+                bootstrap_servers: mirror.source.bootstrap_servers.clone(),
+                topic: mirror.topic.clone(),
+                partition: mirror.partition as i32,
+                commit_handle: commit_handle_for_poller,
+                cache: Arc::clone(&binding.state),
+            },
+            readiness_poll_interval_from_env(),
+            shutdown_rx.clone(),
+        );
+    } else {
+        // No cache slot => no readiness gate to drive. Drop the
+        // extra handle.
+        drop(commit_handle_for_poller);
+    }
 
     let destinations_log = dest_descriptions.join(",");
     let notify_log = match &mirror.notify {

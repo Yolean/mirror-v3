@@ -213,6 +213,24 @@ pub struct KafkaCommitHandle {
 }
 
 impl KafkaCommitHandle {
+    /// `true` iff the underlying consumer's `assignment()` currently
+    /// includes the handle's `(topic, partition)`. The supervisor's
+    /// readiness poller uses this to detect assignment loss without
+    /// owning the source.
+    ///
+    /// Synchronous; rdkafka's `assignment()` reads in-memory state
+    /// rather than contacting the broker. Returns `Err` if rdkafka
+    /// reports an error reading the assignment.
+    pub fn current_assignment_includes(&self) -> Result<bool, SourceError> {
+        let tpl = self
+            .consumer
+            .assignment()
+            .map_err(|e| SourceError::Transport(format!("assignment: {e}")))?;
+        // `find_partition` is `None` when the partition isn't in the
+        // current assignment.
+        Ok(tpl.find_partition(&self.topic, self.partition).is_some())
+    }
+
     /// Stage `through` as the next offset to commit. Idempotent and
     /// monotonic: identical to [`Source::commit_through`] but takes
     /// `&self`, so the supervisor's periodic task can call it
