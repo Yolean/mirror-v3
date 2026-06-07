@@ -241,6 +241,40 @@ pub trait Source: Send {
     async fn high_watermark(&mut self) -> Result<u64, SourceError> {
         Ok(u64::MAX)
     }
+
+    /// Mark every source offset strictly below `through` as
+    /// processed. For Kafka, this stages the offset for a subsequent
+    /// `commit_consumer_state` call so a restart of the same
+    /// `group.id` resumes there rather than at the broker's high
+    /// watermark.
+    ///
+    /// Implementations should buffer in memory; the actual broker
+    /// write is driven by the supervisor's periodic commit task. The
+    /// default no-op is correct for mocks and any source without a
+    /// notion of committed state.
+    ///
+    /// Idempotent: callers may pass the same `through` repeatedly.
+    /// Monotonic: implementations must ignore a `through` value
+    /// lower than the last one observed (the supervisor only ever
+    /// advances forward, but the contract makes that explicit so a
+    /// buggy caller can't rewind committed state).
+    async fn commit_through(&mut self, through: u64) -> Result<(), SourceError> {
+        let _ = through;
+        Ok(())
+    }
+
+    /// Read the broker's `__consumer_offsets` for this source's
+    /// (`group.id`, topic, partition). Used at startup to seed the
+    /// suppression threshold and the readiness gate. `Ok(None)`
+    /// means "no committed offset yet" (a fresh group); the default
+    /// is `Ok(None)` for mocks and any source without committed
+    /// state.
+    ///
+    /// Not part of the run loop's hot path; called once per mirror
+    /// at supervisor startup.
+    async fn fetch_committed_offset(&mut self) -> Result<Option<u64>, SourceError> {
+        Ok(None)
+    }
 }
 
 /// A destination for exactly-once mirroring. The sink owns the truth
