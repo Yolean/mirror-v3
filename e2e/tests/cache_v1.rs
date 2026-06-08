@@ -259,7 +259,14 @@ async fn cache_v1_serves_latest_per_key_and_honours_tombstones() {
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
     let spec: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(spec["openapi"], "3.1.0");
-    assert!(spec["paths"]["/cache/v1/raw/{key}"].is_object());
+    // The static OpenAPI documents only the per-mirror paths; the
+    // unprefixed `cache-v1-main` aliases are config-conditional and
+    // intentionally omitted from the spec.
+    assert!(spec["paths"]["/cache/v1/{mirror}/raw/{key}"].is_object());
+    assert!(
+        spec["paths"]["/cache/v1/raw/{key}"].is_null(),
+        "unprefixed cache-v1-main aliases must stay off the static spec"
+    );
 
     mirror.abort();
     let _ = server_shutdown_tx.send(());
