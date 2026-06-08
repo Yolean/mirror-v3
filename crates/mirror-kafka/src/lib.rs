@@ -8,15 +8,16 @@
 
 #![allow(clippy::result_large_err)]
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use mirror_core::{
-    ColumnType, Header, Record, Sink, SinkError, Source, SourceError, TimestampType,
+    ColumnType, Header, Record, Sink, SinkError, Source, SourceError, TimestampType, WriteObserver,
 };
 use rdkafka::config::ClientConfig;
-use rdkafka::consumer::{BaseConsumer, Consumer, StreamConsumer};
+use rdkafka::consumer::{BaseConsumer, CommitMode, Consumer, StreamConsumer};
 use rdkafka::message::{Header as RdHeader, Headers, Message, OwnedHeaders};
 use rdkafka::producer::{FutureProducer, FutureRecord};
 use rdkafka::topic_partition_list::Offset;
@@ -52,6 +53,45 @@ pub fn fetch_low_watermark(
 ) -> Result<i64, KafkaError> {
     let (low, _high) = fetch_watermarks(bootstrap, topic, partition, timeout)?;
     Ok(low)
+}
+
+/// Read the broker's `__consumer_offsets` entry for the
+/// `(group_id, topic, partition)` tuple. `Ok(None)` is the
+/// "no committed value yet" sentinel (a fresh group, or a group
+/// that hasn't committed for this partition). Sync; wrap in
+/// `spawn_blocking` for async contexts. Mirrors the `fetch_*_watermark`
+/// pattern so the supervisor can read the per-mirror committed
+/// offset at startup without instantiating a full `KafkaSource`.
+pub fn fetch_committed_offset(
+    bootstrap: &str,
+    group_id: &str,
+    topic: &str,
+    partition: i32,
+    timeout: Duration,
+) -> Result<Option<u64>, KafkaError> {
+    let consumer: BaseConsumer = ClientConfig::new()
+        .set("bootstrap.servers", bootstrap)
+        .set("group.id", group_id)
+        .set("enable.auto.commit", "false")
+        .create()
+        .map_err(|e| KafkaError::Init(e.to_string()))?;
+    let mut tpl = TopicPartitionList::new();
+    tpl.add_partition(topic, partition);
+    let filled = consumer
+        .committed_offsets(tpl, Timeout::After(timeout))
+        .map_err(|e| KafkaError::Init(format!("committed_offsets: {e}")))?;
+    let elem = filled.find_partition(topic, partition).ok_or_else(|| {
+        KafkaError::Init(format!(
+            "committed_offsets returned no entry for {topic}/{partition}"
+        ))
+    })?;
+    match elem.offset() {
+        Offset::Offset(n) if n >= 0 => Ok(Some(n as u64)),
+        // `Invalid` is librdkafka's "no committed offset for this
+        // group". The other `Offset::*` variants don't appear in a
+        // `committed_offsets` result; treat them as `None`.
+        _ => Ok(None),
+    }
 }
 
 fn fetch_watermarks(
@@ -98,11 +138,17 @@ impl KafkaSourceConfig {
 }
 
 pub struct KafkaSource {
-    consumer: StreamConsumer,
+    consumer: Arc<StreamConsumer>,
     bootstrap_servers: String,
+    group_id: String,
     topic: String,
     partition: i32,
     poll_timeout: Duration,
+    /// Monotonic guard on `commit_through`. Shared with any
+    /// [`KafkaCommitHandle`] handed out via [`Self::commit_handle`]
+    /// so the supervisor's periodic task and any direct trait-method
+    /// caller observe the same "highest staged" value.
+    last_stored_offset: Arc<AtomicU64>,
 }
 
 impl KafkaSource {
@@ -111,6 +157,11 @@ impl KafkaSource {
             .set("bootstrap.servers", &cfg.bootstrap_servers)
             .set("group.id", &cfg.group_id)
             .set("enable.auto.commit", "false")
+            // Required by `store_offsets`: rdkafka rejects manual
+            // offset staging when its auto-store path is also live.
+            // We always commit through `KafkaCommitHandle`, so the
+            // auto-store path is never the right choice here.
+            .set("enable.auto.offset.store", "false")
             .set("auto.offset.reset", "earliest")
             // Note: the Java worker used `max.poll.records=1` for
             // single-record progression; that property is Java-client
@@ -120,13 +171,117 @@ impl KafkaSource {
             .create()
             .map_err(|e| KafkaError::Init(e.to_string()))?;
         Ok(Self {
-            consumer,
+            consumer: Arc::new(consumer),
             bootstrap_servers: cfg.bootstrap_servers,
+            group_id: cfg.group_id,
             topic: cfg.topic,
             partition: cfg.partition,
             poll_timeout: cfg.poll_timeout,
+            last_stored_offset: Arc::new(AtomicU64::new(0)),
         })
     }
+
+    /// Hand the supervisor's periodic commit task a shared handle
+    /// that can stage offsets and flush them to the broker without
+    /// owning the source. The handle shares the same in-memory
+    /// `last_stored_offset` so the monotonicity guard on
+    /// [`Source::commit_through`] applies regardless of which path
+    /// stages the value.
+    pub fn commit_handle(&self) -> KafkaCommitHandle {
+        KafkaCommitHandle {
+            consumer: Arc::clone(&self.consumer),
+            topic: self.topic.clone(),
+            partition: self.partition,
+            last_stored_offset: Arc::clone(&self.last_stored_offset),
+        }
+    }
+}
+
+/// Shared commit-side handle on a [`KafkaSource`]. Holds an `Arc` of
+/// the underlying `StreamConsumer` so the supervisor's periodic
+/// commit task can stage and flush offsets while the run loop holds
+/// the source's `&mut Source` and is busy in `recv()`.
+///
+/// Cloning this is cheap (one `Arc::clone` per shared field) and
+/// safe; every clone observes the same monotonic guard.
+#[derive(Clone)]
+pub struct KafkaCommitHandle {
+    consumer: Arc<StreamConsumer>,
+    topic: String,
+    partition: i32,
+    last_stored_offset: Arc<AtomicU64>,
+}
+
+impl KafkaCommitHandle {
+    /// `true` iff the underlying consumer's `assignment()` currently
+    /// includes the handle's `(topic, partition)`. The supervisor's
+    /// readiness poller uses this to detect assignment loss without
+    /// owning the source.
+    ///
+    /// Synchronous; rdkafka's `assignment()` reads in-memory state
+    /// rather than contacting the broker. Returns `Err` if rdkafka
+    /// reports an error reading the assignment.
+    pub fn current_assignment_includes(&self) -> Result<bool, SourceError> {
+        let tpl = self
+            .consumer
+            .assignment()
+            .map_err(|e| SourceError::Transport(format!("assignment: {e}")))?;
+        // `find_partition` is `None` when the partition isn't in the
+        // current assignment.
+        Ok(tpl.find_partition(&self.topic, self.partition).is_some())
+    }
+
+    /// Stage `through` as the next offset to commit. Idempotent and
+    /// monotonic: identical to [`Source::commit_through`] but takes
+    /// `&self`, so the supervisor's periodic task can call it
+    /// without owning the source.
+    pub fn commit_through(&self, through: u64) -> Result<(), SourceError> {
+        stage_offset(
+            &self.consumer,
+            &self.topic,
+            self.partition,
+            &self.last_stored_offset,
+            through,
+        )
+    }
+
+    /// Flush every staged offset to the broker. Uses
+    /// `CommitMode::Async` so the call returns immediately; the
+    /// actual write happens inside librdkafka's poll thread. The
+    /// supervisor's periodic task calls this after `commit_through`
+    /// and treats the return as best-effort.
+    pub fn commit_pending(&self) -> Result<(), SourceError> {
+        self.consumer
+            .commit_consumer_state(CommitMode::Async)
+            .map_err(|e| SourceError::Transport(format!("commit_consumer_state: {e}")))
+    }
+}
+
+/// Stage `through` as the offset to commit for `(topic, partition)`,
+/// guarded by `last_stored_offset` against rewinds. Shared between
+/// [`Source::commit_through`] (called via `&mut KafkaSource`) and
+/// [`KafkaCommitHandle::commit_through`] (called via `&self`).
+fn stage_offset(
+    consumer: &StreamConsumer,
+    topic: &str,
+    partition: i32,
+    last_stored_offset: &AtomicU64,
+    through: u64,
+) -> Result<(), SourceError> {
+    // CAS-loop monotonicity guard. `fetch_max` reads the current
+    // value, computes the new value (max of current and `through`),
+    // and stores it atomically. If `through` is not higher we no-op.
+    let prev = last_stored_offset.fetch_max(through, Ordering::AcqRel);
+    if through <= prev {
+        return Ok(());
+    }
+    let mut tpl = TopicPartitionList::new();
+    tpl.add_partition_offset(topic, partition, Offset::Offset(through as i64))
+        .map_err(|e| SourceError::Transport(format!("tpl add: {e}")))?;
+    consumer
+        .store_offsets(&tpl)
+        .map_err(|e| SourceError::Transport(format!("store_offsets: {e}")))?;
+    Ok(())
 }
 
 #[async_trait]
@@ -192,6 +347,45 @@ impl Source for KafkaSource {
         .map_err(|e| SourceError::Transport(format!("low_watermark join: {e}")))?
         .map_err(|e| SourceError::Transport(format!("fetch_low_watermark: {e}")))?;
         Ok(low.max(0) as u64)
+    }
+
+    async fn commit_through(&mut self, through: u64) -> Result<(), SourceError> {
+        // Forwards into the shared helper so the trait path and the
+        // `KafkaCommitHandle` path observe the same monotonic guard.
+        // `store_offsets` is non-blocking in librdkafka (in-memory
+        // stage), so no `spawn_blocking` here.
+        stage_offset(
+            &self.consumer,
+            &self.topic,
+            self.partition,
+            &self.last_stored_offset,
+            through,
+        )
+    }
+
+    async fn fetch_committed_offset(&mut self) -> Result<Option<u64>, SourceError> {
+        // Mirrors the `low_watermark` pattern: a fresh `BaseConsumer`
+        // with the same `group.id` drives the metadata + offset
+        // lookup inside a `spawn_blocking`. Delegates to the free
+        // `fetch_committed_offset` helper so the supervisor's
+        // startup path can read the value without instantiating a
+        // full `KafkaSource`.
+        let bootstrap = self.bootstrap_servers.clone();
+        let group_id = self.group_id.clone();
+        let topic = self.topic.clone();
+        let partition = self.partition;
+        tokio::task::spawn_blocking(move || {
+            fetch_committed_offset(
+                &bootstrap,
+                &group_id,
+                &topic,
+                partition,
+                DEFAULT_WATERMARK_TIMEOUT,
+            )
+            .map_err(|e| SourceError::Transport(format!("fetch_committed_offset: {e}")))
+        })
+        .await
+        .map_err(|e| SourceError::Transport(format!("committed join: {e}")))?
     }
 }
 
@@ -287,6 +481,11 @@ pub struct KafkaSink {
     timestamp_mode: TimestampMode,
     keys: ColumnType,
     values: ColumnType,
+    /// Optional observer fired after every successful produce. Wired
+    /// in by the supervisor via [`Sink::set_write_observer`]; default
+    /// `None` so production code unaware of ack tracking keeps the
+    /// existing single-write behaviour.
+    write_observer: Option<Arc<dyn WriteObserver>>,
 }
 
 impl KafkaSink {
@@ -315,6 +514,7 @@ impl KafkaSink {
             timestamp_mode: cfg.timestamp_mode,
             keys: cfg.keys,
             values: cfg.values,
+            write_observer: None,
         })
     }
 
@@ -407,7 +607,18 @@ impl Sink for KafkaSink {
             "partition" => partition,
         )
         .set((delivery.offset as u64 + 1) as f64);
+        // Per-write ack signal. The supervisor's installed observer
+        // bumps the per-destination ack tracker; the source-side
+        // commit task then advances the broker-committed offset up
+        // to the AND of every destination's ack and any notify ack.
+        if let Some(obs) = self.write_observer.as_ref() {
+            obs.on_written(record.source_offset);
+        }
         Ok(())
+    }
+
+    fn set_write_observer(&mut self, observer: Arc<dyn WriteObserver>) {
+        self.write_observer = Some(observer);
     }
 }
 

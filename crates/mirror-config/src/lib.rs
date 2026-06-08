@@ -67,6 +67,16 @@ pub struct KafkaDestination {
     /// the source.
     #[serde(default)]
     pub topic: Option<String>,
+    /// Whether this destination gates the mirror's readiness. When
+    /// `true` (default), the supervisor reports
+    /// `MirrorStatus::DestinationLagging` if this destination falls
+    /// behind the source by more than the configured tolerance,
+    /// and the structured `/q/health/ready` body names the
+    /// destination by `name`. Set `false` for best-effort secondary
+    /// destinations (observability replicas, archival sync) that
+    /// should not flip the mirror's status.
+    #[serde(default = "default_true")]
+    pub affects_readiness: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -79,6 +89,9 @@ pub struct FilesystemDestination {
     pub name: Option<String>,
     /// Absolute path to the destination root directory.
     pub root: PathBuf,
+    /// See [`KafkaDestination::affects_readiness`].
+    #[serde(default = "default_true")]
+    pub affects_readiness: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -99,6 +112,13 @@ pub struct S3Destination {
     /// Key prefix prepended to all written object keys.
     #[serde(default)]
     pub prefix: Option<String>,
+    /// See [`KafkaDestination::affects_readiness`].
+    #[serde(default = "default_true")]
+    pub affects_readiness: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Destination {
@@ -120,6 +140,18 @@ impl Destination {
     /// Kafka destinations, which commit per-record.
     pub fn is_blob(&self) -> bool {
         !matches!(self, Destination::Kafka(_))
+    }
+
+    /// Whether this destination's progress gates the mirror's
+    /// readiness status. When false, the supervisor still tracks
+    /// `flushed_through` for observability but skips the destination
+    /// when computing `MirrorStatus::DestinationLagging`.
+    pub fn affects_readiness(&self) -> bool {
+        match self {
+            Destination::Kafka(k) => k.affects_readiness,
+            Destination::Filesystem(fs) => fs.affects_readiness,
+            Destination::S3(s3) => s3.affects_readiness,
+        }
     }
 }
 
@@ -196,7 +228,7 @@ pub struct Mirror {
     pub http_access: Option<HttpAccess>,
 
     /// Whether mirror-v3 should actually spawn this mirror at
-    /// startup. Defaults to `true`. Plain YAML boolean only —
+    /// startup. Defaults to `true`. Plain YAML boolean only -
     /// `true` / `false` (and the YAML-1.2 case variants
     /// `True`/`False`/`TRUE`/`FALSE`). The YAML-1.1 truthy/falsy
     /// strings (`yes`/`no`/`on`/`off`) are deliberately NOT
@@ -218,6 +250,21 @@ pub struct Mirror {
     /// loudly so a misconfigured deployment doesn't silently idle.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
+
+    /// Opt-in outbound webhook notify. Closes the legacy
+    /// `Yolean/kafka-keyvalue` (kkv) "onupdate" gap: when a record
+    /// lands in the mirror's view, POST to one or more downstream
+    /// services so their in-process caches can invalidate and
+    /// re-fetch via `/cache/v1/raw/<key>`.
+    ///
+    /// Today the only `api` variant is `kkv-v1`, which matches the
+    /// legacy kkv wire contract byte-for-byte so the upstream
+    /// `@yolean/kafka-keyvalue` Node client works unmodified.
+    ///
+    /// See `WEBHOOKS.md` at the repo root for the full design,
+    /// trigger modes, outcome matrix, and DNS-A fan-out semantics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notify: Option<Notify>,
 }
 
 impl Mirror {
@@ -228,26 +275,302 @@ impl Mirror {
     }
 }
 
-/// HTTP read-access block. Today the only variant is the KKV-compatible
-/// `/cache/v1` surface; the field is grouped so future APIs can be
-/// added without re-shaping the YAML.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+// ============================================================
+//   Notify (outbound webhook) - kkv-v1 drop-in for now
+// ============================================================
+
+/// Per-mirror outbound notify block. Today only the `kkv-v1` API
+/// variant is supported; future variants (e.g. `nats-v1`, a
+/// `kkv-v2` with auth) hang off the same block without re-shaping.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
-pub struct HttpAccess {
-    pub api: HttpAccessApi,
+pub struct Notify {
+    pub api: NotifyApi,
+    /// One or more downstream targets. Each target carries its own
+    /// URL and fan-out mode. Multi-target notify fan-out is parallel
+    /// and per-target outcomes resolve independently.
+    pub targets: Vec<NotifyTarget>,
+    #[serde(default)]
+    pub trigger: NotifyTrigger,
+    /// Per-request HTTP timeout. Independent of retry policy: timing
+    /// out is one of the six outcomes whose action is configurable.
+    /// Spec default: 5000 ms.
+    #[serde(default = "default_notify_timeout_ms")]
+    pub timeout_ms: u64,
+    #[serde(default)]
+    pub retry: NotifyRetry,
+    #[serde(default)]
+    pub outcomes: NotifyOutcomes,
 }
 
-/// Variants of the read API surface mirror-v3 will host. Each opt-in
-/// mirror declares which one applies to it; today only `cache-v1`
-/// exists (a drop-in for `Yolean/kafka-keyvalue`'s `/cache/v1`).
+/// The wire-contract variant this notify block speaks. Today only
+/// the legacy kkv shape exists. New variants must explicitly opt
+/// in - kkv-v1 is not the default to avoid silently changing
+/// behaviour if we ever add e.g. a kkv-v2 with auth.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "kebab-case")]
-pub enum HttpAccessApi {
-    /// `/cache/v1/raw/{key}`, `/cache/v1/keys`, `/cache/v1/values`,
-    /// `/cache/v1/offset/{topic}/{partition}`. See the `mirror-cache`
-    /// crate for behavior and the committed OpenAPI 3.1 spec in
-    /// `schemas/mirror-v3.cache.openapi.json`.
-    CacheV1,
+pub enum NotifyApi {
+    /// `POST /kafka-keyvalue/v1/updates` with the legacy kkv body:
+    /// `{ topic, offsets, updates: { <key>: null } }`. Matches the
+    /// `@yolean/kafka-keyvalue` Node client's
+    /// `getOnUpdateRoute()` / `ON_UPDATE_DEFAULT_PATH`.
+    KkvV1,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct NotifyTarget {
+    /// Full URL of the target. Path defaults to
+    /// `/kafka-keyvalue/v1/updates` under `api: kkv-v1` if `path`
+    /// is unset; explicit override is allowed for non-kkv clients.
+    pub url: String,
+    /// Override the URL's path segment. Defaults to the
+    /// api-variant-defined path (`/kafka-keyvalue/v1/updates`
+    /// for kkv-v1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// How the URL's host is resolved. `none` (default) sends one
+    /// POST to a single keep-alive connection; `dns-a` resolves
+    /// the host to its full A/AAAA record set and POSTs to every
+    /// returned address concurrently - the K8s-headless-Service
+    /// fan-out path without a Kubernetes API dependency.
+    #[serde(default)]
+    pub fan_out: FanOut,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum FanOut {
+    /// Standard DNS, single keep-alive connection. Adequate for a
+    /// non-K8s target or a single-replica deployment.
+    #[default]
+    None,
+    /// Resolve the URL's host to all A/AAAA records and POST to
+    /// every address concurrently. Headless Kubernetes Services
+    /// return one A-record per pod, giving the same fan-out the
+    /// legacy kkv did via the Endpoints API.
+    DnsA,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct NotifyTrigger {
+    pub on: TriggerOn,
+    /// Required when `on: source-consume`; forbidden when
+    /// `on: destination-flush` (the destination's own flush
+    /// triggers ARE the debounce in that mode). Defaults to
+    /// `{ max-records: 100, max-time-ms: 250 }`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub debounce: Option<NotifyDebounce>,
+}
+
+impl Default for NotifyTrigger {
+    fn default() -> Self {
+        Self {
+            on: TriggerOn::default(),
+            // `Some(...)` so the YAML-omitted case still has the
+            // spec-default {100, 250} window when source-consume
+            // applies. Validator can still reject explicit
+            // `destination-flush + debounce`.
+            debounce: Some(NotifyDebounce::default()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum TriggerOn {
+    /// POST as soon as the consume loop hands a record to the
+    /// mirror - bounded by the `debounce` window. Default;
+    /// matches legacy kkv behaviour.
+    #[default]
+    SourceConsume,
+    /// POST when *every* destination has durably committed past
+    /// the batch's high-water offset. The notify body's offset
+    /// range matches the flushed snapshot's `from`–`to`. Wrong
+    /// for cache invalidation; right for downstream archival
+    /// hints.
+    DestinationFlush,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct NotifyDebounce {
+    pub max_records: u64,
+    pub max_time_ms: u64,
+}
+
+impl Default for NotifyDebounce {
+    fn default() -> Self {
+        Self {
+            max_records: 100,
+            max_time_ms: 250,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct NotifyRetry {
+    pub max_attempts: u32,
+    pub backoff_ms: u64,
+}
+
+impl Default for NotifyRetry {
+    fn default() -> Self {
+        Self {
+            max_attempts: 5,
+            backoff_ms: 100,
+        }
+    }
+}
+
+fn default_notify_timeout_ms() -> u64 {
+    5000
+}
+
+/// The six request outcomes and what each one means for the mirror.
+/// Per-field omission falls back to the spec-default for that
+/// outcome only (one outcome being explicit doesn't force the
+/// others to be).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct NotifyOutcomes {
+    #[serde(default = "default_outcome_timeout")]
+    pub timeout: NotifyOutcome,
+    #[serde(default = "default_outcome_connrefused")]
+    pub connrefused: NotifyOutcome,
+    /// HTTP 2xx - the only success outcome.
+    #[serde(rename = "2xx", default = "default_outcome_2xx")]
+    pub two_xx: NotifyOutcome,
+    /// HTTP 3xx - almost always misconfiguration on a webhook.
+    #[serde(rename = "3xx", default = "default_outcome_3xx")]
+    pub three_xx: NotifyOutcome,
+    /// HTTP 4xx - receiver says "your request is wrong";
+    /// retrying the same payload doesn't help.
+    #[serde(rename = "4xx", default = "default_outcome_4xx")]
+    pub four_xx: NotifyOutcome,
+    /// HTTP 5xx - receiver is transiently broken; retry per
+    /// policy and fail on exhaustion.
+    #[serde(rename = "5xx", default = "default_outcome_5xx")]
+    pub five_xx: NotifyOutcome,
+}
+
+impl Default for NotifyOutcomes {
+    fn default() -> Self {
+        Self {
+            timeout: default_outcome_timeout(),
+            connrefused: default_outcome_connrefused(),
+            two_xx: default_outcome_2xx(),
+            three_xx: default_outcome_3xx(),
+            four_xx: default_outcome_4xx(),
+            five_xx: default_outcome_5xx(),
+        }
+    }
+}
+
+fn default_outcome_timeout() -> NotifyOutcome {
+    NotifyOutcome {
+        retry: true,
+        final_: FinalAction::Fail,
+    }
+}
+fn default_outcome_connrefused() -> NotifyOutcome {
+    NotifyOutcome {
+        retry: true,
+        final_: FinalAction::Fail,
+    }
+}
+fn default_outcome_2xx() -> NotifyOutcome {
+    NotifyOutcome {
+        retry: false,
+        final_: FinalAction::Accept,
+    }
+}
+fn default_outcome_3xx() -> NotifyOutcome {
+    NotifyOutcome {
+        retry: false,
+        final_: FinalAction::Fail,
+    }
+}
+fn default_outcome_4xx() -> NotifyOutcome {
+    NotifyOutcome {
+        retry: false,
+        final_: FinalAction::Fail,
+    }
+}
+fn default_outcome_5xx() -> NotifyOutcome {
+    NotifyOutcome {
+        retry: true,
+        final_: FinalAction::Fail,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct NotifyOutcome {
+    /// If `true`, the request is retried per [`NotifyRetry`] before
+    /// [`Self::final_`] is applied. If `false`, the action in
+    /// [`Self::final_`] is taken on the first attempt.
+    pub retry: bool,
+    /// What happens once retries (if any) are exhausted.
+    #[serde(rename = "final")]
+    pub final_: FinalAction,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum FinalAction {
+    /// Treat the batch as delivered, advance.
+    Accept,
+    /// Log WARN, drop the batch, advance.
+    Skip,
+    /// Mirror task errors out; orchestrator restarts; mirror
+    /// replays from durable state on restart.
+    Fail,
+}
+
+/// HTTP read-access block. Multiple API surfaces can be enabled on
+/// the same mirror; each is configured by its presence under its
+/// own key. The map shape (rather than the original `{ api: ... }`
+/// enum) lets a mirror opt into more than one API and keeps room
+/// for per-API knobs without further config reshaping.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct HttpAccess {
+    /// `/cache/v1/{mirror}/raw/{key}` etc. mounted at the mirror's
+    /// own name. Required if `cache-v1-main` is set. See the
+    /// `mirror-cache` crate for behavior and the committed OpenAPI
+    /// 3.1 spec in `schemas/mirror-v3.cache.openapi.json`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_v1: Option<CacheV1Config>,
+    /// `/cache/v1/raw/{key}` etc. mounted at the unprefixed path,
+    /// dispatching to this mirror's per-mirror view. At most one
+    /// mirror in the whole config may set this; the validator
+    /// rejects more than one so a `cache-v1-main` consumer sees a
+    /// single deterministic view. Migration aid; once every consumer
+    /// has moved to `/cache/v1/{mirror}/...` it can be removed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_v1_main: Option<CacheV1MainConfig>,
+}
+
+/// Per-API configuration block for `cache-v1`. Empty today, populated
+/// as the field is given operator-tunable knobs.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CacheV1Config {}
+
+/// Per-API configuration block for `cache-v1-main`. Empty today.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CacheV1MainConfig {}
+
+impl HttpAccess {
+    /// `true` if any API surface is enabled. Used at validator and
+    /// supervisor sites that don't care which one.
+    pub fn any_enabled(&self) -> bool {
+        self.cache_v1.is_some() || self.cache_v1_main.is_some()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -351,7 +674,7 @@ pub enum Compaction {
 #[serde(rename_all = "kebab-case")]
 pub enum DestinationFormat {
     /// Apache Parquet. Columnar, embedded schema, compressed.
-    /// Standard data-lake format — readable by DuckDB / Athena /
+    /// Standard data-lake format - readable by DuckDB / Athena /
     /// Spark out of the box.
     #[default]
     Parquet,
@@ -570,16 +893,59 @@ fn validate(cfg: &Config) -> Result<(), LoadError> {
         }
         validate_mirror(m)?;
     }
+    // Cross-mirror: `cache-v1-main` mounts the unprefixed
+    // /cache/v1/... routes onto exactly one mirror's view. Two
+    // mains would race over the same paths so the supervisor would
+    // never know which mirror to dispatch to; reject up front.
+    let mains: Vec<&str> = cfg
+        .mirrors
+        .iter()
+        .filter(|m| {
+            m.http_access
+                .as_ref()
+                .and_then(|h| h.cache_v1_main.as_ref())
+                .is_some()
+        })
+        .map(|m| m.name.as_str())
+        .collect();
+    if mains.len() > 1 {
+        return Err(LoadError::Validation(format!(
+            "`http-access.cache-v1-main` may be set on at most one mirror; \
+             found on: {mains:?}"
+        )));
+    }
     Ok(())
 }
 
+/// Path segments the `/cache/v1/...` router already binds at the
+/// top of the per-mirror tree. A mirror named after one of these
+/// would make `/cache/v1/{mirror}/raw/{key}` ambiguous against the
+/// literal `/cache/v1/keys` etc., so the validator refuses.
+const RESERVED_MIRROR_NAMES_AT_CACHE_V1: &[&str] = &["raw", "offset", "keys", "values"];
+
 fn validate_mirror(m: &Mirror) -> Result<(), LoadError> {
+    // Destinations-empty is allowed ONLY when notify is set with at
+    // least one target (the "notify-only mirror" shape - see
+    // WEBHOOKS.md). Other rules in this function are then either
+    // skipped (everything destination-shaped) or applied with
+    // tighter restrictions (e.g. http-access forbidden).
     if m.destinations.is_empty() {
-        return Err(LoadError::Validation(format!(
-            "mirror {:?}: `destinations` must contain at least one entry",
-            m.name
-        )));
+        let Some(notify) = m.notify.as_ref() else {
+            return Err(LoadError::Validation(format!(
+                "mirror {:?}: `destinations` must contain at least one entry, \
+                 unless `notify` is set (notify-only mirrors are allowed)",
+                m.name
+            )));
+        };
+        if notify.targets.is_empty() {
+            return Err(LoadError::Validation(format!(
+                "mirror {:?}: notify-only mirror requires `notify.targets` to be non-empty",
+                m.name
+            )));
+        }
+        return validate_notify_only(m, notify);
     }
+
     // Per-destination identifiers: explicit `name` is required when a
     // mirror has more than one destination (otherwise the default
     // `mirror.name` would collide). With exactly one destination,
@@ -614,7 +980,10 @@ fn validate_mirror(m: &Mirror) -> Result<(), LoadError> {
             ("compression", m.compression.is_some()),
             ("compaction", m.compaction.is_some()),
             ("flush", m.flush.is_some()),
-            ("http-access", m.http_access.is_some()),
+            (
+                "http-access",
+                m.http_access.as_ref().is_some_and(HttpAccess::any_enabled),
+            ),
         ] {
             if present {
                 return Err(LoadError::Validation(format!(
@@ -659,7 +1028,9 @@ fn validate_mirror(m: &Mirror) -> Result<(), LoadError> {
                 )));
             }
         }
-        if m.http_access.is_some() && matches!(keys.kind, ColumnType::Bytes) {
+        if m.http_access.as_ref().is_some_and(HttpAccess::any_enabled)
+            && matches!(keys.kind, ColumnType::Bytes)
+        {
             return Err(LoadError::Validation(format!(
                 "mirror {:?}: `http-access` requires `keys.type` ∈ {{utf8, json, json-parseable}}; \
                  /cache/v1 routes keys through URL path segments",
@@ -667,7 +1038,188 @@ fn validate_mirror(m: &Mirror) -> Result<(), LoadError> {
             )));
         }
     }
+
+    if let Some(http) = m.http_access.as_ref() {
+        // `cache-v1-main` mounts the unprefixed /cache/v1/... routes
+        // onto this mirror's per-mirror view; it has no value without
+        // the underlying per-mirror surface (and there is no separate
+        // legacy data path).
+        if http.cache_v1_main.is_some() && http.cache_v1.is_none() {
+            return Err(LoadError::Validation(format!(
+                "mirror {:?}: `http-access.cache-v1-main` requires `http-access.cache-v1` \
+                 on the same mirror",
+                m.name
+            )));
+        }
+        // The /cache/v1/{mirror}/raw/{key} router uses {mirror} as a
+        // path parameter directly under /cache/v1/. Names like
+        // `keys` would collide with the literal /cache/v1/keys path
+        // serving cache-v1-main.
+        if http.cache_v1.is_some() && RESERVED_MIRROR_NAMES_AT_CACHE_V1.contains(&m.name.as_str()) {
+            return Err(LoadError::Validation(format!(
+                "mirror {:?}: name collides with a `/cache/v1/...` literal segment ({:?}); \
+                 rename the mirror to enable `http-access.cache-v1`",
+                m.name, RESERVED_MIRROR_NAMES_AT_CACHE_V1
+            )));
+        }
+    }
+
+    // Notify on a mirror with destinations: per WEBHOOKS.md, the
+    // notify body says "go re-read via /cache/v1/raw/<key>". That's
+    // only meaningful when the per-mirror `cache-v1` API is enabled.
+    if let Some(notify) = m.notify.as_ref() {
+        let has_cache_v1 = m.http_access.as_ref().is_some_and(|h| h.cache_v1.is_some());
+        if !has_cache_v1 {
+            return Err(LoadError::Validation(format!(
+                "mirror {:?}: `notify` requires `http-access.cache-v1` on the same \
+                 mirror (the notify body tells consumers to re-read via /cache/v1)",
+                m.name
+            )));
+        }
+        validate_notify_shared(m, notify)?;
+    }
     Ok(())
+}
+
+/// Validation rules that apply to every notify block regardless of
+/// whether the mirror has destinations. URL parses, targets
+/// non-empty, debounce sanity, retry sanity, timeout sanity.
+fn validate_notify_shared(m: &Mirror, notify: &Notify) -> Result<(), LoadError> {
+    if notify.targets.is_empty() {
+        return Err(LoadError::Validation(format!(
+            "mirror {:?}: `notify.targets` must contain at least one entry",
+            m.name
+        )));
+    }
+    for (i, t) in notify.targets.iter().enumerate() {
+        match url::Url::parse(&t.url) {
+            Ok(u) => {
+                let scheme = u.scheme();
+                if scheme != "http" && scheme != "https" {
+                    return Err(LoadError::Validation(format!(
+                        "mirror {:?}: notify.targets[{i}].url must use scheme http or https, \
+                         got {scheme:?}",
+                        m.name
+                    )));
+                }
+                if u.host_str().map(str::is_empty).unwrap_or(true) {
+                    return Err(LoadError::Validation(format!(
+                        "mirror {:?}: notify.targets[{i}].url has no host",
+                        m.name
+                    )));
+                }
+            }
+            Err(e) => {
+                return Err(LoadError::Validation(format!(
+                    "mirror {:?}: notify.targets[{i}].url is not a valid URL: {e}",
+                    m.name
+                )));
+            }
+        }
+    }
+    if notify.timeout_ms < 1 {
+        return Err(LoadError::Validation(format!(
+            "mirror {:?}: `notify.timeout-ms` must be >= 1",
+            m.name
+        )));
+    }
+    if notify.retry.max_attempts < 1 {
+        return Err(LoadError::Validation(format!(
+            "mirror {:?}: `notify.retry.max-attempts` must be >= 1",
+            m.name
+        )));
+    }
+    if notify.retry.backoff_ms < 1 {
+        return Err(LoadError::Validation(format!(
+            "mirror {:?}: `notify.retry.backoff-ms` must be >= 1",
+            m.name
+        )));
+    }
+    match notify.trigger.on {
+        TriggerOn::SourceConsume => {
+            // `debounce` is required (the constructor default
+            // populates it; explicit `debounce: null` is rejected).
+            let debounce = notify.trigger.debounce.as_ref().ok_or_else(|| {
+                LoadError::Validation(format!(
+                    "mirror {:?}: `notify.trigger.debounce` is required when \
+                     `trigger.on: source-consume`",
+                    m.name
+                ))
+            })?;
+            if debounce.max_records < 1 {
+                return Err(LoadError::Validation(format!(
+                    "mirror {:?}: `notify.trigger.debounce.max-records` must be >= 1",
+                    m.name
+                )));
+            }
+            if debounce.max_time_ms < 1 {
+                return Err(LoadError::Validation(format!(
+                    "mirror {:?}: `notify.trigger.debounce.max-time-ms` must be >= 1",
+                    m.name
+                )));
+            }
+        }
+        TriggerOn::DestinationFlush => {
+            // The destination's own flush triggers ARE the debounce
+            // in this mode. Explicit debounce is redundant noise; we
+            // could tolerate it, but rejecting catches typos and
+            // makes the spec's "no `debounce` block applies" rule
+            // observable.
+            if notify.trigger.debounce.is_some() {
+                return Err(LoadError::Validation(format!(
+                    "mirror {:?}: `notify.trigger.debounce` is forbidden when \
+                     `trigger.on: destination-flush`; the destination flush triggers are the \
+                     debounce in that mode",
+                    m.name
+                )));
+            }
+            // The spec also rejects `destination-flush` on kafka-only
+            // mirrors - kafka commits per-record and has no
+            // observable batch flushes. That rule is enforced
+            // transitively here: notify requires http-access, and
+            // http-access is incompatible with kafka-only destinations
+            // (see `has_blob` checks above), so any kafka-only mirror
+            // with a notify block is already rejected with a clearer
+            // message before this point. No separate check needed.
+        }
+    }
+    Ok(())
+}
+
+/// Extra restrictions on top of [`validate_notify_shared`] when the
+/// mirror has no destinations: notify is the only side-effect, so
+/// destination-shaped fields are all forbidden, http-access is
+/// forbidden, and trigger.on must be source-consume.
+fn validate_notify_only(m: &Mirror, notify: &Notify) -> Result<(), LoadError> {
+    for (field, present) in [
+        ("format", m.format.is_some()),
+        ("compression", m.compression.is_some()),
+        ("keys", m.keys.is_some()),
+        ("values", m.values.is_some()),
+        ("compaction", m.compaction.is_some()),
+        ("flush", m.flush.is_some()),
+        ("timestamp-mode", m.timestamp_mode.is_some()),
+        (
+            "http-access",
+            m.http_access.as_ref().is_some_and(HttpAccess::any_enabled),
+        ),
+    ] {
+        if present {
+            return Err(LoadError::Validation(format!(
+                "mirror {:?}: notify-only mirrors (no destinations) cannot set `{field}`; \
+                 there is nothing for it to apply to",
+                m.name
+            )));
+        }
+    }
+    if matches!(notify.trigger.on, TriggerOn::DestinationFlush) {
+        return Err(LoadError::Validation(format!(
+            "mirror {:?}: notify-only mirrors must use `trigger.on: source-consume` \
+             (no destinations to flush)",
+            m.name
+        )));
+    }
+    validate_notify_shared(m, notify)
 }
 
 fn raw_destination_name(d: &Destination) -> Option<&str> {

@@ -1741,6 +1741,7 @@ name = "mirror-bin"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "clap",
  "metrics",
  "metrics-exporter-prometheus",
@@ -1750,6 +1751,7 @@ dependencies = [
  "mirror-envelope",
  "mirror-fs",
  "mirror-kafka",
+ "mirror-notify-kkv",
  "mirror-s3",
  "object_store",
  "serde",
@@ -1789,6 +1791,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "thiserror",
+ "url",
 ]
 
 [[package]]
@@ -1812,13 +1815,16 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "axum",
  "bytes",
  "futures",
  "mirror-cache",
+ "mirror-config",
  "mirror-core",
  "mirror-envelope",
  "mirror-fs",
  "mirror-kafka",
+ "mirror-notify-kkv",
  "mirror-s3",
  "object_store",
  "portpicker",
@@ -1830,6 +1836,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
@@ -1873,6 +1880,27 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "mirror-notify-kkv"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "futures",
+ "indexmap 2.14.0",
+ "metrics",
+ "mirror-config",
+ "mirror-core",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tower",
+ "tracing",
+ "url",
 ]
 
 [[package]]

@@ -1,4 +1,4 @@
-//! `TeeSink` — fan one source consumer's records out to N inner sinks
+//! `TeeSink`: fan one source consumer's records out to N inner sinks
 //! while preserving every inner sink's end-offset invariant.
 //!
 //! ## Why "per-sink heads"
@@ -8,7 +8,7 @@
 //! per-record. At any wall-clock moment three concurrent sinks fed
 //! from the same loop have **different durable positions**. Restart
 //! from that heterogeneous state would crash any inner sink that
-//! couldn't silently drop re-presented records — the Kafka end-offset
+//! couldn't silently drop re-presented records; the Kafka end-offset
 //! gate, in particular, would refuse.
 //!
 //! `TeeSink` solves this by tracking a `head` per inner sink. The tee
@@ -44,11 +44,13 @@
 //! is returned. The supervisor exits non-zero, but the surviving
 //! sinks' tails are durable.
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use futures::future::join_all;
 
 use crate::cache::CacheBinding;
-use crate::{Record, Sink, SinkError};
+use crate::{FlushObserver, Record, Sink, SinkError};
 
 /// One inner sink plus the source offset it will accept next.
 struct InnerSink {
@@ -70,7 +72,7 @@ impl TeeSink {
     /// starting head. The optional cache binding is applied (once
     /// per record) at the top of [`Self::write`].
     ///
-    /// `names` must be unique and in the same order as `sinks` — they
+    /// `names` must be unique and in the same order as `sinks`; they
     /// appear in error/heartbeat logs so an operator can attribute a
     /// per-sink failure back to the destination element in YAML.
     pub async fn open(
@@ -123,7 +125,7 @@ impl Sink for TeeSink {
     async fn next_expected_offset(&mut self) -> Result<u64, SinkError> {
         // Re-query every inner sink so the per-sink heads stay
         // honest. This is only called at startup and on idle by the
-        // run loop, so the O(N) query cost is bounded — it doesn't
+        // run loop, so the O(N) query cost is bounded; it doesn't
         // run per record.
         for inner in self.inners.iter_mut() {
             let head = inner.sink.next_expected_offset().await?;
@@ -174,7 +176,7 @@ impl Sink for TeeSink {
 
         // Concurrent write fanout. We `join_all` over per-sink
         // futures so the slowest inner sink's per-record latency
-        // dominates the tee's per-record cost — sequential calls
+        // dominates the tee's per-record cost; sequential calls
         // would 1000× the fast sinks' wait time for no reason.
         let mut futs = Vec::with_capacity(indices.len());
         // Take the slots' sinks temporarily so we can drive them
@@ -220,7 +222,7 @@ impl Sink for TeeSink {
 
     async fn flush(&mut self) -> Result<(), SinkError> {
         // Concurrent flush. Per-sink errors are logged; the first
-        // error is returned. The other sinks still flush — losing
+        // error is returned. The other sinks still flush; losing
         // sink A's tail buffer should not cost us sink B's tail too.
         let mut futs = Vec::with_capacity(self.inners.len());
         let mut taken: Vec<(usize, String, Box<dyn Sink>)> = Vec::with_capacity(self.inners.len());
@@ -302,6 +304,97 @@ impl Sink for TeeSink {
         }
         Ok(())
     }
+
+    fn set_flush_observer(&mut self, observer: Arc<dyn FlushObserver>) {
+        if self.inners.len() == 1 {
+            // Length-1 tee (the common case for single-destination
+            // mirrors): forward the observer to the only inner sink
+            // unchanged. `from`/`to` flow through verbatim.
+            self.inners[0].sink.set_flush_observer(observer);
+            return;
+        }
+        // Multi-destination: wrap the outer observer with a per-sink
+        // relay + a min-coordinator. The outer observer fires only
+        // when *every* inner sink has committed past a watermark -
+        // matching the spec's "fire when ALL destinations have
+        // committed past the batch's high-water offset".
+        let coordinator = Arc::new(MinFlushCoordinator::new(self.inners.len(), observer));
+        for (sink_index, inner) in self.inners.iter_mut().enumerate() {
+            inner.sink.set_flush_observer(Arc::new(PerSinkRelay {
+                sink_index,
+                coordinator: Arc::clone(&coordinator),
+            }));
+        }
+    }
+}
+
+/// Per-sink wrapper that funnels every inner sink's `on_flushed`
+/// into the shared [`MinFlushCoordinator`]. Used only when the tee
+/// has more than one inner sink.
+struct PerSinkRelay {
+    sink_index: usize,
+    coordinator: Arc<MinFlushCoordinator>,
+}
+
+impl FlushObserver for PerSinkRelay {
+    fn on_flushed(&self, _from: u64, to: u64) {
+        // `from` reported by the inner sink is its own local batch
+        // boundary, not meaningful at the combined-advance level.
+        // The coordinator synthesises a `from` from the previously-
+        // fired watermark.
+        self.coordinator.note(self.sink_index, to);
+    }
+}
+
+/// Tracks per-sink "highest flushed `to`" and fires the outer
+/// observer when `min(per-sink) > last-fired`. Synchronous, std
+/// `Mutex` (the FS/S3 flush sites are async-context but invoke
+/// `on_flushed` synchronously; the coordinator holds locks only
+/// long enough to compute new min and decide to fire).
+struct MinFlushCoordinator {
+    per_sink_flushed_to: std::sync::Mutex<Vec<u64>>,
+    last_fired_to: std::sync::Mutex<Option<u64>>,
+    outer: Arc<dyn FlushObserver>,
+}
+
+impl MinFlushCoordinator {
+    fn new(num_sinks: usize, outer: Arc<dyn FlushObserver>) -> Self {
+        Self {
+            per_sink_flushed_to: std::sync::Mutex::new(vec![0; num_sinks]),
+            last_fired_to: std::sync::Mutex::new(None),
+            outer,
+        }
+    }
+
+    fn note(&self, sink_index: usize, to: u64) {
+        let new_min = {
+            let mut per_sink = self.per_sink_flushed_to.lock().unwrap();
+            if to > per_sink[sink_index] {
+                per_sink[sink_index] = to;
+            }
+            *per_sink.iter().min().unwrap()
+        };
+        // First-fire case: no `last_fired_to` yet, so `from` is the
+        // tee's *initial* combined head; `0` is acceptable for the
+        // bootstrap fire (the receiver only cares about `to`).
+        let to_fire = {
+            let mut last = self.last_fired_to.lock().unwrap();
+            match *last {
+                Some(prev) if new_min > prev => {
+                    *last = Some(new_min);
+                    Some((prev, new_min))
+                }
+                None if new_min > 0 => {
+                    *last = Some(new_min);
+                    Some((0, new_min))
+                }
+                _ => None,
+            }
+        };
+        if let Some((from, to)) = to_fire {
+            self.outer.on_flushed(from, to);
+        }
+    }
 }
 
 /// Owned, no-op sink used as a placeholder when the tee temporarily
@@ -336,6 +429,11 @@ mod tests {
         fail_on_offset: Option<u64>,
         allow_compacted: bool,
         aligned_to: Arc<Mutex<Option<u64>>>,
+        /// The observer the tee installed via `set_flush_observer`,
+        /// if any. Tests fire it explicitly via [`Self::simulate_flush`]
+        /// to drive the tee's per-sink coordinator without needing
+        /// real disk I/O.
+        observer: Arc<Mutex<Option<Arc<dyn crate::FlushObserver>>>>,
     }
 
     impl Recording {
@@ -343,10 +441,12 @@ mod tests {
             let accepted = Arc::new(Mutex::new(Vec::new()));
             let flush_count = Arc::new(Mutex::new(0));
             let aligned_to = Arc::new(Mutex::new(None));
+            let observer = Arc::new(Mutex::new(None));
             let recorder = Recorder {
                 accepted: Arc::clone(&accepted),
                 flush_count: Arc::clone(&flush_count),
                 aligned_to: Arc::clone(&aligned_to),
+                observer: Arc::clone(&observer),
             };
             (
                 Self {
@@ -356,6 +456,7 @@ mod tests {
                     fail_on_offset: None,
                     allow_compacted: false,
                     aligned_to,
+                    observer,
                 },
                 recorder,
             )
@@ -375,6 +476,7 @@ mod tests {
         accepted: Arc<Mutex<Vec<u64>>>,
         flush_count: Arc<Mutex<u32>>,
         aligned_to: Arc<Mutex<Option<u64>>>,
+        observer: Arc<Mutex<Option<Arc<dyn crate::FlushObserver>>>>,
     }
 
     impl Recorder {
@@ -386,6 +488,14 @@ mod tests {
         }
         fn aligned(&self) -> Option<u64> {
             *self.aligned_to.lock().unwrap()
+        }
+        /// Fire the observer the tee installed via
+        /// `set_flush_observer`, simulating a real on-disk flush.
+        /// Tests use this instead of doing real I/O.
+        fn simulate_flush(&self, from: u64, to: u64) {
+            if let Some(obs) = self.observer.lock().unwrap().as_ref() {
+                obs.on_flushed(from, to);
+            }
         }
     }
 
@@ -420,6 +530,9 @@ mod tests {
             *self.aligned_to.lock().unwrap() = Some(low_watermark);
             self.starting_head = low_watermark;
             Ok(())
+        }
+        fn set_flush_observer(&mut self, observer: Arc<dyn crate::FlushObserver>) {
+            *self.observer.lock().unwrap() = Some(observer);
         }
     }
 
@@ -498,7 +611,7 @@ mod tests {
         let (a, _ra) = Recording::new(0);
         let (b, _rb) = Recording::new(0);
         let cache_state = Arc::new(CacheState::new());
-        cache_state.register_mirror("m", 0);
+        cache_state.register_mirror("m", 0, None, false);
         let binding = CacheBinding {
             state: Arc::clone(&cache_state),
             mirror_name: "m".into(),
@@ -525,7 +638,7 @@ mod tests {
         // here we just confirm a single record produced a single
         // visible key.
         assert_eq!(
-            cache_state.snapshot_keys(),
+            cache_state.snapshot_keys_for("m").unwrap(),
             vec!["k0".to_string()],
             "exactly one key materialised from one record"
         );
@@ -572,5 +685,92 @@ mod tests {
         assert_eq!(rb.aligned(), Some(42));
         let head = tee.next_expected_offset().await.unwrap();
         assert_eq!(head, 42, "after align, min(heads) = low_watermark");
+    }
+
+    // ---- FlushObserver wiring through TeeSink ----
+
+    #[derive(Default)]
+    struct RecordingObserver {
+        fires: Mutex<Vec<(u64, u64)>>,
+    }
+
+    impl crate::FlushObserver for RecordingObserver {
+        fn on_flushed(&self, from: u64, to: u64) {
+            self.fires.lock().unwrap().push((from, to));
+        }
+    }
+
+    #[tokio::test]
+    async fn length_one_tee_forwards_observer_unchanged() {
+        let (inner, recorder) = Recording::new(0);
+        let mut tee = TeeSink::open(vec![("only".into(), boxed(inner))], None)
+            .await
+            .unwrap();
+        let obs = Arc::new(RecordingObserver::default());
+        tee.set_flush_observer(obs.clone() as Arc<dyn crate::FlushObserver>);
+
+        // Simulate two FS-style flushes via the recorder's helper.
+        recorder.simulate_flush(0, 9);
+        recorder.simulate_flush(10, 19);
+
+        let fires = obs.fires.lock().unwrap().clone();
+        assert_eq!(
+            fires,
+            vec![(0, 9), (10, 19)],
+            "length-1 tee passes (from, to) through verbatim"
+        );
+    }
+
+    #[tokio::test]
+    async fn multi_sink_tee_fires_only_when_min_advances() {
+        let (a, ra) = Recording::new(0);
+        let (b, rb) = Recording::new(0);
+        let mut tee = TeeSink::open(vec![("a".into(), boxed(a)), ("b".into(), boxed(b))], None)
+            .await
+            .unwrap();
+        let obs = Arc::new(RecordingObserver::default());
+        tee.set_flush_observer(obs.clone() as Arc<dyn crate::FlushObserver>);
+
+        // a flushes 0..9. b hasn't flushed yet → min is still 0,
+        // outer must not fire.
+        ra.simulate_flush(0, 9);
+        assert!(
+            obs.fires.lock().unwrap().is_empty(),
+            "outer must wait for the laggard"
+        );
+
+        // b flushes 0..4. min(9, 4) = 4; fire (0, 4).
+        rb.simulate_flush(0, 4);
+        assert_eq!(obs.fires.lock().unwrap().clone(), vec![(0, 4)]);
+
+        // b catches up to 9. min(9, 9) = 9; fire (4, 9).
+        rb.simulate_flush(5, 9);
+        assert_eq!(obs.fires.lock().unwrap().clone(), vec![(0, 4), (4, 9)]);
+
+        // a races ahead to 19. min(19, 9) = 9; no advance, no fire.
+        ra.simulate_flush(10, 19);
+        assert_eq!(obs.fires.lock().unwrap().clone(), vec![(0, 4), (4, 9)]);
+    }
+
+    #[tokio::test]
+    async fn multi_sink_tee_does_not_re_fire_for_already_seen_watermark() {
+        // Idempotence: a sink reporting the same `to` twice (which
+        // can happen if FS/S3 re-flushes an empty boundary in some
+        // future refactor) must not cause a duplicate outer fire.
+        let (a, ra) = Recording::new(0);
+        let (b, rb) = Recording::new(0);
+        let mut tee = TeeSink::open(vec![("a".into(), boxed(a)), ("b".into(), boxed(b))], None)
+            .await
+            .unwrap();
+        let obs = Arc::new(RecordingObserver::default());
+        tee.set_flush_observer(obs.clone() as Arc<dyn crate::FlushObserver>);
+
+        ra.simulate_flush(0, 5);
+        rb.simulate_flush(0, 5);
+        // First fire at (0, 5).
+        assert_eq!(obs.fires.lock().unwrap().clone(), vec![(0, 5)]);
+        // a re-reports 5; min doesn't advance; no fire.
+        ra.simulate_flush(0, 5);
+        assert_eq!(obs.fires.lock().unwrap().clone(), vec![(0, 5)]);
     }
 }

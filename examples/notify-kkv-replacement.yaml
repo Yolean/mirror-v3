@@ -1,0 +1,55 @@
+# yaml-language-server: $schema=../schemas/mirror-v3.config.schema.json
+#
+# Full kkv replacement: durable Parquet on disk + cache-v1 GET surface
+# + outbound kkv-v1 webhook so consumers know when to invalidate. Drop-
+# in for any service stack still pointing at the legacy
+# `@yolean/kafka-keyvalue` Node client.
+#
+# Per WEBHOOKS.md:
+#   * trigger.on: source-consume   - POST as records arrive (default).
+#   * debounce  {100, 250}         - at most 100 records per POST and
+#                                    no more than 250 ms of staleness.
+#   * outcomes.5xx { retry: true, final: fail }
+#                                  - transient backend trouble retries
+#                                    per `notify.retry`; persistent
+#                                    trouble crashes the mirror so the
+#                                    orchestrator restarts it.
+
+mirrors:
+  - name: user-states
+    source:
+      bootstrap-servers: kafka:9092
+    topic: user-states
+    partition: 0
+    destinations:
+      - type: filesystem
+        root: /var/lib/mirror-v3
+    format: parquet
+    compression: zstd-1
+    http-access:
+      # /cache/v1/user-states/raw/{key} always; the unprefixed
+      # /cache/v1/raw/{key} is the legacy kkv path consumers hit,
+      # served onto this mirror's view via `cache-v1-main`.
+      cache-v1: {}
+      cache-v1-main: {}
+    notify:
+      api: kkv-v1
+      targets:
+        - url: http://user-states-cache-target:8080
+          # `fan-out: dns-a` resolves the headless Service to all pod
+          # IPs and POSTs each. Use `none` for a single-replica
+          # target or a non-K8s consumer behind a single hostname.
+          fan-out: dns-a
+      trigger:
+        on: source-consume
+        debounce:
+          max-records: 100
+          max-time-ms: 250
+      timeout-ms: 5000
+      retry:
+        max-attempts: 5
+        backoff-ms: 100
+    flush:
+      max-time-ms: 60000
+      max-bytes: 67108864
+      max-offsets: 10000

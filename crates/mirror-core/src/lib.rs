@@ -15,19 +15,22 @@
 //!    `next_expected_offset()` and require it to still equal what we
 //!    expect. This catches external topic resets / out-of-band writes.
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use thiserror::Error;
 
 pub mod cache;
 pub mod mock;
 pub mod tee;
+pub mod testing;
 
-pub use cache::{CacheBinding, CacheState};
+pub use cache::{CacheBinding, CacheState, MirrorStatus, MirrorStatusSnapshot};
 pub use tee::TeeSink;
 
 /// Per-mirror Prometheus labels. `topic` and `partition` together
 /// uniquely identify the data stream and join cleanly with broker-
-/// side exporters (kafka_exporter, etc.) — the mirror's operator-
+/// side exporters (kafka_exporter, etc.) - the mirror's operator-
 /// chosen `name` is *not* a metric label, it lives in `tracing`
 /// logs only.
 #[derive(Debug, Clone)]
@@ -210,7 +213,7 @@ pub trait Source: Send {
     async fn seek(&mut self, next_offset: u64) -> Result<(), SourceError>;
 
     /// Wait up to an implementation-defined poll timeout for the next
-    /// record. `Ok(None)` means the window elapsed without one — the
+    /// record. `Ok(None)` means the window elapsed without one - the
     /// loop will use that as a heartbeat to revalidate the sink.
     async fn poll_one(&mut self) -> Result<Option<Record>, SourceError>;
 
@@ -223,10 +226,59 @@ pub trait Source: Send {
     async fn low_watermark(&mut self) -> Result<u64, SourceError> {
         Ok(0)
     }
+
+    /// Highest offset still retained by the source (Kafka "high
+    /// watermark"; i.e. `last_offset + 1` if the source has any
+    /// records, or `0` if it's empty). The run loop doesn't query
+    /// this today - the default `Ok(u64::MAX)` is the
+    /// "always-satisfiable" sentinel, so future spec changes (e.g.
+    /// "fatal if sink_next_expected > source_high_watermark") can be
+    /// added without breaking sources that don't implement it.
+    ///
+    /// Implementations should query the broker rather than caching
+    /// (same contract as [`Self::low_watermark`]). The Kafka source
+    /// wraps the existing `mirror_kafka::fetch_high_watermark` helper.
+    async fn high_watermark(&mut self) -> Result<u64, SourceError> {
+        Ok(u64::MAX)
+    }
+
+    /// Mark every source offset strictly below `through` as
+    /// processed. For Kafka, this stages the offset for a subsequent
+    /// `commit_consumer_state` call so a restart of the same
+    /// `group.id` resumes there rather than at the broker's high
+    /// watermark.
+    ///
+    /// Implementations should buffer in memory; the actual broker
+    /// write is driven by the supervisor's periodic commit task. The
+    /// default no-op is correct for mocks and any source without a
+    /// notion of committed state.
+    ///
+    /// Idempotent: callers may pass the same `through` repeatedly.
+    /// Monotonic: implementations must ignore a `through` value
+    /// lower than the last one observed (the supervisor only ever
+    /// advances forward, but the contract makes that explicit so a
+    /// buggy caller can't rewind committed state).
+    async fn commit_through(&mut self, through: u64) -> Result<(), SourceError> {
+        let _ = through;
+        Ok(())
+    }
+
+    /// Read the broker's `__consumer_offsets` for this source's
+    /// (`group.id`, topic, partition). Used at startup to seed the
+    /// suppression threshold and the readiness gate. `Ok(None)`
+    /// means "no committed offset yet" (a fresh group); the default
+    /// is `Ok(None)` for mocks and any source without committed
+    /// state.
+    ///
+    /// Not part of the run loop's hot path; called once per mirror
+    /// at supervisor startup.
+    async fn fetch_committed_offset(&mut self) -> Result<Option<u64>, SourceError> {
+        Ok(None)
+    }
 }
 
 /// A destination for exactly-once mirroring. The sink owns the truth
-/// about "where we are" — the loop trusts `next_expected_offset`.
+/// about "where we are" - the loop trusts `next_expected_offset`.
 #[async_trait]
 pub trait Sink: Send {
     /// The source offset the destination will accept next. Must be
@@ -292,7 +344,131 @@ pub trait Sink: Send {
         let _ = low_watermark;
         Ok(())
     }
+
+    /// Install a [`FlushObserver`] that will be invoked every time
+    /// this sink durably commits a batch. Used by the
+    /// `notify.trigger.on: destination-flush` dispatch path to learn
+    /// when records are durable on the destination side without
+    /// scraping logs or polling `next_expected_offset`.
+    ///
+    /// Default no-op - sinks without observable flushes (Kafka,
+    /// mocks, in-memory) keep this default and the observer simply
+    /// never fires for them. Blob sinks (FS, S3) override and call
+    /// `observer.on_flushed(from, to)` after every successful
+    /// flush, where `to` is the highest source offset in the
+    /// just-flushed batch and `from` is the lowest. Only one
+    /// observer is supported per sink instance; later installs
+    /// replace earlier ones.
+    fn set_flush_observer(&mut self, _observer: Arc<dyn FlushObserver>) {}
+
+    /// Install a [`WriteObserver`] that fires after every successful
+    /// `write`. Default no-op for sinks where the per-record signal
+    /// is uninteresting or already covered by [`FlushObserver`]
+    /// (FS/S3 buffer multiple records into one flush; the flush
+    /// observer is the right granularity there). Kafka destination
+    /// sinks override and fire on every accepted record, so the
+    /// supervisor's per-destination ack tracker advances per write.
+    fn set_write_observer(&mut self, _observer: Arc<dyn WriteObserver>) {}
 }
+
+/// Observer notified when a sink durably commits a batch. Lives in
+/// `mirror-core` so [`Sink`] implementations (blob and tee) can
+/// invoke it without depending on the notify crate. The webhook
+/// dispatcher in `mirror-notify-kkv` implements this trait.
+///
+/// Synchronous on purpose: a flush is rare relative to records, and
+/// the observer is expected to do something cheap - typically
+/// enqueueing the `(from, to)` pair into an `mpsc` channel that a
+/// dedicated async task drains. Doing the HTTP POST inline would
+/// block the flush path and serialise destinations behind the
+/// receiver's latency.
+pub trait FlushObserver: Send + Sync {
+    /// `from` is the lowest source offset in the just-flushed batch
+    /// (inclusive). `to` is the highest (inclusive). For a tee over
+    /// multiple inner sinks the values are the *combined* advance
+    /// (the min across inner sinks); the observer fires only when
+    /// that min strictly increases.
+    fn on_flushed(&self, from: u64, to: u64);
+}
+
+/// Observer notified after a sink successfully writes a record.
+/// Parallel to [`FlushObserver`] but for per-record signals; Kafka
+/// destination sinks fire this after each accepted produce. Blob
+/// sinks buffer writes so they use `FlushObserver` instead.
+///
+/// Synchronous; implementations are expected to do something cheap
+/// (typically: bump an `AtomicU64` on the supervisor's per-
+/// destination ack tracker).
+pub trait WriteObserver: Send + Sync {
+    /// `source_offset` is the offset the record carried; the
+    /// destination is durable through `source_offset + 1` by the
+    /// time this fires.
+    fn on_written(&self, source_offset: u64);
+}
+
+/// Acknowledgement sink. Receives "everything strictly below
+/// `through` has been delivered" signals from either:
+/// * a notify dispatcher (after a successful drain / POST), or
+/// * a supervisor-installed [`FlushObserver`] / [`WriteObserver`]
+///   shim that translates per-destination flush / write events into
+///   `note_through` calls.
+///
+/// The supervisor's per-mirror ack tracker is the canonical
+/// implementation. The trait lives in `mirror-core` so notify
+/// dispatchers (in `mirror-notify-kkv`) can take a
+/// `Box<dyn AckSink>` without depending on `mirror-bin`.
+///
+/// Synchronous and idempotent. Implementations must guard against
+/// regressions (callers may not be monotonic at the trait surface;
+/// the AckTracker keeps a running maximum).
+pub trait AckSink: Send + Sync {
+    fn note_through(&self, through: u64);
+}
+
+/// Per-mirror observer of records as they flow through the loop.
+/// Used to drive the opt-in `api: kkv-v1` outbound webhook surface
+/// (see `WEBHOOKS.md`) without coupling the run loop to HTTP.
+///
+/// Contract:
+/// - `on_record` is called **after** `sink.write(record)` succeeds.
+///   The loop has already validated the source-offset gate, so the
+///   record is guaranteed to be at the destination's authoritative
+///   next-offset. A `NotifyError` returned here aborts the loop and
+///   surfaces as [`MirrorError::Notify`] - same fail-fast contract as
+///   [`SinkError`].
+/// - `shutdown` is called once on graceful exit, after the final
+///   `sink.flush`. Implementations should drain any buffered webhook
+///   batches synchronously before returning.
+///
+/// Implementations live outside `mirror-core` so this crate stays
+/// HTTP-free. The default impl (no-op) is used by every mirror that
+/// doesn't opt into a `notify:` block in config.
+#[async_trait]
+pub trait Notifier: Send {
+    /// Observe a record that was just successfully written to the
+    /// destination chain. `record` carries the same fields the sink
+    /// saw; implementations should clone what they need and return
+    /// promptly so they don't block the consume loop.
+    async fn on_record(&mut self, record: &Record) -> Result<(), NotifyError> {
+        let _ = record;
+        Ok(())
+    }
+
+    /// Called once on graceful shutdown, after the final `sink.flush`.
+    /// Implementations with debounce/buffer state should flush it here.
+    async fn shutdown(&mut self) -> Result<(), NotifyError> {
+        Ok(())
+    }
+}
+
+/// Zero-cost [`Notifier`] used by every mirror that doesn't configure
+/// a `notify:` block. Keeps the run loop's signature generic without
+/// forcing every caller to plumb a real notifier.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NoOpNotifier;
+
+#[async_trait]
+impl Notifier for NoOpNotifier {}
 
 #[derive(Debug, Error)]
 pub enum SourceError {
@@ -308,12 +484,29 @@ pub enum SinkError {
     Transport(String),
 }
 
+/// Error produced by a [`Notifier`]. `Transport` carries a single
+/// underlying failure (timeout, connrefused, http status…); `Exhausted`
+/// signals that the retry budget was spent without success - the
+/// `final` action in the `notify.outcomes.*` config table (`fail` for
+/// this variant) decides whether the run loop should propagate the
+/// error up. The notifier itself encodes that decision: an `accept` /
+/// `skip` outcome simply returns `Ok(())` and never surfaces here.
+#[derive(Debug, Error)]
+pub enum NotifyError {
+    #[error("notify transport: {0}")]
+    Transport(String),
+    #[error("notify retries exhausted after {attempts} attempt(s): {last_error}")]
+    Exhausted { attempts: u32, last_error: String },
+}
+
 #[derive(Debug, Error)]
 pub enum MirrorError {
     #[error(transparent)]
     Source(#[from] SourceError),
     #[error(transparent)]
     Sink(#[from] SinkError),
+    #[error(transparent)]
+    Notify(#[from] NotifyError),
     /// Source delivered an offset *below* `expected`. Always a hard
     /// error: a Kafka client bug, a producer that rewound, or a
     /// destination chain that has somehow advanced past the broker.
@@ -322,7 +515,7 @@ pub enum MirrorError {
     /// Source delivered an offset *above* `expected`. Hard error in
     /// append mode (would leave a gap in the destination chain).
     /// Recoverable under `compaction: log`: the run loop aligns the
-    /// sink to the delivered offset and continues — the broker's
+    /// sink to the delivered offset and continues - the broker's
     /// `LogStartOffset` reports 0 for a `cleanup.policy=compact`
     /// topic even when the earliest deliverable record is much later
     /// (compaction deduplicates by key but does not advance the
@@ -340,7 +533,7 @@ pub enum MirrorError {
     /// next-expected-offset, and the sink is not willing to skip
     /// records (i.e. it's not a compaction:log destination). This
     /// fires at bootstrap on a compacted or delete-records-trimmed
-    /// source topic when the mirror is configured for append mode —
+    /// source topic when the mirror is configured for append mode -
     /// it would leave a gap in the destination chain, which append
     /// mode forbids.
     #[error(
@@ -357,7 +550,7 @@ pub enum MirrorError {
 }
 
 /// How often the loop emits an INFO-level "heartbeat" log line. This
-/// is the operator's `kubectl logs` heartbeat — without it, a quiet
+/// is the operator's `kubectl logs` heartbeat - without it, a quiet
 /// mirror (no source traffic, or buffered records that haven't
 /// tripped a flush trigger yet) looks indistinguishable from a stuck
 /// one. Override via the `MIRROR_V3_HEARTBEAT_SECS` env var; set to
@@ -384,7 +577,9 @@ pub fn heartbeat_interval_from_env() -> std::time::Duration {
 ///
 /// Heartbeat interval is read from the environment; pass a fixed
 /// interval via [`run_mirror_with_heartbeat`] if you need explicit
-/// control (e.g. tests that want to disable heartbeats).
+/// control (e.g. tests that want to disable heartbeats). Callers that
+/// need to observe records (e.g. webhook fan-out) use
+/// [`run_mirror_with_notifier`].
 pub async fn run_mirror<S, K, F>(source: S, sink: K, shutdown: F) -> Result<(), MirrorError>
 where
     S: Source,
@@ -395,14 +590,37 @@ where
 }
 
 pub async fn run_mirror_with_heartbeat<S, K, F>(
-    mut source: S,
-    mut sink: K,
+    source: S,
+    sink: K,
     shutdown: F,
     heartbeat_interval: std::time::Duration,
 ) -> Result<(), MirrorError>
 where
     S: Source,
     K: Sink,
+    F: std::future::Future<Output = ()> + Send,
+{
+    run_mirror_with_notifier(source, sink, NoOpNotifier, shutdown, heartbeat_interval).await
+}
+
+/// Same as [`run_mirror_with_heartbeat`] but with a caller-supplied
+/// [`Notifier`]. The loop calls `notifier.on_record(&record)` after
+/// every successful `sink.write`, and `notifier.shutdown()` once after
+/// the final `sink.flush` on graceful exit. `NotifyError`s propagate
+/// as [`MirrorError::Notify`] and abort the loop - the notifier itself
+/// is responsible for distinguishing "retryable, eventually accept"
+/// from "fail loudly" per the `notify.outcomes.*` table.
+pub async fn run_mirror_with_notifier<S, K, N, F>(
+    mut source: S,
+    mut sink: K,
+    mut notifier: N,
+    shutdown: F,
+    heartbeat_interval: std::time::Duration,
+) -> Result<(), MirrorError>
+where
+    S: Source,
+    K: Sink,
+    N: Notifier,
     F: std::future::Future<Output = ()> + Send,
 {
     let sink_start = sink.next_expected_offset().await?;
@@ -484,6 +702,7 @@ where
             _ = &mut shutdown => {
                 tracing::info!("shutdown requested; flushing sink");
                 sink.flush().await?;
+                notifier.shutdown().await?;
                 return Ok(());
             }
             _ = async {
@@ -546,7 +765,7 @@ where
                                 // log level here scales with millions
                                 // of lines per restart. Observability
                                 // for gap rate is the dedicated
-                                // counter below — plot a rate or
+                                // counter below - plot a rate or
                                 // alert on a threshold rather than
                                 // reading logs. The startup `loop
                                 // start … compaction="log"` INFO
@@ -567,6 +786,12 @@ where
                                 });
                             }
                         }
+                        // Clone the record so the notifier can observe
+                        // it after the sink has consumed ownership.
+                        // One clone per accepted record is dwarfed by
+                        // the sink I/O cost; if profiling ever flags
+                        // it, add a `Notifier::wants_records` gate.
+                        let record_for_notify = record.clone();
                         sink.write(record).await?;
                         expected = expected
                             .checked_add(1)
@@ -586,6 +811,11 @@ where
                             "partition" => partition.clone(),
                         )
                         .increment(1);
+                        // Notifier observes only after the destination
+                        // chain has accepted the record. A failure
+                        // here aborts the loop and surfaces as
+                        // `MirrorError::Notify`.
+                        notifier.on_record(&record_for_notify).await?;
                     }
                     None => {
                         let current = sink.next_expected_offset().await?;
@@ -635,7 +865,7 @@ mod column_type_tests {
 
     #[test]
     fn json_does_not_parse_payload() {
-        // Valid UTF-8 but not parseable JSON — Json must accept it.
+        // Valid UTF-8 but not parseable JSON - Json must accept it.
         assert!(ColumnType::Json
             .validate("value", 0, Some(b"{this is not json"))
             .is_ok());

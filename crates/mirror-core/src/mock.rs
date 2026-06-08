@@ -1,13 +1,14 @@
 //! Hand-written mocks for testing the mirror loop.
 //!
-//! These are public so downstream crates (notably the e2e harness in
-//! Phase 2) can reuse them, but the API is `#[doc(hidden)]`-ish: it
-//! exists to be shaped by the tests next to it.
+//! These are public so downstream crates (notably the e2e harness)
+//! can reuse them, but the API is `#[doc(hidden)]`-ish: it exists to
+//! be shaped by the tests next to it.
 
 use async_trait::async_trait;
 use std::collections::VecDeque;
+use std::sync::Arc;
 
-use crate::{Record, Sink, SinkError, Source, SourceError, TimestampType};
+use crate::{Record, Sink, SinkError, Source, SourceError, TimestampType, WriteObserver};
 
 /// Scriptable [`Source`] that returns canned events. Records seek
 /// calls and poll results so tests can assert on them.
@@ -15,6 +16,7 @@ pub struct MockSource {
     events: VecDeque<MockSourceEvent>,
     pub seeks: Vec<u64>,
     pub low_watermark: u64,
+    pub high_watermark: u64,
 }
 
 pub enum MockSourceEvent {
@@ -34,6 +36,10 @@ impl MockSource {
             events: events.into_iter().collect(),
             seeks: Vec::new(),
             low_watermark: 0,
+            // Default `u64::MAX` matches the trait's default; no
+            // spec currently rejects on HWM, so the sentinel value
+            // is "always satisfiable."
+            high_watermark: u64::MAX,
         }
     }
 
@@ -41,6 +47,16 @@ impl MockSource {
     /// by tests that simulate a compacted or trimmed source topic.
     pub fn with_low_watermark(mut self, low_watermark: u64) -> Self {
         self.low_watermark = low_watermark;
+        self
+    }
+
+    /// Configure the value returned by [`Source::high_watermark`].
+    /// Used by tests for spec changes that introduce a "sink can't
+    /// exceed source HWM" gate. The default is `u64::MAX` (the
+    /// trait's "always-satisfiable" sentinel) so unrelated tests
+    /// aren't affected.
+    pub fn with_high_watermark(mut self, high_watermark: u64) -> Self {
+        self.high_watermark = high_watermark;
         self
     }
 }
@@ -67,6 +83,10 @@ impl Source for MockSource {
 
     async fn low_watermark(&mut self) -> Result<u64, SourceError> {
         Ok(self.low_watermark)
+    }
+
+    async fn high_watermark(&mut self) -> Result<u64, SourceError> {
+        Ok(self.high_watermark)
     }
 }
 
@@ -100,6 +120,10 @@ pub struct MockSink {
     /// to false (append-mode behaviour) and is set true by tests
     /// simulating a compaction:log destination.
     pub allows_compacted_source: bool,
+    /// Observer fired after every successful `write`. Tests use this
+    /// to assert the per-write ack hook is wired correctly through
+    /// whichever code path is under test.
+    pub write_observer: Option<Arc<dyn WriteObserver>>,
 }
 
 impl MockSink {
@@ -110,6 +134,7 @@ impl MockSink {
             write_error: None,
             running_position: offset,
             allows_compacted_source: false,
+            write_observer: None,
         }
     }
 
@@ -153,8 +178,12 @@ impl Sink for MockSink {
                 actual: record.source_offset,
             });
         }
+        let offset = record.source_offset;
         self.running_position += 1;
         self.writes.push(record);
+        if let Some(obs) = self.write_observer.as_ref() {
+            obs.on_written(offset);
+        }
         Ok(())
     }
 
@@ -167,6 +196,10 @@ impl Sink for MockSink {
         // the next `write()` accepts a record at `low_watermark`.
         self.running_position = low_watermark;
         Ok(())
+    }
+
+    fn set_write_observer(&mut self, observer: Arc<dyn WriteObserver>) {
+        self.write_observer = Some(observer);
     }
 }
 

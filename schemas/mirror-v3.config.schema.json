@@ -133,10 +133,21 @@
           ]
         },
         "enabled": {
-          "description": "Whether mirror-v3 should actually spawn this mirror at\nstartup. Defaults to `true`. Plain YAML boolean only —\n`true` / `false` (and the YAML-1.2 case variants\n`True`/`False`/`TRUE`/`FALSE`). The YAML-1.1 truthy/falsy\nstrings (`yes`/`no`/`on`/`off`) are deliberately NOT\naccepted; operators who want to flip a mirror via env\ninterpolation should write the env value as `true` or\n`false`:\n\n```yaml\n- name: requests\n  enabled: ${REQUESTS_ENABLED:-false}\n  ...\n```\n\nDisabled mirrors are validated the same as enabled ones (so\nflipping `false` → `true` won't surface latent config bugs)\nbut are not spawned, do not register with the cache-v1\nreadiness gate, and do not contribute to source-broker reads.\nIf *every* mirror in a process is disabled, startup fails\nloudly so a misconfigured deployment doesn't silently idle.",
+          "description": "Whether mirror-v3 should actually spawn this mirror at\nstartup. Defaults to `true`. Plain YAML boolean only -\n`true` / `false` (and the YAML-1.2 case variants\n`True`/`False`/`TRUE`/`FALSE`). The YAML-1.1 truthy/falsy\nstrings (`yes`/`no`/`on`/`off`) are deliberately NOT\naccepted; operators who want to flip a mirror via env\ninterpolation should write the env value as `true` or\n`false`:\n\n```yaml\n- name: requests\n  enabled: ${REQUESTS_ENABLED:-false}\n  ...\n```\n\nDisabled mirrors are validated the same as enabled ones (so\nflipping `false` → `true` won't surface latent config bugs)\nbut are not spawned, do not register with the cache-v1\nreadiness gate, and do not contribute to source-broker reads.\nIf *every* mirror in a process is disabled, startup fails\nloudly so a misconfigured deployment doesn't silently idle.",
           "type": [
             "boolean",
             "null"
+          ]
+        },
+        "notify": {
+          "description": "Opt-in outbound webhook notify. Closes the legacy\n`Yolean/kafka-keyvalue` (kkv) \"onupdate\" gap: when a record\nlands in the mirror's view, POST to one or more downstream\nservices so their in-process caches can invalidate and\nre-fetch via `/cache/v1/raw/<key>`.\n\nToday the only `api` variant is `kkv-v1`, which matches the\nlegacy kkv wire contract byte-for-byte so the upstream\n`@yolean/kafka-keyvalue` Node client works unmodified.\n\nSee `WEBHOOKS.md` at the repo root for the full design,\ntrigger modes, outcome matrix, and DNS-A fan-out semantics.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Notify"
+            },
+            {
+              "type": "null"
+            }
           ]
         }
       },
@@ -194,6 +205,11 @@
               ],
               "default": null
             },
+            "affects-readiness": {
+              "description": "Whether this destination gates the mirror's readiness. When\n`true` (default), the supervisor reports\n`MirrorStatus::DestinationLagging` if this destination falls\nbehind the source by more than the configured tolerance,\nand the structured `/q/health/ready` body names the\ndestination by `name`. Set `false` for best-effort secondary\ndestinations (observability replicas, archival sync) that\nshould not flip the mirror's status.",
+              "type": "boolean",
+              "default": true
+            },
             "type": {
               "type": "string",
               "const": "kafka"
@@ -219,6 +235,11 @@
             "root": {
               "description": "Absolute path to the destination root directory.",
               "type": "string"
+            },
+            "affects-readiness": {
+              "description": "See [`KafkaDestination::affects_readiness`].",
+              "type": "boolean",
+              "default": true
             },
             "type": {
               "type": "string",
@@ -264,6 +285,11 @@
               ],
               "default": null
             },
+            "affects-readiness": {
+              "description": "See [`KafkaDestination::affects_readiness`].",
+              "type": "boolean",
+              "default": true
+            },
             "type": {
               "type": "string",
               "const": "s3"
@@ -282,7 +308,7 @@
       "description": "Envelope format for Filesystem and S3 destinations.",
       "oneOf": [
         {
-          "description": "Apache Parquet. Columnar, embedded schema, compressed.\nStandard data-lake format — readable by DuckDB / Athena /\nSpark out of the box.",
+          "description": "Apache Parquet. Columnar, embedded schema, compressed.\nStandard data-lake format - readable by DuckDB / Athena /\nSpark out of the box.",
           "type": "string",
           "const": "parquet"
         },
@@ -441,25 +467,331 @@
       ]
     },
     "HttpAccess": {
-      "description": "HTTP read-access block. Today the only variant is the KKV-compatible\n`/cache/v1` surface; the field is grouped so future APIs can be\nadded without re-shaping the YAML.",
+      "description": "HTTP read-access block. Multiple API surfaces can be enabled on\nthe same mirror; each is configured by its presence under its\nown key. The map shape (rather than the original `{ api: ... }`\nenum) lets a mirror opt into more than one API and keeps room\nfor per-API knobs without further config reshaping.",
+      "type": "object",
+      "properties": {
+        "cache-v1": {
+          "description": "`/cache/v1/{mirror}/raw/{key}` etc. mounted at the mirror's\nown name. Required if `cache-v1-main` is set. See the\n`mirror-cache` crate for behavior and the committed OpenAPI\n3.1 spec in `schemas/mirror-v3.cache.openapi.json`.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CacheV1Config"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "cache-v1-main": {
+          "description": "`/cache/v1/raw/{key}` etc. mounted at the unprefixed path,\ndispatching to this mirror's per-mirror view. At most one\nmirror in the whole config may set this; the validator\nrejects more than one so a `cache-v1-main` consumer sees a\nsingle deterministic view. Migration aid; once every consumer\nhas moved to `/cache/v1/{mirror}/...` it can be removed.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CacheV1MainConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "CacheV1Config": {
+      "description": "Per-API configuration block for `cache-v1`. Empty today, populated\nas the field is given operator-tunable knobs.",
+      "type": "object",
+      "additionalProperties": false
+    },
+    "CacheV1MainConfig": {
+      "description": "Per-API configuration block for `cache-v1-main`. Empty today.",
+      "type": "object",
+      "additionalProperties": false
+    },
+    "Notify": {
+      "description": "Per-mirror outbound notify block. Today only the `kkv-v1` API\nvariant is supported; future variants (e.g. `nats-v1`, a\n`kkv-v2` with auth) hang off the same block without re-shaping.",
       "type": "object",
       "properties": {
         "api": {
-          "$ref": "#/$defs/HttpAccessApi"
+          "$ref": "#/$defs/NotifyApi"
+        },
+        "targets": {
+          "description": "One or more downstream targets. Each target carries its own\nURL and fan-out mode. Multi-target notify fan-out is parallel\nand per-target outcomes resolve independently.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/NotifyTarget"
+          }
+        },
+        "trigger": {
+          "$ref": "#/$defs/NotifyTrigger",
+          "default": {
+            "on": "source-consume",
+            "debounce": {
+              "max-records": 100,
+              "max-time-ms": 250
+            }
+          }
+        },
+        "timeout-ms": {
+          "description": "Per-request HTTP timeout. Independent of retry policy: timing\nout is one of the six outcomes whose action is configurable.\nSpec default: 5000 ms.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0,
+          "default": 5000
+        },
+        "retry": {
+          "$ref": "#/$defs/NotifyRetry",
+          "default": {
+            "max-attempts": 5,
+            "backoff-ms": 100
+          }
+        },
+        "outcomes": {
+          "$ref": "#/$defs/NotifyOutcomes",
+          "default": {
+            "timeout": {
+              "retry": true,
+              "final": "fail"
+            },
+            "connrefused": {
+              "retry": true,
+              "final": "fail"
+            },
+            "2xx": {
+              "retry": false,
+              "final": "accept"
+            },
+            "3xx": {
+              "retry": false,
+              "final": "fail"
+            },
+            "4xx": {
+              "retry": false,
+              "final": "fail"
+            },
+            "5xx": {
+              "retry": true,
+              "final": "fail"
+            }
+          }
         }
       },
       "additionalProperties": false,
       "required": [
-        "api"
+        "api",
+        "targets"
       ]
     },
-    "HttpAccessApi": {
-      "description": "Variants of the read API surface mirror-v3 will host. Each opt-in\nmirror declares which one applies to it; today only `cache-v1`\nexists (a drop-in for `Yolean/kafka-keyvalue`'s `/cache/v1`).",
+    "NotifyApi": {
+      "description": "The wire-contract variant this notify block speaks. Today only\nthe legacy kkv shape exists. New variants must explicitly opt\nin - kkv-v1 is not the default to avoid silently changing\nbehaviour if we ever add e.g. a kkv-v2 with auth.",
       "oneOf": [
         {
-          "description": "`/cache/v1/raw/{key}`, `/cache/v1/keys`, `/cache/v1/values`,\n`/cache/v1/offset/{topic}/{partition}`. See the `mirror-cache`\ncrate for behavior and the committed OpenAPI 3.1 spec in\n`schemas/mirror-v3.cache.openapi.json`.",
+          "description": "`POST /kafka-keyvalue/v1/updates` with the legacy kkv body:\n`{ topic, offsets, updates: { <key>: null } }`. Matches the\n`@yolean/kafka-keyvalue` Node client's\n`getOnUpdateRoute()` / `ON_UPDATE_DEFAULT_PATH`.",
           "type": "string",
-          "const": "cache-v1"
+          "const": "kkv-v1"
+        }
+      ]
+    },
+    "NotifyTarget": {
+      "type": "object",
+      "properties": {
+        "url": {
+          "description": "Full URL of the target. Path defaults to\n`/kafka-keyvalue/v1/updates` under `api: kkv-v1` if `path`\nis unset; explicit override is allowed for non-kkv clients.",
+          "type": "string"
+        },
+        "path": {
+          "description": "Override the URL's path segment. Defaults to the\napi-variant-defined path (`/kafka-keyvalue/v1/updates`\nfor kkv-v1).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "fan-out": {
+          "description": "How the URL's host is resolved. `none` (default) sends one\nPOST to a single keep-alive connection; `dns-a` resolves\nthe host to its full A/AAAA record set and POSTs to every\nreturned address concurrently - the K8s-headless-Service\nfan-out path without a Kubernetes API dependency.",
+          "$ref": "#/$defs/FanOut",
+          "default": "none"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "url"
+      ]
+    },
+    "FanOut": {
+      "oneOf": [
+        {
+          "description": "Standard DNS, single keep-alive connection. Adequate for a\nnon-K8s target or a single-replica deployment.",
+          "type": "string",
+          "const": "none"
+        },
+        {
+          "description": "Resolve the URL's host to all A/AAAA records and POST to\nevery address concurrently. Headless Kubernetes Services\nreturn one A-record per pod, giving the same fan-out the\nlegacy kkv did via the Endpoints API.",
+          "type": "string",
+          "const": "dns-a"
+        }
+      ]
+    },
+    "NotifyTrigger": {
+      "type": "object",
+      "properties": {
+        "on": {
+          "$ref": "#/$defs/TriggerOn"
+        },
+        "debounce": {
+          "description": "Required when `on: source-consume`; forbidden when\n`on: destination-flush` (the destination's own flush\ntriggers ARE the debounce in that mode). Defaults to\n`{ max-records: 100, max-time-ms: 250 }`.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/NotifyDebounce"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "on"
+      ]
+    },
+    "TriggerOn": {
+      "oneOf": [
+        {
+          "description": "POST as soon as the consume loop hands a record to the\nmirror - bounded by the `debounce` window. Default;\nmatches legacy kkv behaviour.",
+          "type": "string",
+          "const": "source-consume"
+        },
+        {
+          "description": "POST when *every* destination has durably committed past\nthe batch's high-water offset. The notify body's offset\nrange matches the flushed snapshot's `from`–`to`. Wrong\nfor cache invalidation; right for downstream archival\nhints.",
+          "type": "string",
+          "const": "destination-flush"
+        }
+      ]
+    },
+    "NotifyDebounce": {
+      "type": "object",
+      "properties": {
+        "max-records": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "max-time-ms": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "max-records",
+        "max-time-ms"
+      ]
+    },
+    "NotifyRetry": {
+      "type": "object",
+      "properties": {
+        "max-attempts": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "backoff-ms": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "max-attempts",
+        "backoff-ms"
+      ]
+    },
+    "NotifyOutcomes": {
+      "description": "The six request outcomes and what each one means for the mirror.\nPer-field omission falls back to the spec-default for that\noutcome only (one outcome being explicit doesn't force the\nothers to be).",
+      "type": "object",
+      "properties": {
+        "timeout": {
+          "$ref": "#/$defs/NotifyOutcome",
+          "default": {
+            "retry": true,
+            "final": "fail"
+          }
+        },
+        "connrefused": {
+          "$ref": "#/$defs/NotifyOutcome",
+          "default": {
+            "retry": true,
+            "final": "fail"
+          }
+        },
+        "2xx": {
+          "description": "HTTP 2xx - the only success outcome.",
+          "$ref": "#/$defs/NotifyOutcome",
+          "default": {
+            "retry": false,
+            "final": "accept"
+          }
+        },
+        "3xx": {
+          "description": "HTTP 3xx - almost always misconfiguration on a webhook.",
+          "$ref": "#/$defs/NotifyOutcome",
+          "default": {
+            "retry": false,
+            "final": "fail"
+          }
+        },
+        "4xx": {
+          "description": "HTTP 4xx - receiver says \"your request is wrong\";\nretrying the same payload doesn't help.",
+          "$ref": "#/$defs/NotifyOutcome",
+          "default": {
+            "retry": false,
+            "final": "fail"
+          }
+        },
+        "5xx": {
+          "description": "HTTP 5xx - receiver is transiently broken; retry per\npolicy and fail on exhaustion.",
+          "$ref": "#/$defs/NotifyOutcome",
+          "default": {
+            "retry": true,
+            "final": "fail"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "NotifyOutcome": {
+      "type": "object",
+      "properties": {
+        "retry": {
+          "description": "If `true`, the request is retried per [`NotifyRetry`] before\n[`Self::final_`] is applied. If `false`, the action in\n[`Self::final_`] is taken on the first attempt.",
+          "type": "boolean"
+        },
+        "final": {
+          "description": "What happens once retries (if any) are exhausted.",
+          "$ref": "#/$defs/FinalAction"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "retry",
+        "final"
+      ]
+    },
+    "FinalAction": {
+      "oneOf": [
+        {
+          "description": "Treat the batch as delivered, advance.",
+          "type": "string",
+          "const": "accept"
+        },
+        {
+          "description": "Log WARN, drop the batch, advance.",
+          "type": "string",
+          "const": "skip"
+        },
+        {
+          "description": "Mirror task errors out; orchestrator restarts; mirror\nreplays from durable state on restart.",
+          "type": "string",
+          "const": "fail"
         }
       ]
     }

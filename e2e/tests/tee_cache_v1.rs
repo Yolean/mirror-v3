@@ -108,7 +108,7 @@ async fn tee_with_cache_v1_serves_latest_per_key_across_both_destinations() {
     assert!(bootstrap_hwm >= 5);
 
     let cache_state = Arc::new(CacheState::new());
-    cache_state.register_mirror("cache-mirror", bootstrap_hwm);
+    cache_state.register_mirror("cache-mirror", bootstrap_hwm, None, true);
     let binding = mirror_core::CacheBinding {
         state: Arc::clone(&cache_state),
         mirror_name: "cache-mirror".into(),

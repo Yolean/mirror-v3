@@ -138,7 +138,7 @@ async fn compare_kkv_and_mirror_v3_cache_v1() {
     // Spin up mirror-v3 in-process. Append mode with cache-v1.
     let root = tempfile::tempdir().expect("tempdir");
     let cache_state = Arc::new(CacheState::new());
-    cache_state.register_mirror("compat", bootstrap_hwm);
+    cache_state.register_mirror("compat", bootstrap_hwm, None, true);
     let mirror_addr = {
         let port = portpicker::pick_unused_port().expect("port");
         std::net::SocketAddr::from(([127, 0, 0, 1], port))

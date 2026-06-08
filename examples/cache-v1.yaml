@@ -1,21 +1,24 @@
 # yaml-language-server: $schema=../schemas/mirror-v3.config.schema.json
 #
 # KKV drop-in: mirror Kafka topics to disk *and* serve the latest
-# value per key over `/cache/v1` on port 8080 (override with
-# `MIRROR_V3_CACHE_PORT`).
+# value per key over `/cache/v1/{mirror}/...` on port 8080 (override
+# with `MIRROR_V3_CACHE_PORT`). At most one mirror per process may
+# additionally opt into `cache-v1-main`, which mounts the unprefixed
+# `/cache/v1/...` paths onto that mirror's view as a migration alias
+# for legacy kkv consumers that don't carry a mirror name in the URL.
 #
 # The mirror does both jobs from the same consume loop:
 #   1. Writes records to disk via the chosen format (Parquet here).
 #      Files grow append-style; they're durable history, not the
 #      cache view itself.
-#   2. Maintains an in-memory `key → latest value` map updated
-#      per-record (decoupled from flush cadence — set flush
+#   2. Maintains a per-mirror in-memory `key → latest value` map
+#      updated per-record (decoupled from flush cadence — set flush
 #      thresholds high to minimise bucket ops without affecting
 #      cache freshness).
 #
 # On restart, mirror-v3 replays the on-disk chain into the in-memory
-# view before flipping `/cache/v1` to ready. KKV semantics: dependents
-# never see a partially-rebuilt cache.
+# view before flipping the mirror's slot to ready. KKV semantics:
+# dependents never see a partially-rebuilt cache.
 #
 # For very large topics where restart replay would be slow, switch
 # to `compaction: log` — the mirror then bootstraps from the latest
@@ -36,7 +39,12 @@ mirrors:
     # requires keys to be utf8 / json / json-parseable (URL-routable).
     # values: { type: json-parseable }
     http-access:
-      api: cache-v1
+      # Per-mirror /cache/v1/user-states/... is always mounted.
+      cache-v1: {}
+      # Also serve the unprefixed /cache/v1/... paths so legacy
+      # kkv consumers that don't yet pass a mirror name keep
+      # working. At most one mirror per process may set this.
+      cache-v1-main: {}
     flush:
       # Long flush window — cache freshness is independent of this;
       # the values are live in memory the instant the consume loop
@@ -45,8 +53,9 @@ mirrors:
       max-bytes: 67108864
       max-offsets: 10000
 
-  # `http-access` works with `compaction: log` too. Both mirrors below
-  # serve into the same /cache/v1 keyspace; their keys must not collide.
+  # A second mirror is fine. It serves its own /cache/v1/orders/...
+  # paths; it cannot also set `cache-v1-main` (validator rejects
+  # >1 mains).
   # - name: orders
   #   source: { bootstrap-servers: kafka:9092 }
   #   topic: orders
@@ -57,7 +66,8 @@ mirrors:
   #   format: parquet
   #   compression: zstd-1
   #   compaction: log
-  #   http-access: { api: cache-v1 }
+  #   http-access:
+  #     cache-v1: {}
   #   flush:
   #     max-time-ms: 60000
   #     max-bytes: 67108864

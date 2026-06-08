@@ -1,0 +1,28 @@
+[package]
+name = "mirror-notify-kkv"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Outbound kkv-v1 webhook notifier for mirror-v3 (drop-in replacement for Yolean/kafka-keyvalue push side)"
+
+[dependencies]
+mirror-core = { workspace = true }
+mirror-config = { workspace = true }
+tokio = { workspace = true, features = ["sync", "time"] }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+reqwest = { workspace = true, features = ["json"] }
+url = { workspace = true }
+indexmap = { workspace = true, features = ["serde"] }
+futures = { workspace = true }
+metrics = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }
+axum = { workspace = true }
+tower = { workspace = true }

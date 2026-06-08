@@ -65,16 +65,18 @@ A minimal PodMonitor for the checkit chart points at port 9090; the standard pro
 
 ### `/cache/v1` (drop-in for `Yolean/kafka-keyvalue`)
 
-Per-mirror opt-in via `http-access: { api: cache-v1 }`. When at least one mirror has it set, `mirror-v3 run` starts a second HTTP server on `0.0.0.0:8080` (override with `MIRROR_V3_CACHE_PORT`) that exposes the KKV `/cache/v1` surface:
+Per-mirror opt-in via `http-access: { cache-v1: {} }`. When at least one mirror has it set, `mirror-v3 run` starts a second HTTP server on `0.0.0.0:8080` (override with `MIRROR_V3_CACHE_PORT`) that exposes the KKV-shaped surface under each opt-in mirror's name:
 
 ```
-GET /cache/v1/raw/{key}                  → value bytes (application/octet-stream), 404 if absent
-GET /cache/v1/offset/{topic}/{partition} → decimal text
-GET /cache/v1/keys                       → newline-separated keys
-GET /cache/v1/values                     → newline-separated raw values
+GET /cache/v1/{mirror}/raw/{key}                  → value bytes (application/octet-stream), 404 if absent
+GET /cache/v1/{mirror}/offset/{topic}/{partition} → decimal text
+GET /cache/v1/{mirror}/keys                       → newline-separated keys
+GET /cache/v1/{mirror}/values                     → newline-separated raw values
 ```
 
-Reads carry `x-kkv-last-seen-offsets: <JSON>` and return **503** until every opt-in mirror has caught up to the source's high-watermark captured at startup — same readiness contract as KKV, so dependents don't transiently see an older state across reloads. The cache view updates per-record from the consume loop, decoupled from disk flush cadence (set `flush.max-time-ms` high to save bucket ops without sacrificing freshness). Updates are monotonic; if a future feature ever rewinds source consumption, the cache stays at the highest offset seen.
+Each mirror owns its own `key → latest-value` view; a key only shows up under the mirror that consumed it. Reads carry `x-kkv-last-seen-offsets: <JSON>` and return **503** until that mirror has caught up to its source's high-watermark captured at startup — same readiness contract as KKV, so dependents don't transiently see an older state across reloads. The view updates per-record from the consume loop, decoupled from disk flush cadence (set `flush.max-time-ms` high to save bucket ops without sacrificing freshness). Updates are monotonic; if a future feature ever rewinds source consumption, the cache stays at the highest offset seen.
+
+To keep existing kkv consumers working unmodified during a migration, **one** mirror per process may additionally set `cache-v1-main: {}`. That mounts the unprefixed `/cache/v1/...` paths onto that mirror's view (alias-only — same handlers, no separate data path). The validator rejects more than one `cache-v1-main` in the config. Mirror names that collide with the literal path segments `raw | offset | keys | values` are rejected.
 
 Also exposed on the same port:
 
@@ -153,7 +155,56 @@ docker run --rm -v "$PWD/examples:/cfg" mirror-v3:dev validate --config /cfg/kaf
 
 ## Operational invariants
 
-- **One process owns at most one mirror per `(topic, partition)`.** Run with `replicas: 1` and `strategy.type: Recreate` in Kubernetes for every mirror-v3 deployment. This is non-negotiable — two writers will race on destination naming and trip the corrupt-chain detector on the next restart.
+- **One process owns at most one mirror per `(topic, partition)`.** Run with `replicas: 1` and either `strategy.type: Recreate` or `RollingUpdate` with `maxSurge: 0` and `maxUnavailable: 1` for every mirror-v3 deployment. This is non-negotiable on two counts:
+    1. **Destination races.** Two writers will race on destination naming and trip the corrupt-chain detector on the next restart.
+    2. **Source-side coordination.** mirror-v3 uses `assign()` instead of `subscribe()` for its Kafka consumer, so there is no consumer-group coordinator deciding which pod owns the partition. Two pods up at once would both consume the same partition and race the consumer-offset commit log.
 - **VersityGW specifically:** `If-None-Match: *` is silently ignored (v1.4.1, POSIX backend, verified in e2e), so the deployment guarantee is the *only* atomicity layer for the cross-process race. AWS S3 honors `If-None-Match: *` and gives API-level atomicity on top of the deployment guarantee.
 - **Any unrecoverable error in any mirror exits the entire process.** Restart correctness is the recovery mechanism; supervision belongs to the orchestrator.
 - **For blob destinations, a `(from, to)` filename/key is the durable "offset"** — atomic rename (FS) or single-shot `PutObject` (S3) makes it visible. The destination listing is the source of truth on startup.
+
+## Readiness
+
+`GET /q/health/ready` returns a structured JSON body in every state:
+
+```json
+{
+  "ready": "ready" | "warming" | "degraded",
+  "mirrors": [
+    {
+      "name": "userstate",
+      "status": "ready" | "warming" | "lag_behind_source"
+              | "source_unassigned" | "destination_lagging",
+      "source": {
+        "topic": "userstate", "partition": 0, "assigned": true,
+        "end_offset": 12345, "last_applied_offset": 12345, "lag": 0
+      },
+      "destination": { "name": "userstate-gcs", "lag": 5 }
+    }
+  ],
+  "unhealthy": ["userstate"]
+}
+```
+
+HTTP status is `200` iff every mirror is `ready`; `503` otherwise. The drop-in `@yolean/kafka-keyvalue` Node client only inspects the status code, so the body is transparent to legacy consumers but greppable for on-call.
+
+Per-mirror `/cache/v1/{mirror}/...` routes return the matching `mirrors[i]` element as the `503` body, so a polling consumer sees a meaningful retry signal instead of opaque `503`.
+
+Tuning:
+
+- `MIRROR_V3_READINESS_LAG` (default `0`) — offsets of lag tolerated before `LagBehindSource` fires.
+- `MIRROR_V3_READINESS_POLL_MS` (default `2000`) — how often each mirror's broker high-watermark + consumer assignment is re-checked. `0` disables the poller.
+- `MIRROR_V3_OFFSET_COMMIT_INTERVAL_MS` (default `5000`) — how often the supervisor commits the consumer's progress back to the broker. `0` disables (the mirror still works but loses the between-pods notify guarantee on the next restart).
+
+Per-destination opt-out:
+
+```yaml
+destinations:
+  - type: filesystem
+    root: /var/lib/mirror-v3
+    # affects-readiness: true   # default
+  - type: kafka
+    bootstrap-servers: ghost-cluster:9092
+    affects-readiness: false   # best-effort secondary
+```
+
+A destination with `affects-readiness: false` still records its `flushed_through` for observability but is skipped when computing `DestinationLagging`. Use it for observability replicas or archival sinks that must not flip consumer-pod readiness when they fall behind.

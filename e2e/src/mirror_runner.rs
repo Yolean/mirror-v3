@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use mirror_core::{run_mirror, MirrorError, TeeSink};
+use mirror_core::{run_mirror, run_mirror_with_notifier, MirrorError, NoOpNotifier, Sink, TeeSink};
 use mirror_fs::{FilesystemSink, FilesystemSinkConfig};
 use mirror_kafka::{KafkaSink, KafkaSinkConfig, KafkaSource, KafkaSourceConfig};
 use mirror_s3::{S3Sink, S3SinkConfig};
@@ -39,7 +39,7 @@ impl MirrorHandle {
     /// Await the task without requesting shutdown. Used by adversarial
     /// tests that expect the mirror to terminate on its own because
     /// of an error (e.g. destination drift detection). Returns
-    /// `Ok(())` only if the mirror exits gracefully — a non-cancelled
+    /// `Ok(())` only if the mirror exits gracefully; a non-cancelled
     /// `Err` is propagated and a cancellation is reported.
     pub async fn wait_for_termination(self) -> Result<()> {
         match self.handle.await {
@@ -353,6 +353,111 @@ pub async fn spawn_kafka_to_s3(spec: S3MirrorSpec) -> Result<MirrorHandle> {
         .await
         .map_err(MirrorError::Sink)?;
         run_mirror(source, tee, signal).await
+    });
+    Ok(MirrorHandle { handle, shutdown })
+}
+
+/// Spawn a kafka → filesystem mirror with a `notify` block attached.
+/// Mirrors `mirror-bin`'s `spawn_mirror` wiring: source-consume
+/// builds a `KkvV1Notifier`; destination-flush builds a
+/// `FlushDispatcher` and attaches it to the TeeSink as a flush
+/// observer.
+pub async fn spawn_kafka_to_fs_with_notify(
+    spec: FsMirrorSpec,
+    notify: mirror_config::Notify,
+) -> Result<MirrorHandle> {
+    let src_cfg = {
+        let mut c = KafkaSourceConfig::new(
+            spec.source_bootstrap,
+            spec.group_id,
+            spec.source_topic.clone(),
+            spec.partition,
+        );
+        c.poll_timeout = Duration::from_millis(500);
+        c
+    };
+    let source = KafkaSource::open(src_cfg).context("open KafkaSource")?;
+    let dest_name = spec.destination_name.clone();
+    let topic = spec.source_topic.clone();
+    let partition = spec.partition;
+    let mirror_name = dest_name.clone();
+    // `KkvV1Notifier::from_config` and `FlushDispatcher::from_config`
+    // need a `CacheState` so the per-mirror suppression gate can read
+    // `is_mirror_ready`. If the caller didn't pass one we build a
+    // fresh state and register this mirror at `bootstrap_hwm = 0` so
+    // the slot is immediately ready — the test scenarios that opt
+    // out of cache binding don't care about suppression timing.
+    let (cache_state, cache_for_tee) = match spec.cache.clone() {
+        Some(binding) => (Arc::clone(&binding.state), Some(binding)),
+        None => {
+            let state = Arc::new(mirror_core::CacheState::new());
+            state.register_mirror(&mirror_name, 0, None, false);
+            (state, None)
+        }
+    };
+    let cache_for_bootstrap = spec.cache.clone();
+    let sink_cfg = FilesystemSinkConfig {
+        root: spec.root,
+        destination_name: spec.destination_name,
+        partition: spec.partition as u32,
+        format: spec.format,
+        compression: spec.compression,
+        keys: spec.keys,
+        values: spec.values,
+        compaction: spec.compaction,
+        cache: cache_for_bootstrap,
+        flush: spec.flush,
+    };
+    let sink = FilesystemSink::open(sink_cfg).context("open FilesystemSink")?;
+    let trigger_mode = notify.trigger.on;
+    let (shutdown, signal) = shutdown_pair();
+    let handle = tokio::spawn(async move {
+        let mut tee = TeeSink::open(
+            vec![(dest_name, Box::new(sink) as Box<dyn Sink>)],
+            cache_for_tee,
+        )
+        .await
+        .map_err(MirrorError::Sink)?;
+
+        match trigger_mode {
+            mirror_config::TriggerOn::SourceConsume => {
+                let notifier = mirror_notify_kkv::KkvV1Notifier::from_config(
+                    &notify,
+                    topic,
+                    partition,
+                    cache_state,
+                    mirror_name,
+                )
+                .map_err(|e| MirrorError::Sink(mirror_core::SinkError::Transport(e.to_string())))?;
+                run_mirror_with_notifier(
+                    source,
+                    tee,
+                    notifier,
+                    signal,
+                    mirror_core::DEFAULT_HEARTBEAT_INTERVAL,
+                )
+                .await
+            }
+            mirror_config::TriggerOn::DestinationFlush => {
+                let dispatcher = mirror_notify_kkv::FlushDispatcher::from_config(
+                    &notify,
+                    topic,
+                    partition,
+                    cache_state,
+                    mirror_name,
+                )
+                .map_err(|e| MirrorError::Sink(mirror_core::SinkError::Transport(e.to_string())))?;
+                tee.set_flush_observer(std::sync::Arc::new(dispatcher));
+                run_mirror_with_notifier(
+                    source,
+                    tee,
+                    NoOpNotifier,
+                    signal,
+                    mirror_core::DEFAULT_HEARTBEAT_INTERVAL,
+                )
+                .await
+            }
+        }
     });
     Ok(MirrorHandle { handle, shutdown })
 }

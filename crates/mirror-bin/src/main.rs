@@ -4,11 +4,25 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use mirror_config::{Destination, Mirror};
-use mirror_core::{run_mirror, MetricLabels, MIRROR_LABELS};
+use mirror_config::{Destination, HttpAccess, Mirror};
+
+mod ack_tracker;
+mod readiness_poller;
+use ack_tracker::{
+    commit_interval_from_env, spawn_periodic_commit_task, AckTracker, DestAckSlot, FlushAckShim,
+    WriteAckShim,
+};
+use mirror_core::{
+    heartbeat_interval_from_env, run_mirror_with_notifier, MetricLabels, NoOpNotifier, Record,
+    Sink, SinkError, MIRROR_LABELS,
+};
 use mirror_fs::{FilesystemSink, FilesystemSinkConfig};
 use mirror_kafka::{KafkaSink, KafkaSinkConfig, KafkaSource, KafkaSourceConfig};
 use mirror_s3::{S3Sink, S3SinkConfig};
+use readiness_poller::{
+    readiness_lag_tolerance_from_env, readiness_poll_interval_from_env, spawn_readiness_poller,
+    PollSpec,
+};
 use tracing::Instrument;
 use tracing_subscriber::EnvFilter;
 
@@ -452,7 +466,7 @@ async fn run(path: PathBuf) -> Result<()> {
     }
     if enabled_mirrors.is_empty() {
         anyhow::bail!(
-            "all {} mirror(s) are disabled (enabled: false); nothing to do — \
+            "all {} mirror(s) are disabled (enabled: false); nothing to do - \
              enable at least one mirror or scale this deployment to zero replicas",
             total_mirrors
         );
@@ -471,7 +485,7 @@ async fn run(path: PathBuf) -> Result<()> {
     // One shutdown channel, cloned per mirror. Listening for Ctrl-C
     // here means SIGINT triggers graceful flush; in containers,
     // SIGTERM will arrive on the same path because tokio's
-    // ctrl_c handler is the platform's INT handler — for full SIGTERM
+    // ctrl_c handler is the platform's INT handler - for full SIGTERM
     // support a unix-signals branch can be added next.
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let signal_tx = shutdown_tx.clone();
@@ -495,37 +509,63 @@ async fn run(path: PathBuf) -> Result<()> {
         }
     }
 
-    // Build a shared CacheState if any *enabled* mirror opted into
-    // http-access. Capture each opt-in mirror's source-partition
-    // high-watermark *now* so the readiness gate flips only after
-    // we've consumed past whatever was already there at startup. (KKV
-    // semantics — dependents must not see a partially-rebuilt cache
-    // after a reload.) Disabled mirrors never register, otherwise
-    // their slot would never flip ready and the whole cache would
-    // sit at 503 forever.
-    let cache_state = if enabled_mirrors.iter().any(|m| m.http_access.is_some()) {
-        let state = std::sync::Arc::new(mirror_core::CacheState::new());
+    // Every *enabled* mirror gets a `CacheState` slot, regardless of
+    // whether it has `http_access` or `notify`. The slot is what the
+    // structured `/q/health/ready` body enumerates; downstream
+    // features (HTTP routes, notify suppression gate, source-commit
+    // task) only attach when the mirror opts into them. Disabled
+    // mirrors never register: otherwise their slot would never flip
+    // ready and the aggregate /q/health/ready would sit at 503
+    // forever. Capture each registered mirror's source-partition
+    // high-watermark *now* so the gate flips only after we've
+    // consumed past whatever was already there at startup (KKV
+    // semantics: dependents must not see a partially-rebuilt cache,
+    // and webhook subscribers must not see historical-replay
+    // invalidations).
+    let cache_state = if enabled_mirrors.is_empty() {
+        None
+    } else {
+        let tolerance = readiness_lag_tolerance_from_env();
+        let state = std::sync::Arc::new(
+            mirror_core::CacheState::new().with_readiness_lag_tolerance(tolerance),
+        );
         for m in &enabled_mirrors {
-            if m.http_access.is_some() {
-                let hwm = fetch_hwm_for_mirror(m).await?;
-                tracing::info!(
-                    mirror = %m.name,
-                    topic = %m.topic,
-                    partition = m.partition,
-                    bootstrap_hwm = hwm,
-                    "registering mirror with cache readiness gate"
-                );
-                state.register_mirror(&m.name, hwm);
-            }
+            let hwm = fetch_hwm_for_mirror(m).await?;
+            let last_committed = fetch_committed_offset_for_mirror(m).await?;
+            let is_main = m
+                .http_access
+                .as_ref()
+                .is_some_and(|h| h.cache_v1_main.is_some());
+            tracing::info!(
+                mirror = %m.name,
+                topic = %m.topic,
+                partition = m.partition,
+                bootstrap_hwm = hwm,
+                last_committed = ?last_committed,
+                is_main,
+                lag_tolerance = tolerance,
+                "registering mirror with cache readiness gate"
+            );
+            state.register_mirror_with_topic(
+                &m.name,
+                hwm,
+                last_committed,
+                is_main,
+                &m.topic,
+                m.partition,
+            );
         }
         Some(state)
-    } else {
-        None
     };
 
-    // Spawn the cache HTTP server if any mirror has opt-in. Server
-    // runs until shutdown_rx flips OR /_admin/v1/shutdown is hit.
-    if let Some(state) = cache_state.as_ref() {
+    // Spawn the cache HTTP server if any mirror opted into a route
+    // surface (`cache-v1` or `cache-v1-main`). Mirrors that only
+    // need the bootstrap-hwm gate (notify-only) don't pull in the
+    // server. Runs until shutdown_rx flips OR /_admin/v1/shutdown is hit.
+    let wants_http_routes = enabled_mirrors
+        .iter()
+        .any(|m| m.http_access.as_ref().is_some_and(HttpAccess::any_enabled));
+    if let (Some(state), true) = (cache_state.as_ref(), wants_http_routes) {
         let addr = cache_listen_addr();
         let state = std::sync::Arc::clone(state);
         let cache_shutdown_rx = shutdown_rx.clone();
@@ -575,19 +615,22 @@ fn cache_listen_addr() -> std::net::SocketAddr {
     std::net::SocketAddr::from(([0, 0, 0, 0], port))
 }
 
-/// Materialise a `CacheBinding` for the given mirror if it has
-/// `http-access` set and the supervisor built a shared CacheState.
+/// Materialise a `CacheBinding` for the given mirror. Every enabled
+/// mirror now registers a slot in the shared CacheState (the
+/// supervisor enumerates them in the structured `/q/health/ready`
+/// body), so the binding is materialised whenever a `CacheState`
+/// exists at all. The binding wires the consume loop's TeeSink to
+/// that slot so `apply_record` advances the slot's
+/// `last_applied_offset` and flips the readiness gate at the right
+/// point.
 fn mirror_cache_binding(
     mirror: &Mirror,
     cache: Option<&std::sync::Arc<mirror_core::CacheState>>,
 ) -> Option<mirror_core::CacheBinding> {
-    match (mirror.http_access.as_ref(), cache) {
-        (Some(_), Some(state)) => Some(mirror_core::CacheBinding {
-            state: std::sync::Arc::clone(state),
-            mirror_name: mirror.name.clone(),
-        }),
-        _ => None,
-    }
+    cache.map(|state| mirror_core::CacheBinding {
+        state: std::sync::Arc::clone(state),
+        mirror_name: mirror.name.clone(),
+    })
 }
 
 /// Per-mirror bootstrap watermark. Run in a `spawn_blocking` task
@@ -612,6 +655,36 @@ async fn fetch_hwm_for_mirror(mirror: &Mirror) -> Result<u64> {
     Ok(hwm.max(0) as u64)
 }
 
+/// Read the broker's `__consumer_offsets` for this mirror's group
+/// at startup. `Ok(None)` means the group has no committed value yet
+/// (fresh deploy); the `CacheState` then falls back to
+/// `bootstrap_hwm` for the suppression threshold. Like `fetch_hwm_for_mirror`,
+/// this hits `BaseConsumer` synchronously under `spawn_blocking`.
+async fn fetch_committed_offset_for_mirror(mirror: &Mirror) -> Result<Option<u64>> {
+    let bootstrap = mirror.source.bootstrap_servers.clone();
+    let group_id = mirror
+        .source
+        .group_id
+        .clone()
+        .unwrap_or_else(|| format!("mirror-v3-{}", mirror.name));
+    let topic = mirror.topic.clone();
+    let partition = mirror.partition as i32;
+    let mirror_name = mirror.name.clone();
+    let committed = tokio::task::spawn_blocking(move || {
+        mirror_kafka::fetch_committed_offset(
+            &bootstrap,
+            &group_id,
+            &topic,
+            partition,
+            std::time::Duration::from_secs(10),
+        )
+    })
+    .await
+    .with_context(|| format!("mirror {mirror_name}: committed task join"))?
+    .with_context(|| format!("mirror {mirror_name}: fetch committed offset"))?;
+    Ok(committed)
+}
+
 async fn shutdown_signal(mut rx: tokio::sync::watch::Receiver<bool>) {
     if *rx.borrow() {
         return;
@@ -621,7 +694,7 @@ async fn shutdown_signal(mut rx: tokio::sync::watch::Receiver<bool>) {
 
 /// Install the Prometheus exporter on `0.0.0.0:<port>`. Port defaults
 /// to 9090; override with `MIRROR_V3_METRICS_PORT` (set to `0` to
-/// disable). A failure to bind logs at warn level and is non-fatal —
+/// disable). A failure to bind logs at warn level and is non-fatal -
 /// the operator's observability story degrades, but the mirror keeps
 /// running.
 fn install_metrics_exporter() {
@@ -660,6 +733,12 @@ async fn spawn_mirror(
     );
     let source = KafkaSource::open(source_cfg)
         .with_context(|| format!("opening source for mirror {}", mirror.name))?;
+    // Snapshot two commit handles before the run loop takes
+    // ownership of the source. Each `KafkaCommitHandle` clones the
+    // underlying `Arc<StreamConsumer>` (cheap); the periodic commit
+    // task and the readiness poller each get their own.
+    let commit_handle = source.commit_handle();
+    let commit_handle_for_poller = source.commit_handle();
 
     let name = mirror.name.clone();
     let labels = MetricLabels {
@@ -669,27 +748,170 @@ async fn spawn_mirror(
     let compaction = compaction_label(mirror.compaction);
 
     // Build one inner Sink per destination, then wrap them in a tee.
-    // The single-destination case routes through a length-1 tee too —
+    // The single-destination case routes through a length-1 tee too -
     // this keeps the cache binding's per-record fanout on a single
-    // code path.
-    let mut inners: Vec<(String, Box<dyn mirror_core::Sink>)> =
-        Vec::with_capacity(mirror.destinations.len());
+    // code path. A *notify-only* mirror (no destinations + a notify
+    // block, validated upstream) wraps a single in-memory
+    // [`NotifyOnlySink`] in the tee so the rest of the run loop -
+    // bootstrap, low-watermark alignment, idle-drift checks - keeps
+    // its existing shape.
+    let mut inners: Vec<(String, Box<dyn Sink>)> = Vec::with_capacity(
+        // +1 reserved for the notify-only path; harmless when
+        // destinations is non-empty.
+        mirror.destinations.len().max(1),
+    );
     let mut dest_descriptions: Vec<String> = Vec::with_capacity(mirror.destinations.len());
+    // Per-destination ack slots, shared by Arc with the shims
+    // installed on each inner sink and with the AckTracker that the
+    // periodic commit task reads. `affects_readiness` is set from the
+    // YAML `affects-readiness:` field on each destination (default
+    // true): a destination with `affects-readiness: false` still
+    // records `flushed_through` for observability but is skipped when
+    // computing `MirrorStatus::DestinationLagging`.
+    let mut dest_ack_slots: Vec<Arc<DestAckSlot>> = Vec::with_capacity(mirror.destinations.len());
     for dest in &mirror.destinations {
         let inner_name = dest.effective_name(&mirror.name);
         let kind = destination_type(dest);
         dest_descriptions.push(format!("{inner_name}({kind})"));
-        let sink: Box<dyn mirror_core::Sink> =
+        let mut sink: Box<dyn Sink> =
             open_inner_sink(dest, &mirror, &inner_name, cache.as_ref()).await?;
+        let slot = Arc::new(DestAckSlot::new(
+            inner_name.clone(),
+            dest.affects_readiness(),
+        ));
+        // Pick the right observer hook per destination type. Blob
+        // sinks fire `FlushObserver` per buffered flush; Kafka sinks
+        // commit per-record and fire `WriteObserver`. The shim feeds
+        // the destination ack slot in either case.
+        //
+        // Note: when destination-flush trigger is enabled (only on
+        // mirrors with at least one blob destination), the tee-level
+        // `set_flush_observer` call further down replaces the per-
+        // sink FlushObserver installed here with a tee-coordinated
+        // version. That's intentional: in destination-flush mode the
+        // notify ack is authoritative for source-side commits, so
+        // losing the per-destination ack signal for blob sinks is
+        // acceptable.
+        match dest {
+            Destination::Kafka(_) => {
+                sink.set_write_observer(Arc::new(WriteAckShim {
+                    dest: Arc::clone(&slot),
+                }));
+            }
+            Destination::Filesystem(_) | Destination::S3(_) => {
+                sink.set_flush_observer(Arc::new(FlushAckShim {
+                    dest: Arc::clone(&slot),
+                }));
+            }
+        }
+        dest_ack_slots.push(slot);
         inners.push((inner_name, sink));
     }
-    let tee = mirror_core::TeeSink::open(inners, cache.clone())
+    if inners.is_empty() {
+        // Notify-only mirror: spec says "On every startup the source
+        // seeks to the broker's low watermark". `NotifyOnlySink`
+        // declares `allows_compacted_source = true` so the run loop's
+        // bootstrap branch aligns the (in-memory) head to
+        // `low_watermark`. The notifier sees every record from there
+        // forward.
+        inners.push((
+            "notify-only".to_string(),
+            Box::new(NotifyOnlySink::default()) as Box<dyn Sink>,
+        ));
+        dest_descriptions.push("notify-only".to_string());
+    }
+    let mut tee = mirror_core::TeeSink::open(inners, cache.clone())
         .await
         .map_err(|e| anyhow::anyhow!("opening tee for mirror {name}: {e}"))?;
 
+    // Build the per-mirror ack tracker. Notify-side slot exists iff
+    // the mirror has a `notify:` block; destinations always
+    // contribute (commit 9 wires `affects-readiness` to filter).
+    let notify_present = mirror.notify.is_some();
+    let ack_tracker = Arc::new(AckTracker::new(notify_present, dest_ack_slots));
+
+    // Branch on the notify trigger mode (validated upstream in
+    // mirror-config; see WEBHOOKS.md § Trigger):
+    //   * source-consume → build `KkvV1Notifier`, pass as the run
+    //     loop's `N: Notifier`.
+    //   * destination-flush → build `FlushDispatcher`, attach as the
+    //     TeeSink's `FlushObserver`; the run loop's notifier is
+    //     `NoOpNotifier` (records flow through unobserved).
+    //
+    // In both modes the notifier's `with_ack_sink` installs the
+    // per-mirror `AckTracker` so each successful drain/POST feeds
+    // the periodic commit task's view of "delivered through N".
+    let trigger_mode = mirror.notify.as_ref().map(|n| n.trigger.on);
+    let ack_sink_for_notifier: Arc<dyn mirror_core::AckSink> =
+        Arc::clone(&ack_tracker) as Arc<dyn mirror_core::AckSink>;
+    let notifier_opt = match trigger_mode {
+        Some(mirror_config::TriggerOn::SourceConsume) => {
+            build_source_consume_notifier(&mirror, cache.as_ref())?
+                .map(|n| n.with_ack_sink(Arc::clone(&ack_sink_for_notifier)))
+        }
+        _ => None,
+    };
+    if matches!(
+        trigger_mode,
+        Some(mirror_config::TriggerOn::DestinationFlush)
+    ) {
+        let dispatcher = build_flush_dispatcher(&mirror, cache.as_ref())?
+            .with_ack_sink(Arc::clone(&ack_sink_for_notifier));
+        tee.set_flush_observer(std::sync::Arc::new(dispatcher));
+    }
+
+    // Spawn the periodic source-commit task. It reads
+    // `AckTracker::commit_offset()` every
+    // `MIRROR_V3_OFFSET_COMMIT_INTERVAL_MS` (default 5 s), stages
+    // it via the Kafka commit handle, and flushes to the broker.
+    // The handle clones an `Arc<StreamConsumer>` internally so this
+    // task runs independently of the source-owning run loop.
+    let _commit_task = spawn_periodic_commit_task(
+        commit_handle,
+        Arc::clone(&ack_tracker),
+        commit_interval_from_env(),
+        name.clone(),
+        shutdown_rx.clone(),
+    );
+
+    // Spawn the per-mirror readiness poller when a cache slot
+    // exists (i.e. the mirror has `http_access` or `notify`). The
+    // poller refreshes the broker end offset for the lag-based
+    // readiness predicate and detects source-assignment loss.
+    if let Some(binding) = cache.as_ref() {
+        let _poller = spawn_readiness_poller(
+            PollSpec {
+                mirror_name: name.clone(),
+                bootstrap_servers: mirror.source.bootstrap_servers.clone(),
+                topic: mirror.topic.clone(),
+                partition: mirror.partition as i32,
+                commit_handle: commit_handle_for_poller,
+                cache: Arc::clone(&binding.state),
+            },
+            readiness_poll_interval_from_env(),
+            shutdown_rx.clone(),
+        );
+    } else {
+        // No cache slot => no readiness gate to drive. Drop the
+        // extra handle.
+        drop(commit_handle_for_poller);
+    }
+
     let destinations_log = dest_descriptions.join(",");
+    let notify_log = match &mirror.notify {
+        Some(n) => {
+            let targets: Vec<&str> = n.targets.iter().map(|t| t.url.as_str()).collect();
+            let trigger = match n.trigger.on {
+                mirror_config::TriggerOn::SourceConsume => "source-consume",
+                mirror_config::TriggerOn::DestinationFlush => "destination-flush",
+            };
+            format!(" notify=kkv-v1[{}] trigger={trigger}", targets.join(","))
+        }
+        None => String::new(),
+    };
+
     // Single span carries `mirror = <name>` onto every event emitted
-    // from the spawned task — including the mirror-core logs
+    // from the spawned task - including the mirror-core logs
     // (`starting mirror`, `heartbeat`, etc.) that don't otherwise have
     // access to the operator-chosen mirror name. MIRROR_LABELS still
     // carries topic+partition for metric labeling separately.
@@ -699,14 +921,38 @@ async fn spawn_mirror(
             tracing::info!(
                 destinations = %destinations_log,
                 compaction,
+                notify = %notify_log,
                 "loop start"
             );
-            let result = MIRROR_LABELS
-                .scope(
-                    labels,
-                    run_mirror(source, tee, shutdown_signal(shutdown_rx)),
-                )
-                .await;
+            let heartbeat = heartbeat_interval_from_env();
+            let shutdown = shutdown_signal(shutdown_rx);
+            // Match-on-notifier so the generic `N: Notifier`
+            // monomorphises with the right concrete type per branch
+            // without a `Box<dyn Notifier>` allocation.
+            let result = match notifier_opt {
+                Some(n) => {
+                    MIRROR_LABELS
+                        .scope(
+                            labels,
+                            run_mirror_with_notifier(source, tee, n, shutdown, heartbeat),
+                        )
+                        .await
+                }
+                None => {
+                    MIRROR_LABELS
+                        .scope(
+                            labels,
+                            run_mirror_with_notifier(
+                                source,
+                                tee,
+                                NoOpNotifier,
+                                shutdown,
+                                heartbeat,
+                            ),
+                        )
+                        .await
+                }
+            };
             match result {
                 Ok(()) => Ok(()),
                 Err(e) => Err(anyhow::anyhow!("mirror {name}: {e}")),
@@ -714,6 +960,121 @@ async fn spawn_mirror(
         }
         .instrument(span),
     ))
+}
+
+/// Construct the `KkvV1Notifier` for a mirror with
+/// `trigger.on: source-consume`. Returns `None` when the mirror has
+/// no notify block or uses a different trigger (the supervisor
+/// handles the destination-flush case via [`build_flush_dispatcher`]).
+/// Failures bubble up so the supervisor refuses to spawn a mirror
+/// whose webhook surface can't possibly work.
+///
+/// `cache` carries the shared `CacheState` and the per-mirror name
+/// used by the notifier's bootstrap_hwm suppression gate.
+/// `mirror-config` validation requires `http-access: cache-v1`
+/// whenever `notify` is set, so this binding is always present for
+/// any mirror that reaches this branch.
+fn build_source_consume_notifier(
+    mirror: &Mirror,
+    cache: Option<&mirror_core::CacheBinding>,
+) -> Result<Option<mirror_notify_kkv::KkvV1Notifier>> {
+    let Some(notify) = mirror.notify.as_ref() else {
+        return Ok(None);
+    };
+    let binding = cache.ok_or_else(|| {
+        anyhow::anyhow!(
+            "mirror {} has notify but no cache binding; validator should reject this",
+            mirror.name
+        )
+    })?;
+    // Only kkv-v1 exists today; validator rejects other api: values.
+    let notifier = mirror_notify_kkv::KkvV1Notifier::from_config(
+        notify,
+        mirror.topic.clone(),
+        mirror.partition as i32,
+        std::sync::Arc::clone(&binding.state),
+        binding.mirror_name.clone(),
+    )
+    .with_context(|| format!("building notify dispatcher for mirror {}", mirror.name))?;
+    Ok(Some(notifier))
+}
+
+/// Construct the `FlushDispatcher` for a mirror with
+/// `trigger.on: destination-flush`. Validator guarantees the mirror
+/// has notify set; this asserts on the trigger variant.
+fn build_flush_dispatcher(
+    mirror: &Mirror,
+    cache: Option<&mirror_core::CacheBinding>,
+) -> Result<mirror_notify_kkv::FlushDispatcher> {
+    let notify = mirror
+        .notify
+        .as_ref()
+        .expect("build_flush_dispatcher called with no notify block");
+    debug_assert!(matches!(
+        notify.trigger.on,
+        mirror_config::TriggerOn::DestinationFlush
+    ));
+    let binding = cache.ok_or_else(|| {
+        anyhow::anyhow!(
+            "mirror {} has notify but no cache binding; validator should reject this",
+            mirror.name
+        )
+    })?;
+    let dispatcher = mirror_notify_kkv::FlushDispatcher::from_config(
+        notify,
+        mirror.topic.clone(),
+        mirror.partition as i32,
+        std::sync::Arc::clone(&binding.state),
+        binding.mirror_name.clone(),
+    )
+    .with_context(|| {
+        format!(
+            "building notify flush dispatcher for mirror {}",
+            mirror.name
+        )
+    })?;
+    Ok(dispatcher)
+}
+
+/// In-memory sink for `destinations: []` notify-only mirrors. Holds
+/// only its own "next expected offset" and accepts any record at or
+/// above it. `allows_compacted_source = true` so the run loop's
+/// bootstrap branch can align the head to the broker's low
+/// watermark - matching the spec's "seeks to low watermark on every
+/// startup" behaviour for notify-only mirrors.
+#[derive(Debug, Default)]
+struct NotifyOnlySink {
+    position: u64,
+}
+
+#[async_trait::async_trait]
+impl Sink for NotifyOnlySink {
+    async fn next_expected_offset(&mut self) -> Result<u64, SinkError> {
+        Ok(self.position)
+    }
+
+    async fn write(&mut self, record: Record) -> Result<(), SinkError> {
+        if record.source_offset < self.position {
+            return Err(SinkError::UnexpectedPosition {
+                expected: self.position,
+                actual: record.source_offset,
+            });
+        }
+        // Accept forward gaps under compaction:log; bump position to
+        // `record.source_offset + 1`. Matches the loosened write
+        // contract in `mirror-fs` / `mirror-s3` for compacted sources.
+        self.position = record.source_offset + 1;
+        Ok(())
+    }
+
+    fn allows_compacted_source(&self) -> bool {
+        true
+    }
+
+    async fn align_to_source_low_watermark(&mut self, low_watermark: u64) -> Result<(), SinkError> {
+        self.position = low_watermark;
+        Ok(())
+    }
 }
 
 async fn open_inner_sink(

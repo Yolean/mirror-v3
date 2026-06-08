@@ -1,0 +1,49 @@
+# yaml-language-server: $schema=../schemas/mirror-v3.config.schema.json
+#
+# `trigger.on: destination-flush`. Fire one POST per durable blob
+# flush. Use case from WEBHOOKS.md: downstream consumers that care
+# about durability over freshness (e.g. an archival sync job that
+# wants "tell me when a parquet file lands so I can copy it
+# elsewhere"). Not appropriate for cache invalidation, since
+# destination flush cadence is typically minutes.
+#
+# Body shape per flush:
+#   POST /kafka-keyvalue/v1/updates
+#   { "topic": "...", "offsets": { "<partition>": <highest-offset> },
+#     "updates": {} }
+#
+# `updates: {}` is intentional. Destination-flush doesn't accumulate
+# record keys; the offset alone tells the consumer everything they
+# need to act on the just-landed file.
+
+mirrors:
+  - name: archival-feed
+    source:
+      bootstrap-servers: kafka:9092
+    topic: events
+    partition: 0
+    destinations:
+      - type: filesystem
+        root: /var/lib/mirror-v3
+    format: parquet
+    compression: zstd-1
+    http-access:
+      cache-v1: {}
+    notify:
+      api: kkv-v1
+      targets:
+        - url: http://archival-sync:8080
+          fan-out: none
+      trigger:
+        on: destination-flush
+        # No `debounce` block; the destination's flush triggers
+        # ARE the debounce in this mode. Validator rejects an
+        # explicit debounce here.
+      timeout-ms: 5000
+      retry:
+        max-attempts: 5
+        backoff-ms: 100
+    flush:
+      max-time-ms: 60000
+      max-bytes: 67108864
+      max-offsets: 10000

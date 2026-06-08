@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "mirror-v3 cache",
-    "description": "Drop-in HTTP surface for Yolean/kafka-keyvalue's /cache/v1. The state is a merged in-memory `key → latest-value` view across every mirror with `http-access: { api: cache-v1 }`. Updates are per-record from the consume loop; reads return 503 until every registered mirror has caught up to its startup high-watermark.",
+    "description": "Drop-in HTTP surface for Yolean/kafka-keyvalue's /cache/v1. Each opt-in mirror (`http-access.cache-v1`) owns its own in-memory `key → latest-value` view, exposed under `/cache/v1/{mirror}/...`. A single mirror may additionally opt into `cache-v1-main`, which mounts the unprefixed `/cache/v1/...` paths onto its view as a migration alias for legacy kkv consumers; these unprefixed routes are config-conditional and intentionally omitted from this spec. Updates are per-record from the consume loop; reads return 503 until the target mirror has caught up to its startup high-watermark.",
     "license": {
       "name": "Apache-2.0",
       "identifier": "Apache-2.0"
@@ -15,7 +15,7 @@
         "tags": [
           "admin"
         ],
-        "summary": "POST /_admin/v1/shutdown — request graceful exit.",
+        "summary": "POST /_admin/v1/shutdown; request graceful exit.",
         "operationId": "admin_shutdown",
         "responses": {
           "202": {
@@ -29,7 +29,7 @@
         "tags": [
           "admin"
         ],
-        "summary": "POST /_admin/v1/shutdown/{exitcode} — request graceful exit with a specific code.",
+        "summary": "POST /_admin/v1/shutdown/{exitcode}; request graceful exit with a specific code.",
         "operationId": "admin_shutdown_with_exit_code",
         "parameters": [
           {
@@ -50,14 +50,25 @@
         }
       }
     },
-    "/cache/v1/keys": {
+    "/cache/v1/{mirror}/keys": {
       "get": {
         "tags": [
           "cache"
         ],
-        "summary": "GET /cache/v1/keys — newline-separated key list, every line\n(including the last) terminated by `\\n`. Order is the order each\nkey was first seen by the cache (insertion order).",
-        "description": "`Content-Type` is `application/octet-stream` to match KKV's\nbyte-for-byte response shape. A possible future enhancement (gated\non operator demand) is to surface the topic schema in the content\ntype — see the `values` handler for the same hook.",
+        "summary": "GET /cache/v1/{mirror}/keys; newline-separated key list for the\nnamed mirror's view. Every line (including the last) is\nterminated by `\\n`. Order is insertion order (the position a key\ngets the *first* time the mirror sees it).",
+        "description": "`Content-Type` is `application/octet-stream` to match KKV's\nbyte-for-byte response shape.",
         "operationId": "keys",
+        "parameters": [
+          {
+            "name": "mirror",
+            "in": "path",
+            "description": "Name of the `http-access.cache-v1` mirror to read from",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": "Newline-separated keys (UTF-8, trailing newline included)",
@@ -74,20 +85,39 @@
               }
             }
           },
+          "404": {
+            "description": "Mirror unknown"
+          },
           "503": {
-            "description": "Cache is not yet caught up to the source"
+            "description": "Mirror is not currently Ready; body is a MirrorReadiness object",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MirrorReadiness"
+                }
+              }
+            }
           }
         }
       }
     },
-    "/cache/v1/offset/{topic}/{partition}": {
+    "/cache/v1/{mirror}/offset/{topic}/{partition}": {
       "get": {
         "tags": [
           "cache"
         ],
-        "summary": "GET /cache/v1/offset/{topic}/{partition} — last-seen offset.",
+        "summary": "GET /cache/v1/{mirror}/offset/{topic}/{partition}; last-seen\noffset for that (topic, partition) within the named mirror.",
         "operationId": "offset_for_partition",
         "parameters": [
+          {
+            "name": "mirror",
+            "in": "path",
+            "description": "Name of the `http-access.cache-v1` mirror to read from",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
           {
             "name": "topic",
             "in": "path",
@@ -111,7 +141,7 @@
         ],
         "responses": {
           "200": {
-            "description": "Decimal offset of the last applied record, or empty if none yet",
+            "description": "Decimal offset of the last applied record on this mirror, or empty if none yet",
             "content": {
               "text/plain": {
                 "schema": {
@@ -122,18 +152,30 @@
           },
           "400": {
             "description": "Empty topic"
+          },
+          "404": {
+            "description": "Mirror unknown"
           }
         }
       }
     },
-    "/cache/v1/raw/{key}": {
+    "/cache/v1/{mirror}/raw/{key}": {
       "get": {
         "tags": [
           "cache"
         ],
-        "summary": "GET /cache/v1/raw/{key} — fetch a value by key.",
+        "summary": "GET /cache/v1/{mirror}/raw/{key}; fetch a value by key from the\nnamed mirror's view. The unprefixed `/cache/v1/raw/{key}` alias\nis mounted by `build_router` when one mirror opted into\n`http-access.cache-v1-main`, and dispatches here with that\nmirror's name.",
         "operationId": "raw_by_key",
         "parameters": [
+          {
+            "name": "mirror",
+            "in": "path",
+            "description": "Name of the `http-access.cache-v1` mirror to read from",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
           {
             "name": "key",
             "in": "path",
@@ -164,22 +206,39 @@
             "description": "Empty or invalid key"
           },
           "404": {
-            "description": "Key not in cache"
+            "description": "Mirror unknown, or key not in cache"
           },
           "503": {
-            "description": "Cache is not yet caught up to the source"
+            "description": "Mirror is not currently Ready; body is a MirrorReadiness object",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MirrorReadiness"
+                }
+              }
+            }
           }
         }
       }
     },
-    "/cache/v1/values": {
+    "/cache/v1/{mirror}/values": {
       "get": {
         "tags": [
           "cache"
         ],
-        "summary": "GET /cache/v1/values — newline-separated values (raw bytes).\nOrder matches `/cache/v1/keys`. Every line — including the last —\nis terminated by `\\n`. Binary-safe **only** when none of the values\ncontain a `0x0A` byte; binary topics should pin\n`values: { type: bytes-base64 }` so the cache returns the\nbase64-encoded form here.",
-        "description": "`Content-Type` is `text/plain; charset=utf-8` regardless of the\nconfigured value type. Future work — gated on operator demand —\nis to adapt the response content type to the topic schema:\n\n| `values.type`        | proposed `Content-Type`            |\n| -------------------- | ---------------------------------- |\n| `bytes-base64`       | `application/octet-stream`         |\n| `utf8`               | `text/plain; charset=utf-8`        |\n| `json` / `json-parseable` | `application/x-ndjson`        |\n\nNot implemented today to keep parity with KKV's\n`text/plain;charset=UTF-8` (mirror-v3 emits the RFC-normalised\nequivalent).",
+        "summary": "GET /cache/v1/{mirror}/values; newline-separated values for the\nnamed mirror's view, in `keys` order. Binary-safe **only** when\nnone of the values contain a `0x0A` byte; binary topics should\npin `values: { type: bytes-base64 }` so the cache returns the\nbase64-encoded form here.",
         "operationId": "values",
+        "parameters": [
+          {
+            "name": "mirror",
+            "in": "path",
+            "description": "Name of the `http-access.cache-v1` mirror to read from",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": "Newline-separated raw values with trailing newline; binary-safe iff no value contains 0x0A",
@@ -196,8 +255,18 @@
               }
             }
           },
+          "404": {
+            "description": "Mirror unknown"
+          },
           "503": {
-            "description": "Cache is not yet caught up to the source"
+            "description": "Mirror is not currently Ready; body is a MirrorReadiness object",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MirrorReadiness"
+                }
+              }
+            }
           }
         }
       }
@@ -205,6 +274,132 @@
   },
   "components": {
     "schemas": {
+      "AggregateReadiness": {
+        "type": "string",
+        "description": "Aggregate readiness state for the process. The discriminator\nstring lets a grep-friendly consumer distinguish \"warming up but\nexpected to clear shortly\" (a cold start) from \"something is\nwrong\" (a mirror went degraded after first reaching Ready).",
+        "enum": [
+          "ready",
+          "warming",
+          "degraded"
+        ]
+      },
+      "MirrorReadiness": {
+        "type": "object",
+        "description": "One mirror's slice of the readiness response. Returned both as\nan element of [`ReadinessReport::mirrors`] and as the standalone\nbody of the per-mirror `/cache/v1/{mirror}/...` 503 response so a\nclient library can surface the reason without a second request.",
+        "required": [
+          "name",
+          "status",
+          "source"
+        ],
+        "properties": {
+          "destination": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/MirrorReadinessDestination",
+                "description": "Status-specific detail: the lagging destination's name + lag\n(when `status == \"destination_lagging\"`), or the source lag\n(when `status == \"lag_behind_source\"`). `None` otherwise."
+              }
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "source": {
+            "$ref": "#/components/schemas/MirrorReadinessSource",
+            "description": "Source-side detail: topic, partition, assignment, offsets."
+          },
+          "status": {
+            "type": "string",
+            "description": "String discriminator for the status, easy to grep:\n`ready` | `warming` | `lag_behind_source` | `source_unassigned`\n| `destination_lagging`."
+          }
+        }
+      },
+      "MirrorReadinessDestination": {
+        "type": "object",
+        "required": [
+          "name",
+          "lag"
+        ],
+        "properties": {
+          "lag": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "name": {
+            "type": "string"
+          }
+        }
+      },
+      "MirrorReadinessSource": {
+        "type": "object",
+        "required": [
+          "topic",
+          "partition",
+          "assigned",
+          "end_offset",
+          "last_applied_offset",
+          "lag"
+        ],
+        "properties": {
+          "assigned": {
+            "type": "boolean"
+          },
+          "end_offset": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "lag": {
+            "type": "integer",
+            "format": "int64",
+            "description": "`end_offset - last_applied_offset`, saturating at 0 so a\nlate-arriving high-watermark fetch can't underflow.",
+            "minimum": 0
+          },
+          "last_applied_offset": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "partition": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "topic": {
+            "type": "string"
+          }
+        }
+      },
+      "ReadinessReport": {
+        "type": "object",
+        "description": "Full body of the readiness endpoint. Always serialised; the\nHTTP status code (200 vs 503) is determined by `ready`.",
+        "required": [
+          "ready",
+          "mirrors",
+          "unhealthy"
+        ],
+        "properties": {
+          "mirrors": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/MirrorReadiness"
+            }
+          },
+          "ready": {
+            "$ref": "#/components/schemas/AggregateReadiness"
+          },
+          "unhealthy": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Grep-friendly list of mirror names whose status is not\n`ready`. Empty when `ready == \"ready\"`."
+          }
+        }
+      },
       "TopicPartitionOffsetJson": {
         "type": "object",
         "description": "`{topic, partition, offset}` shape serialized into the\n`x-kkv-last-seen-offsets` header. Mirrors KKV's\n`TopicPartitionOffset`, including JSON property order.",
