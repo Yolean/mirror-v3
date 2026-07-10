@@ -111,8 +111,8 @@ fn fs_spec(root: &std::path::Path) -> FilesystemSinkConfig {
 }
 
 /// Extract the `updates` map keys from a kkv-v1 notify body. The
-/// notifier POSTs JSON of shape `{"v":"v1","topic":..., "offsets":
-/// {...}, "updates": {"<key>": "<base64>"}}`.
+/// notifier POSTs JSON of shape `{"v":1,"topic":..., "offsets":
+/// {...}, "updates": {"<key>": null}}`.
 fn keys_in_body(body: &[u8]) -> HashSet<String> {
     let v: serde_json::Value = serde_json::from_slice(body).expect("notify body is JSON");
     v.get("updates")

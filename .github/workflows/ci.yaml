@@ -67,9 +67,9 @@ jobs:
         save-if: ${{ github.ref == 'refs/heads/main' }}
     - name: prepull e2e images
       run: |
-        docker pull quay.io/ogunalp/kafka-native:latest &
-        docker pull docker.io/redpandadata/redpanda:latest &
-        docker pull docker.io/versity/versitygw:latest &
+        docker pull quay.io/ogunalp/kafka-native:latest@sha256:9ae667c854cd25a86a2d263e0cd7352cd6ffa6395c2dec5f90ab9056cc60b14f &
+        docker pull docker.io/redpandadata/redpanda:v26.1.12 &
+        docker pull docker.io/versity/versitygw:v1.6.0 &
         docker pull ghcr.io/shopify/toxiproxy:2.12.0 &
         wait
     - name: cargo test mirror-e2e
@@ -132,12 +132,17 @@ jobs:
         cache-to: type=gha,mode=max
         provenance: false
     - name: prune superseded main buildkit caches
-      # Buildx writes content-addressed blobs and an index per build;
-      # the next main build only reads from the most recent entries
-      # (main rarely reverts), so older runs' blobs are dead weight
-      # that pushes the rust-cache and other useful entries closer
-      # to GHA's per-repo eviction ceiling. Keep the top N most-
-      # recently-created buildkit-* / index-buildkit-* entries on
+      # Buildx writes content-addressed blobs and an index per build.
+      # Blobs are NOT re-uploaded when their content is unchanged, so
+      # a stable base layer keeps the createdAt of the build that
+      # first uploaded it while still being referenced by every newer
+      # index. Pruning by creation time would therefore delete the
+      # most stable, still-referenced blobs first and send the next
+      # build partially cold. lastAccessedAt is the safe ordering:
+      # restores touch every blob they read, so anything the latest
+      # main build actually used sorts to the top and the deletions
+      # hit genuinely dead entries. Keep the top N most-recently-
+      # accessed buildkit-* / index-buildkit-* entries on
       # refs/heads/main; delete the rest.
       #
       # N=200 is roughly 2-4 main builds' worth (one multi-arch build
@@ -150,12 +155,12 @@ jobs:
       run: |
         set -euo pipefail
         to_delete=$(gh cache list -R "$GITHUB_REPOSITORY" -L 1000 \
-          --json id,key,ref,createdAt \
+          --json id,key,ref,lastAccessedAt \
           --jq '[ .[]
                   | select(.ref == "refs/heads/main")
                   | select((.key | startswith("buildkit-")) or (.key | startswith("index-buildkit-")))
                 ]
-                | sort_by(.createdAt) | reverse | .[200:] | .[].id')
+                | sort_by(.lastAccessedAt) | reverse | .[200:] | .[].id')
         if [ -n "${to_delete:-}" ]; then
           count=$(echo "$to_delete" | wc -l | tr -d ' ')
           echo "Pruning $count superseded buildkit cache entries on main"
