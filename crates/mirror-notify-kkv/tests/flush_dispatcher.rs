@@ -155,3 +155,46 @@ async fn shutdown_with_no_events_is_a_noop() {
         .expect("empty shutdown is a noop");
     assert_eq!(server.request_count(), 0);
 }
+
+/// The supervisor's only production-grade visibility into a dead
+/// drainer: the watch resolves when dispatch exhausts retries, so
+/// the mirror task can error out instead of running silently with
+/// every subsequent flush notification dropped.
+#[tokio::test]
+async fn terminal_error_watch_fires_when_drainer_exhausts() {
+    let server = TestServer::start(Reply::Status(500), vec![]).await;
+    let cfg = notify_dest_flush(server.addr);
+    let dispatcher =
+        FlushDispatcher::from_config(&cfg, "t".into(), 0, ready_cache("m"), "m".into())
+            .expect("must build");
+    let watch = dispatcher.terminal_error_watch();
+
+    dispatcher.on_flushed(0, 9);
+
+    let err = tokio::time::timeout(Duration::from_secs(5), watch.wait())
+        .await
+        .expect("watch must resolve once the drainer exhausts retries");
+    let msg = format!("{err}").to_lowercase();
+    assert!(msg.contains("exhausted"), "got: {msg}");
+}
+
+/// The watch must stay pending while dispatch succeeds; resolving
+/// spuriously would crash a healthy mirror.
+#[tokio::test]
+async fn terminal_error_watch_stays_pending_on_success() {
+    let server = TestServer::start(Reply::Status(200), vec![]).await;
+    let cfg = notify_dest_flush(server.addr);
+    let dispatcher =
+        FlushDispatcher::from_config(&cfg, "t".into(), 0, ready_cache("m"), "m".into())
+            .expect("must build");
+    let watch = dispatcher.terminal_error_watch();
+
+    dispatcher.on_flushed(0, 9);
+    wait_for_requests(&server, 1, Duration::from_secs(5)).await;
+
+    let pending = tokio::time::timeout(Duration::from_millis(200), watch.wait()).await;
+    assert!(
+        pending.is_err(),
+        "watch must not resolve while dispatch succeeds"
+    );
+}
