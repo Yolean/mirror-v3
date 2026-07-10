@@ -9,8 +9,8 @@ use mirror_config::{Destination, HttpAccess, Mirror};
 mod ack_tracker;
 mod readiness_poller;
 use ack_tracker::{
-    commit_interval_from_env, spawn_periodic_commit_task, AckTracker, DestAckSlot, FlushAckShim,
-    WriteAckShim,
+    commit_interval_from_env, final_commit, spawn_periodic_commit_task, AckTracker, DestAckSlot,
+    FlushAckShim, WriteAckShim,
 };
 use mirror_core::{
     heartbeat_interval_from_env, run_mirror_with_notifier, MetricLabels, NoOpNotifier, Record,
@@ -757,12 +757,14 @@ async fn spawn_mirror(
     );
     let source = KafkaSource::open(source_cfg)
         .with_context(|| format!("opening source for mirror {}", mirror.name))?;
-    // Snapshot two commit handles before the run loop takes
+    // Snapshot three commit handles before the run loop takes
     // ownership of the source. Each `KafkaCommitHandle` clones the
     // underlying `Arc<StreamConsumer>` (cheap); the periodic commit
-    // task and the readiness poller each get their own.
+    // task, the readiness poller and the final shutdown commit each
+    // get their own.
     let commit_handle = source.commit_handle();
     let commit_handle_for_poller = source.commit_handle();
+    let commit_handle_final = source.commit_handle();
 
     let name = mirror.name.clone();
     let labels = MetricLabels {
@@ -853,6 +855,7 @@ async fn spawn_mirror(
     // contribute (commit 9 wires `affects-readiness` to filter).
     let notify_present = mirror.notify.is_some();
     let ack_tracker = Arc::new(AckTracker::new(notify_present, dest_ack_slots));
+    let ack_tracker_final = Arc::clone(&ack_tracker);
 
     // Branch on the notify trigger mode (validated upstream in
     // mirror-config; see WEBHOOKS.md § Trigger):
@@ -927,6 +930,7 @@ async fn spawn_mirror(
     // error only surfaces on the next record, which an idle topic
     // never delivers.
     let mut dispatch_error_watch = notifier_opt.as_ref().map(|n| n.terminal_error_watch());
+    let mut flush_dispatcher_shutdown: Option<Arc<mirror_notify_kkv::FlushDispatcher>> = None;
     if matches!(
         trigger_mode,
         Some(mirror_config::TriggerOn::DestinationFlush)
@@ -951,7 +955,13 @@ async fn spawn_mirror(
                 dispatcher.on_flushed(committed, min_head - 1);
             }
         }
-        tee.set_flush_observer(std::sync::Arc::new(dispatcher));
+        // The tee owns the dispatcher as its FlushObserver; the
+        // supervisor keeps a second handle so the graceful-shutdown
+        // path can drain queued flush events before the process
+        // exits (they are not regenerated on restart).
+        let dispatcher = Arc::new(dispatcher);
+        flush_dispatcher_shutdown = Some(Arc::clone(&dispatcher));
+        tee.set_flush_observer(dispatcher);
     }
 
     // Spawn the periodic source-commit task. It reads
@@ -1053,9 +1063,28 @@ async fn spawn_mirror(
                         .await
                 }
             };
-            match result {
-                Ok(()) => Ok(()),
-                Err(e) => Err(anyhow::anyhow!("mirror {name}: {e}")),
+            // Drain the flush dispatcher before committing: the run
+            // loop's final sink.flush() may have queued flush events
+            // that are not regenerated on restart, and their acks
+            // belong in the final commit below.
+            let flush_drain = match flush_dispatcher_shutdown {
+                Some(d) => d.drain_and_stop().await,
+                None => Ok(()),
+            };
+            // One final sync commit of whatever the notifier acked:
+            // the periodic commit task exits on the shutdown signal
+            // before the run loop's final drain acks, and its async
+            // commit mode would race process exit anyway. Runs on
+            // the error path too - acked offsets are delivered
+            // regardless of why the loop stopped, and committing
+            // them shrinks the duplicate-webhook replay on restart.
+            final_commit(commit_handle_final, &ack_tracker_final, &name).await;
+            match (result, flush_drain) {
+                (Ok(()), Ok(())) => Ok(()),
+                (Err(e), _) => Err(anyhow::anyhow!("mirror {name}: {e}")),
+                (Ok(()), Err(e)) => Err(anyhow::anyhow!(
+                    "mirror {name}: flush notify drain on shutdown: {e}"
+                )),
             }
         }
         .instrument(span),
