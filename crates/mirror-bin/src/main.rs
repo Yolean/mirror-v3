@@ -685,6 +685,30 @@ async fn fetch_committed_offset_for_mirror(mirror: &Mirror) -> Result<Option<u64
     Ok(committed)
 }
 
+/// Broker low watermark for a mirror's source partition, used to
+/// clamp the notify resume floor: a committed offset that has aged
+/// past retention cannot be re-read, so the replay starts at the
+/// earliest available offset instead of erroring the append-mode
+/// bootstrap gate.
+async fn fetch_low_watermark_for_mirror(mirror: &Mirror) -> Result<u64> {
+    let bootstrap = mirror.source.bootstrap_servers.clone();
+    let topic = mirror.topic.clone();
+    let partition = mirror.partition as i32;
+    let mirror_name = mirror.name.clone();
+    let low = tokio::task::spawn_blocking(move || {
+        mirror_kafka::fetch_low_watermark(
+            &bootstrap,
+            &topic,
+            partition,
+            std::time::Duration::from_secs(5),
+        )
+    })
+    .await
+    .with_context(|| format!("mirror {mirror_name}: low watermark task join"))?
+    .with_context(|| format!("mirror {mirror_name}: fetch low watermark"))?;
+    Ok(low.max(0) as u64)
+}
+
 async fn shutdown_signal(mut rx: tokio::sync::watch::Receiver<bool>) {
     if *rx.borrow() {
         return;
@@ -844,6 +868,23 @@ async fn spawn_mirror(
     let trigger_mode = mirror.notify.as_ref().map(|n| n.trigger.on);
     let ack_sink_for_notifier: Arc<dyn mirror_core::AckSink> =
         Arc::clone(&ack_tracker) as Arc<dyn mirror_core::AckSink>;
+    // Notify re-delivery across restarts: the destinations' durable
+    // heads can be ahead of the broker-committed (= notify-acked)
+    // offset, e.g. when the webhook receiver was down at shutdown.
+    // The destination state alone would resume above those records
+    // and their invalidations would never fire. `[committed,
+    // min(heads))` is that gap; each trigger mode closes it below.
+    let notify_committed = if trigger_mode.is_some() {
+        fetch_committed_offset_for_mirror(&mirror).await?
+    } else {
+        None
+    };
+    let min_head = tee
+        .heads()
+        .iter()
+        .map(|(_, h)| *h)
+        .min()
+        .expect("tee is non-empty by construction");
     let notifier_opt = match trigger_mode {
         Some(mirror_config::TriggerOn::SourceConsume) => {
             build_source_consume_notifier(&mirror, cache.as_ref())?
@@ -851,6 +892,34 @@ async fn spawn_mirror(
         }
         _ => None,
     };
+    if notifier_opt.is_some() {
+        if let Some(committed) = notify_committed {
+            if committed < min_head {
+                // Re-read the gap from the source; the tee skips the
+                // destination writes and the notifier's suppression
+                // threshold (== committed) lets exactly these
+                // records fire.
+                let low = fetch_low_watermark_for_mirror(&mirror).await?;
+                if committed < low {
+                    tracing::warn!(
+                        mirror = %name,
+                        committed,
+                        low_watermark = low,
+                        "committed offset is below the broker low watermark; notify re-delivery starts at the earliest available offset and the records below it are lost"
+                    );
+                }
+                let floor = committed.max(low);
+                tracing::info!(
+                    mirror = %name,
+                    committed,
+                    destination_min_head = min_head,
+                    resume_floor = floor,
+                    "re-reading un-acked notify window from the source"
+                );
+                tee.set_resume_floor(floor);
+            }
+        }
+    }
     // The run loop races this watch so a terminal dispatch failure
     // errors the mirror even when nothing else would surface it:
     // the flush drainer's death is otherwise invisible (its events
@@ -865,6 +934,23 @@ async fn spawn_mirror(
         let dispatcher = build_flush_dispatcher(&mirror, cache.as_ref())?
             .with_ack_sink(Arc::clone(&ack_sink_for_notifier));
         dispatch_error_watch = Some(dispatcher.terminal_error_watch());
+        // Destination-flush variant of the un-acked window: a replay
+        // cannot regenerate flush events for data that is already
+        // durable, so synthesize one catch-up event covering
+        // `[committed, min_head)`. Suppression (threshold ==
+        // committed) admits it; a fresh deploy (no commit) skips it.
+        if let Some(committed) = notify_committed {
+            if committed < min_head {
+                tracing::info!(
+                    mirror = %name,
+                    committed,
+                    destination_min_head = min_head,
+                    "dispatching synthetic flush notification for the un-acked window"
+                );
+                use mirror_core::FlushObserver;
+                dispatcher.on_flushed(committed, min_head - 1);
+            }
+        }
         tee.set_flush_observer(std::sync::Arc::new(dispatcher));
     }
 
