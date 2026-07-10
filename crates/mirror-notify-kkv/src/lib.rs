@@ -147,6 +147,17 @@ struct NotifierState {
     new_data: TokioNotify,
     shutting_down: AtomicBool,
     error_state: TokioMutex<Option<NotifyError>>,
+    /// Serializes take-dispatch-ack across the inline drain
+    /// (`on_record` max-records path, shutdown) and the background
+    /// timer drain. Without it two batches can be in flight at once
+    /// and a *later* batch's success can ack past an *earlier* batch
+    /// that is still retrying; `AckTracker::note_through` is
+    /// `fetch_max`, so the periodic source commit would then advance
+    /// past undelivered records and a restart would suppress them
+    /// forever. Holding the lock across the whole dispatch also
+    /// gives the documented backpressure: the consume loop blocks on
+    /// the in-flight batch instead of racing it.
+    dispatch_lock: TokioMutex<()>,
     /// Set once, before any record is dispatched, via
     /// [`KkvV1Notifier::with_ack_sink`]. Shared between
     /// `drain_now` (inline path) and the background timer task so
@@ -233,6 +244,7 @@ impl KkvV1Notifier {
             new_data: TokioNotify::new(),
             shutting_down: AtomicBool::new(false),
             error_state: TokioMutex::new(None),
+            dispatch_lock: TokioMutex::new(()),
             ack_sink: OnceLock::new(),
         });
 
@@ -270,6 +282,15 @@ impl KkvV1Notifier {
     /// Drain the current buffer (if any) and dispatch it. Used from
     /// both the on_record max-records path and shutdown.
     async fn drain_now(&self) -> Result<(), NotifyError> {
+        let _dispatch = self.state.dispatch_lock.lock().await;
+        // The timer task may have failed terminally while we waited
+        // for the lock. Dispatching (and acking) a later batch after
+        // an earlier one is known-undelivered would let the source
+        // commit advance past the failed batch; surface the error
+        // instead and leave the buffer for the post-restart replay.
+        if let Some(err) = self.state.error_state.lock().await.take() {
+            return Err(err);
+        }
         let batch = {
             let mut buf = self.state.buffer.lock().await;
             buf.take(self.inner.partition)
@@ -282,7 +303,8 @@ impl KkvV1Notifier {
         // Successful dispatch through every endpoint => the batch is
         // delivered. Tell the supervisor's ack tracker so the
         // periodic source-commit task can advance the broker-side
-        // committed offset.
+        // committed offset. Still under the dispatch lock, so acks
+        // arrive in batch order.
         if let Some(ack) = self.state.ack_sink.get() {
             ack.note_through(high + 1);
         }
@@ -751,6 +773,11 @@ async fn timer_loop(inner: Arc<Inner>, state: Arc<NotifierState>, max_time: Dura
         if state.shutting_down.load(Ordering::SeqCst) {
             return;
         }
+        // Serialize with the inline drain path; see the
+        // `dispatch_lock` field docs. Taken before the buffer take so
+        // batches dispatch, and therefore ack, in source-offset
+        // order.
+        let _dispatch = state.dispatch_lock.lock().await;
         let batch = {
             let mut buf = state.buffer.lock().await;
             buf.take(inner.partition)
