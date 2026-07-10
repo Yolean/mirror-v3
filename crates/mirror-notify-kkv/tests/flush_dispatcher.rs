@@ -198,3 +198,25 @@ async fn terminal_error_watch_stays_pending_on_success() {
         "watch must not resolve while dispatch succeeds"
     );
 }
+
+/// Graceful shutdown must dispatch every already-queued flush event
+/// before returning: flush events are not regenerated on restart,
+/// so aborting the drainer here would lose the final flush
+/// notification of every clean shutdown.
+#[tokio::test]
+async fn shutdown_drains_queued_flush_events_before_stopping() {
+    let server = TestServer::start(Reply::SlowOk(Duration::from_millis(100)), vec![]).await;
+    let cfg = notify_dest_flush(server.addr);
+    let mut dispatcher =
+        FlushDispatcher::from_config(&cfg, "t".into(), 0, ready_cache("m"), "m".into())
+            .expect("must build");
+
+    dispatcher.on_flushed(0, 9);
+    dispatcher.on_flushed(10, 19);
+    dispatcher.shutdown().await.expect("drain must succeed");
+    assert_eq!(
+        server.request_count(),
+        2,
+        "both queued flush events must dispatch before shutdown returns"
+    );
+}

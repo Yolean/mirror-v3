@@ -887,7 +887,11 @@ pub struct FlushDispatcher {
     #[allow(dead_code)]
     inner: Arc<Inner>,
     tx: tokio::sync::mpsc::UnboundedSender<FlushEvent>,
-    drainer: Option<JoinHandle<()>>,
+    /// Behind a mutex so [`Self::drain_and_stop`] can join the task
+    /// through `&self`: in production the dispatcher lives inside
+    /// the tee as an `Arc<dyn FlushObserver>`, and the supervisor
+    /// holds a second `Arc` clone for the shutdown drain.
+    drainer: TokioMutex<Option<JoinHandle<()>>>,
     error_state: Arc<TokioMutex<Option<NotifyError>>>,
     /// Signalled when the drainer stashes a terminal error; see
     /// [`TerminalErrorWatch`]. Without a watcher a drainer death is
@@ -988,7 +992,7 @@ impl FlushDispatcher {
         Ok(Self {
             inner,
             tx,
-            drainer: Some(drainer),
+            drainer: TokioMutex::new(Some(drainer)),
             error_state,
             error_signal,
             cache_state,
@@ -1012,10 +1016,25 @@ impl FlushDispatcher {
     /// Drain pending events and stop the background task. Returns
     /// any error the drainer accumulated before exit. Idempotent -
     /// calling twice is safe (the second call is a no-op).
+    ///
+    /// The channel is FIFO, so awaiting the drainer after queueing
+    /// the Shutdown marker lets every already-queued flush event
+    /// dispatch first - aborting instead would silently drop the
+    /// final flush notification of a graceful shutdown, and flush
+    /// events are not regenerated on restart. A dispatch stuck in
+    /// retries holds this up for at most the retry budget
+    /// (max-attempts x (timeout + backoff)); beyond that the
+    /// orchestrator's termination grace period is the backstop.
     pub async fn shutdown(&mut self) -> Result<(), NotifyError> {
+        self.drain_and_stop().await
+    }
+
+    /// `&self` version of [`Self::shutdown`] for the supervisor,
+    /// which holds the dispatcher behind an `Arc` (the tee owns it
+    /// as its `FlushObserver`). Idempotent.
+    pub async fn drain_and_stop(&self) -> Result<(), NotifyError> {
         let _ = self.tx.send(FlushEvent::Shutdown);
-        if let Some(handle) = self.drainer.take() {
-            handle.abort();
+        if let Some(handle) = self.drainer.lock().await.take() {
             let _ = handle.await;
         }
         if let Some(err) = self.error_state.lock().await.take() {
