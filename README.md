@@ -2,7 +2,7 @@
 
 Exactly-once Kafka topic+partition mirroring to **Kafka**, **Filesystem**, or **S3**, in one deployment.
 
-> **Status:** Phase 5 — Kafka source + Kafka/Filesystem/S3 sinks; supervisor for parallel mirrors with graceful SIGINT/SIGTERM shutdown that flushes buffered records. Fault-injection tests deferred to Phase 2b; cutover to `checkit/mirror-v3` is a handoff step. See [AGENTS.md](AGENTS.md) for the phase map.
+> **Status:** feature-complete for the `checkit/mirror-v3` cutover: Kafka source + Kafka/Filesystem/S3 sinks, `/cache/v1` HTTP surface, kkv-v1 notify webhooks, committed-offset delivery semantics and non-sticky readiness. See [AGENTS.md](AGENTS.md) for the development history.
 
 ## What this gives you
 
@@ -74,7 +74,7 @@ GET /cache/v1/{mirror}/keys                       → newline-separated keys
 GET /cache/v1/{mirror}/values                     → newline-separated raw values
 ```
 
-Each mirror owns its own `key → latest-value` view; a key only shows up under the mirror that consumed it. Reads carry `x-kkv-last-seen-offsets: <JSON>` and return **503** until that mirror has caught up to its source's high-watermark captured at startup — same readiness contract as KKV, so dependents don't transiently see an older state across reloads. The view updates per-record from the consume loop, decoupled from disk flush cadence (set `flush.max-time-ms` high to save bucket ops without sacrificing freshness). Updates are monotonic; if a future feature ever rewinds source consumption, the cache stays at the highest offset seen.
+Each mirror owns its own `key → latest-value` view; a key only shows up under the mirror that consumed it. Reads carry `x-kkv-last-seen-offsets: <JSON>` and return **503** until that mirror is `ready` (non-sticky, lag-based; see [Readiness](#readiness)) — same readiness contract as KKV, so dependents don't transiently see an older state across reloads. The view updates per-record from the consume loop, decoupled from disk flush cadence (set `flush.max-time-ms` high to save bucket ops without sacrificing freshness). Updates are monotonic; if a future feature ever rewinds source consumption, the cache stays at the highest offset seen.
 
 To keep existing kkv consumers working unmodified during a migration, **one** mirror per process may additionally set `cache-v1-main: {}`. That mounts the unprefixed `/cache/v1/...` paths onto that mirror's view (alias-only — same handlers, no separate data path). The validator rejects more than one `cache-v1-main` in the config. Mirror names that collide with the literal path segments `raw | offset | keys | values` are rejected.
 
