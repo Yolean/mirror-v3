@@ -99,7 +99,9 @@ jobs:
     - id: meta
       uses: docker/metadata-action@030e881283bb7a6894de51c315a6bfe6a94e05cf  # v6.0.0
       with:
-        images: ghcr.io/yolean/mirror-v3
+        # repository_owner keeps pushes working from forks (e.g.
+        # YoleanAgents); metadata-action lowercases the owner.
+        images: ghcr.io/${{ github.repository_owner }}/mirror-v3
         # Tag rules (sha tag is the full 40-char commit SHA, no prefix):
         #   - push to main          -> :main and :latest and :<full-sha>
         #   - push to tag vX.Y.Z    -> :vX.Y.Z (and :latest if default-branch)
