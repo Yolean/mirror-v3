@@ -64,6 +64,17 @@ struct InnerSink {
 pub struct TeeSink {
     inners: Vec<InnerSink>,
     cache: Option<CacheBinding>,
+    /// Resume cursor for notify re-delivery. When the supervisor
+    /// sets a floor below the inner sinks' heads (the broker-side
+    /// committed offset of a notify mirror), the tee reports it as
+    /// `next_expected_offset` so the source seeks there and the run
+    /// loop re-presents `[floor, min(heads))` to the notifier; the
+    /// per-sink head skip keeps the destinations write-idempotent
+    /// through the replay. The cursor then advances with every
+    /// `write` call (including fully-skipped replays) so the idle
+    /// drift re-check, which requires `next_expected_offset ==` the
+    /// loop's own tracker, stays satisfied mid-replay.
+    resume_cursor: Option<u64>,
 }
 
 impl TeeSink {
@@ -89,7 +100,23 @@ impl TeeSink {
             let head = sink.next_expected_offset().await?;
             inners.push(InnerSink { name, sink, head });
         }
-        Ok(Self { inners, cache })
+        Ok(Self {
+            inners,
+            cache,
+            resume_cursor: None,
+        })
+    }
+
+    /// Lower the tee's reported resume position to `floor` so the
+    /// run loop re-reads `[floor, min(heads))` from the source. Used
+    /// by the supervisor for notify mirrors: records that were made
+    /// durable on the destinations but whose webhook batch was never
+    /// acked (committed) get re-presented to the notifier, closing
+    /// the at-least-once gap across restarts. A floor at or above
+    /// the inner minimum is a no-op. Call before the run loop
+    /// starts; the cursor is not meant to move backwards mid-run.
+    pub fn set_resume_floor(&mut self, floor: u64) {
+        self.resume_cursor = Some(floor);
     }
 
     /// Test-only / mirror-bin-style constructor that skips the open
@@ -107,6 +134,18 @@ impl TeeSink {
                 .map(|(name, sink, head)| InnerSink { name, sink, head })
                 .collect(),
             cache,
+            resume_cursor: None,
+        }
+    }
+
+    /// Keep the resume cursor in step with the run loop's `expected`
+    /// tracker: every write call (skipped or fanned out) means the
+    /// loop is about to expect `record_offset + 1`. The idle drift
+    /// re-check compares `next_expected_offset()` for equality, so a
+    /// stale cursor would fail it mid-replay.
+    fn advance_resume_cursor(&mut self, record_offset: u64) {
+        if let Some(cursor) = self.resume_cursor {
+            self.resume_cursor = Some(cursor.max(record_offset + 1));
         }
     }
 
@@ -140,12 +179,19 @@ impl Sink for TeeSink {
                 inner.head = head;
             }
         }
-        Ok(self
+        let inner_min = self
             .inners
             .iter()
             .map(|i| i.head)
             .min()
-            .expect("non-empty by construction"))
+            .expect("non-empty by construction");
+        // The resume cursor can only lower the reported position
+        // (replay for notify re-delivery); it never holds the tee
+        // above the inner minimum.
+        Ok(match self.resume_cursor {
+            Some(cursor) => inner_min.min(cursor),
+            None => inner_min,
+        })
     }
 
     async fn write(&mut self, record: Record) -> Result<(), SinkError> {
@@ -168,9 +214,13 @@ impl Sink for TeeSink {
             }
         }
         if indices.is_empty() {
-            // Every inner sink is already past this offset (rare:
-            // only happens during restart with all sinks recovered
-            // to or beyond `record_offset`). Drop the record.
+            // Every inner sink is already past this offset: the
+            // notify-resume replay window, or a restart with all
+            // sinks recovered beyond `record_offset`. Drop the
+            // record for the destinations (the run loop still hands
+            // it to the notifier) but keep the resume cursor in step
+            // with the loop's `expected` tracker.
+            self.advance_resume_cursor(record_offset);
             return Ok(());
         }
 
@@ -217,6 +267,7 @@ impl Sink for TeeSink {
         if let Some((name, e)) = first_err {
             return Err(SinkError::Transport(format!("inner sink {name}: {e}")));
         }
+        self.advance_resume_cursor(record_offset);
         Ok(())
     }
 
@@ -772,5 +823,52 @@ mod tests {
         // a re-reports 5; min doesn't advance; no fire.
         ra.simulate_flush(0, 5);
         assert_eq!(obs.fires.lock().unwrap().clone(), vec![(0, 5)]);
+    }
+
+    #[tokio::test]
+    async fn resume_floor_lowers_reported_start_and_tracks_replay() {
+        let (a, ra) = Recording::new(5);
+        let mut tee = TeeSink::open(vec![("a".into(), boxed(a))], None)
+            .await
+            .unwrap();
+        tee.set_resume_floor(2);
+        assert_eq!(
+            tee.next_expected_offset().await.unwrap(),
+            2,
+            "floor lowers the reported start below the inner head"
+        );
+        // Replay window 2..=4: dropped for the destination, but the
+        // reported next-expected must track the loop's tracker or
+        // the idle drift re-check fails mid-replay.
+        for offset in 2..=4 {
+            tee.write(rec(offset)).await.unwrap();
+            assert_eq!(tee.next_expected_offset().await.unwrap(), offset + 1);
+        }
+        assert_eq!(
+            ra.writes(),
+            Vec::<u64>::new(),
+            "replay must not re-write to the destination"
+        );
+        // From the destination head onward, writes fan out normally
+        // and the cursor converges with the inner heads.
+        for offset in 5..=7 {
+            tee.write(rec(offset)).await.unwrap();
+        }
+        assert_eq!(ra.writes(), vec![5, 6, 7]);
+        assert_eq!(tee.next_expected_offset().await.unwrap(), 8);
+    }
+
+    #[tokio::test]
+    async fn resume_floor_at_or_above_inner_min_is_a_noop() {
+        let (a, _ra) = Recording::new(3);
+        let mut tee = TeeSink::open(vec![("a".into(), boxed(a))], None)
+            .await
+            .unwrap();
+        tee.set_resume_floor(9);
+        assert_eq!(
+            tee.next_expected_offset().await.unwrap(),
+            3,
+            "the cursor never raises the tee above the inner minimum"
+        );
     }
 }
