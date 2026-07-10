@@ -357,25 +357,58 @@ impl Sink for TeeSink {
     }
 
     fn set_flush_observer(&mut self, observer: Arc<dyn FlushObserver>) {
-        if self.inners.len() == 1 {
-            // Length-1 tee (the common case for single-destination
-            // mirrors): forward the observer to the only inner sink
-            // unchanged. `from`/`to` flow through verbatim.
-            self.inners[0].sink.set_flush_observer(observer);
-            return;
+        // Only sinks that actually fire flush events participate in
+        // the min-coordination. A per-record sink (Kafka) never
+        // calls its observer, so including it would pin the min at
+        // 0 and the outer observer would never fire on a mixed
+        // blob+kafka mirror.
+        let supporting: Vec<usize> = self
+            .inners
+            .iter()
+            .enumerate()
+            .filter(|(_, inner)| inner.sink.supports_flush_observer())
+            .map(|(i, _)| i)
+            .collect();
+        match supporting.len() {
+            0 => {
+                // The config validator rejects destination-flush
+                // without a blob destination, so this is a
+                // programming error rather than an operator one;
+                // keep it loud.
+                tracing::error!(
+                    "set_flush_observer on a tee with no flush-capable inner sink; flush notifications will never fire"
+                );
+            }
+            1 => {
+                // Single flush-capable sink (covers the common
+                // single-destination mirror): forward the observer
+                // unchanged. `from`/`to` flow through verbatim.
+                self.inners[supporting[0]].sink.set_flush_observer(observer);
+            }
+            n => {
+                // Multiple flush-capable sinks: wrap the outer
+                // observer with a per-sink relay + min-coordinator.
+                // The outer observer fires only when every
+                // flush-capable inner sink has committed past a
+                // watermark - the spec's "fire when ALL destinations
+                // have committed past the batch's high-water offset".
+                let coordinator = Arc::new(MinFlushCoordinator::new(n, observer));
+                for (relay_index, inner_index) in supporting.into_iter().enumerate() {
+                    self.inners[inner_index]
+                        .sink
+                        .set_flush_observer(Arc::new(PerSinkRelay {
+                            sink_index: relay_index,
+                            coordinator: Arc::clone(&coordinator),
+                        }));
+                }
+            }
         }
-        // Multi-destination: wrap the outer observer with a per-sink
-        // relay + a min-coordinator. The outer observer fires only
-        // when *every* inner sink has committed past a watermark -
-        // matching the spec's "fire when ALL destinations have
-        // committed past the batch's high-water offset".
-        let coordinator = Arc::new(MinFlushCoordinator::new(self.inners.len(), observer));
-        for (sink_index, inner) in self.inners.iter_mut().enumerate() {
-            inner.sink.set_flush_observer(Arc::new(PerSinkRelay {
-                sink_index,
-                coordinator: Arc::clone(&coordinator),
-            }));
-        }
+    }
+
+    fn supports_flush_observer(&self) -> bool {
+        self.inners
+            .iter()
+            .any(|inner| inner.sink.supports_flush_observer())
     }
 }
 
@@ -479,6 +512,10 @@ mod tests {
         flush_count: Arc<Mutex<u32>>,
         fail_on_offset: Option<u64>,
         allow_compacted: bool,
+        /// Mirrors the FS/S3 (`true`) vs Kafka (`false`) split in
+        /// `Sink::supports_flush_observer`. Default true so the
+        /// existing flush-coordination tests model blob sinks.
+        flush_capable: bool,
         aligned_to: Arc<Mutex<Option<u64>>>,
         /// The observer the tee installed via `set_flush_observer`,
         /// if any. Tests fire it explicitly via [`Self::simulate_flush`]
@@ -506,6 +543,7 @@ mod tests {
                     flush_count,
                     fail_on_offset: None,
                     allow_compacted: false,
+                    flush_capable: true,
                     aligned_to,
                     observer,
                 },
@@ -518,6 +556,13 @@ mod tests {
         }
         fn with_allow_compacted(mut self, allow: bool) -> Self {
             self.allow_compacted = allow;
+            self
+        }
+        /// Model a per-record sink (Kafka): accepts an observer
+        /// install but never fires it and reports itself
+        /// flush-incapable.
+        fn without_flush_support(mut self) -> Self {
+            self.flush_capable = false;
             self
         }
     }
@@ -584,6 +629,9 @@ mod tests {
         }
         fn set_flush_observer(&mut self, observer: Arc<dyn crate::FlushObserver>) {
             *self.observer.lock().unwrap() = Some(observer);
+        }
+        fn supports_flush_observer(&self) -> bool {
+            self.flush_capable
         }
     }
 
@@ -869,6 +917,33 @@ mod tests {
             tee.next_expected_offset().await.unwrap(),
             3,
             "the cursor never raises the tee above the inner minimum"
+        );
+    }
+
+    /// The mixed blob+kafka regression: a per-record sink must not
+    /// pin the flush min at 0. With the kafka-like sink excluded
+    /// from coordination, the blob sink's flush alone drives the
+    /// outer observer.
+    #[tokio::test]
+    async fn flush_observer_ignores_sinks_that_never_flush() {
+        let (blob, r_blob) = Recording::new(0);
+        let (kafka, _r_kafka) = Recording::new(0);
+        let kafka = kafka.without_flush_support();
+        let mut tee = TeeSink::open(
+            vec![("blob".into(), boxed(blob)), ("kafka".into(), boxed(kafka))],
+            None,
+        )
+        .await
+        .unwrap();
+        let obs = Arc::new(RecordingObserver::default());
+        tee.set_flush_observer(obs.clone() as Arc<dyn crate::FlushObserver>);
+        assert!(tee.supports_flush_observer());
+
+        r_blob.simulate_flush(0, 9);
+        assert_eq!(
+            obs.fires.lock().unwrap().clone(),
+            vec![(0, 9)],
+            "the blob sink's flush must fire the outer observer even though the kafka sink never flushes"
         );
     }
 }
