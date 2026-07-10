@@ -851,12 +851,20 @@ async fn spawn_mirror(
         }
         _ => None,
     };
+    // The run loop races this watch so a terminal dispatch failure
+    // errors the mirror even when nothing else would surface it:
+    // the flush drainer's death is otherwise invisible (its events
+    // are not regenerated on restart), and the notifier's timer
+    // error only surfaces on the next record, which an idle topic
+    // never delivers.
+    let mut dispatch_error_watch = notifier_opt.as_ref().map(|n| n.terminal_error_watch());
     if matches!(
         trigger_mode,
         Some(mirror_config::TriggerOn::DestinationFlush)
     ) {
         let dispatcher = build_flush_dispatcher(&mirror, cache.as_ref())?
             .with_ack_sink(Arc::clone(&ack_sink_for_notifier));
+        dispatch_error_watch = Some(dispatcher.terminal_error_watch());
         tee.set_flush_observer(std::sync::Arc::new(dispatcher));
     }
 
@@ -934,7 +942,10 @@ async fn spawn_mirror(
                     MIRROR_LABELS
                         .scope(
                             labels,
-                            run_mirror_with_notifier(source, tee, n, shutdown, heartbeat),
+                            run_racing_dispatch_error(
+                                run_mirror_with_notifier(source, tee, n, shutdown, heartbeat),
+                                dispatch_error_watch,
+                            ),
                         )
                         .await
                 }
@@ -942,12 +953,15 @@ async fn spawn_mirror(
                     MIRROR_LABELS
                         .scope(
                             labels,
-                            run_mirror_with_notifier(
-                                source,
-                                tee,
-                                NoOpNotifier,
-                                shutdown,
-                                heartbeat,
+                            run_racing_dispatch_error(
+                                run_mirror_with_notifier(
+                                    source,
+                                    tee,
+                                    NoOpNotifier,
+                                    shutdown,
+                                    heartbeat,
+                                ),
+                                dispatch_error_watch,
                             ),
                         )
                         .await
@@ -960,6 +974,32 @@ async fn spawn_mirror(
         }
         .instrument(span),
     ))
+}
+
+/// Race the mirror run loop against the notify pipeline's terminal
+/// dispatch error. Whichever resolves first errors (or completes)
+/// the mirror; the loser is dropped. With no watch installed the
+/// second branch is pending forever and this is exactly the run
+/// loop.
+async fn run_racing_dispatch_error<Fut>(
+    run: Fut,
+    watch: Option<mirror_notify_kkv::TerminalErrorWatch>,
+) -> Result<(), anyhow::Error>
+where
+    Fut: std::future::Future<Output = Result<(), mirror_core::MirrorError>>,
+{
+    let watch_error = async move {
+        match watch {
+            Some(w) => w.wait().await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::select! {
+        r = run => r.map_err(anyhow::Error::from),
+        e = watch_error => Err(anyhow::anyhow!(
+            "notify dispatch failed terminally: {e}"
+        )),
+    }
 }
 
 /// Construct the `KkvV1Notifier` for a mirror with

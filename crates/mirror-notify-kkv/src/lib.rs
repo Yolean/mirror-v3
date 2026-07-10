@@ -146,7 +146,24 @@ struct NotifierState {
     buffer: TokioMutex<Buffer>,
     new_data: TokioNotify,
     shutting_down: AtomicBool,
-    error_state: TokioMutex<Option<NotifyError>>,
+    error_state: Arc<TokioMutex<Option<NotifyError>>>,
+    /// Signalled (`notify_one`) whenever a background task stashes a
+    /// terminal error into `error_state`, so a
+    /// [`TerminalErrorWatch`] can wake without polling. `on_record`
+    /// still surfaces the error on the next call; the watch exists
+    /// for the idle-topic case where no next call ever comes.
+    error_signal: Arc<TokioNotify>,
+    /// Serializes take-dispatch-ack across the inline drain
+    /// (`on_record` max-records path, shutdown) and the background
+    /// timer drain. Without it two batches can be in flight at once
+    /// and a *later* batch's success can ack past an *earlier* batch
+    /// that is still retrying; `AckTracker::note_through` is
+    /// `fetch_max`, so the periodic source commit would then advance
+    /// past undelivered records and a restart would suppress them
+    /// forever. Holding the lock across the whole dispatch also
+    /// gives the documented backpressure: the consume loop blocks on
+    /// the in-flight batch instead of racing it.
+    dispatch_lock: TokioMutex<()>,
     /// Set once, before any record is dispatched, via
     /// [`KkvV1Notifier::with_ack_sink`]. Shared between
     /// `drain_now` (inline path) and the background timer task so
@@ -232,7 +249,9 @@ impl KkvV1Notifier {
             buffer: TokioMutex::new(Buffer::default()),
             new_data: TokioNotify::new(),
             shutting_down: AtomicBool::new(false),
-            error_state: TokioMutex::new(None),
+            error_state: Arc::new(TokioMutex::new(None)),
+            error_signal: Arc::new(TokioNotify::new()),
+            dispatch_lock: TokioMutex::new(()),
             ack_sink: OnceLock::new(),
         });
 
@@ -267,9 +286,30 @@ impl KkvV1Notifier {
         self
     }
 
+    /// Handle for the supervisor to observe a terminal dispatch
+    /// error without owning the notifier. `on_record` surfaces
+    /// timer-task errors on the next record, but an idle topic never
+    /// produces that next record; racing the run loop against this
+    /// watch closes that gap.
+    pub fn terminal_error_watch(&self) -> TerminalErrorWatch {
+        TerminalErrorWatch {
+            error_state: Arc::clone(&self.state.error_state),
+            signal: Arc::clone(&self.state.error_signal),
+        }
+    }
+
     /// Drain the current buffer (if any) and dispatch it. Used from
     /// both the on_record max-records path and shutdown.
     async fn drain_now(&self) -> Result<(), NotifyError> {
+        let _dispatch = self.state.dispatch_lock.lock().await;
+        // The timer task may have failed terminally while we waited
+        // for the lock. Dispatching (and acking) a later batch after
+        // an earlier one is known-undelivered would let the source
+        // commit advance past the failed batch; surface the error
+        // instead and leave the buffer for the post-restart replay.
+        if let Some(err) = self.state.error_state.lock().await.take() {
+            return Err(err);
+        }
         let batch = {
             let mut buf = self.state.buffer.lock().await;
             buf.take(self.inner.partition)
@@ -282,7 +322,8 @@ impl KkvV1Notifier {
         // Successful dispatch through every endpoint => the batch is
         // delivered. Tell the supervisor's ack tracker so the
         // periodic source-commit task can advance the broker-side
-        // committed offset.
+        // committed offset. Still under the dispatch lock, so acks
+        // arrive in batch order.
         if let Some(ack) = self.state.ack_sink.get() {
             ack.note_through(high + 1);
         }
@@ -751,6 +792,11 @@ async fn timer_loop(inner: Arc<Inner>, state: Arc<NotifierState>, max_time: Dura
         if state.shutting_down.load(Ordering::SeqCst) {
             return;
         }
+        // Serialize with the inline drain path; see the
+        // `dispatch_lock` field docs. Taken before the buffer take so
+        // batches dispatch, and therefore ack, in source-offset
+        // order.
+        let _dispatch = state.dispatch_lock.lock().await;
         let batch = {
             let mut buf = state.buffer.lock().await;
             buf.take(inner.partition)
@@ -760,8 +806,11 @@ async fn timer_loop(inner: Arc<Inner>, state: Arc<NotifierState>, max_time: Dura
             if let Err(e) = inner.dispatch_drained(batch).await {
                 // Stash for the next on_record / shutdown to surface;
                 // exit so the buffer doesn't grow further behind a
-                // broken receiver.
+                // broken receiver. The signal wakes any
+                // TerminalErrorWatch, which covers the idle-topic
+                // case where no next on_record ever comes.
                 *state.error_state.lock().await = Some(e);
+                state.error_signal.notify_one();
                 return;
             }
             // Same ack semantics as `drain_now`: successful POST
@@ -830,6 +879,13 @@ pub struct FlushDispatcher {
     tx: tokio::sync::mpsc::UnboundedSender<FlushEvent>,
     drainer: Option<JoinHandle<()>>,
     error_state: Arc<TokioMutex<Option<NotifyError>>>,
+    /// Signalled when the drainer stashes a terminal error; see
+    /// [`TerminalErrorWatch`]. Without a watcher a drainer death is
+    /// otherwise invisible in production: nothing calls
+    /// `last_error`/`shutdown`, later `on_flushed` sends fail
+    /// silently, and flush events (unlike source records) are not
+    /// regenerated by a restart.
+    error_signal: Arc<TokioNotify>,
     /// Per-mirror readiness handle. `on_flushed` consults
     /// `cache_state.is_mirror_ready(&mirror_name)` and drops events
     /// arriving before the mirror's bootstrap high-watermark is
@@ -848,6 +904,37 @@ pub struct FlushDispatcher {
 enum FlushEvent {
     Flushed { to: u64 },
     Shutdown,
+}
+
+/// Awaitable handle onto a notifier's / dispatcher's terminal
+/// dispatch error. The supervisor races this against the mirror run
+/// loop so a dead webhook pipeline errors the mirror (and thereby
+/// the process) instead of going silent: the orchestrator restarts,
+/// and the post-restart replay-from-committed-offset re-delivers
+/// what the dead pipeline dropped.
+pub struct TerminalErrorWatch {
+    error_state: Arc<TokioMutex<Option<NotifyError>>>,
+    signal: Arc<TokioNotify>,
+}
+
+impl TerminalErrorWatch {
+    /// Resolve once a terminal error is stashed, consuming it.
+    /// Pending forever if dispatch never fails terminally. If the
+    /// run loop consumes the error first (the `on_record` path),
+    /// this stays pending; the run loop's own error wins the race,
+    /// which is fine because either way the mirror errors exactly
+    /// once.
+    pub async fn wait(self) -> NotifyError {
+        loop {
+            if let Some(err) = self.error_state.lock().await.take() {
+                return err;
+            }
+            // notify_one stores a permit when there's no waiter yet,
+            // so a stash happening between the check above and this
+            // await cannot be missed.
+            self.signal.notified().await;
+        }
+    }
 }
 
 impl FlushDispatcher {
@@ -879,11 +966,13 @@ impl FlushDispatcher {
         let inner = Arc::new(build_inner(notify, topic.clone(), partition, resolver)?);
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let error_state = Arc::new(TokioMutex::new(None));
+        let error_signal = Arc::new(TokioNotify::new());
         let ack_sink: Arc<OnceLock<Arc<dyn AckSink>>> = Arc::new(OnceLock::new());
         let drainer = tokio::spawn(flush_drainer_loop(
             Arc::clone(&inner),
             rx,
             Arc::clone(&error_state),
+            Arc::clone(&error_signal),
             Arc::clone(&ack_sink),
         ));
         Ok(Self {
@@ -891,6 +980,7 @@ impl FlushDispatcher {
             tx,
             drainer: Some(drainer),
             error_state,
+            error_signal,
             cache_state,
             mirror_name,
             topic,
@@ -925,11 +1015,21 @@ impl FlushDispatcher {
     }
 
     /// Snapshot the drainer's latest error without consuming the
-    /// dispatcher. Used by `mirror-bin`'s status / supervision loop
-    /// to detect a fatal dispatch failure without waiting for
-    /// shutdown.
+    /// dispatcher. Prefer [`Self::terminal_error_watch`] for
+    /// supervision; this polling accessor remains for tests and
+    /// one-shot status checks.
     pub async fn last_error(&self) -> Option<NotifyError> {
         self.error_state.lock().await.take()
+    }
+
+    /// Handle for the supervisor to observe the drainer's terminal
+    /// error while the dispatcher itself is owned by the sink as a
+    /// `FlushObserver`. See [`TerminalErrorWatch`].
+    pub fn terminal_error_watch(&self) -> TerminalErrorWatch {
+        TerminalErrorWatch {
+            error_state: Arc::clone(&self.error_state),
+            signal: Arc::clone(&self.error_signal),
+        }
     }
 }
 
@@ -970,6 +1070,7 @@ async fn flush_drainer_loop(
     inner: Arc<Inner>,
     mut rx: tokio::sync::mpsc::UnboundedReceiver<FlushEvent>,
     error_state: Arc<TokioMutex<Option<NotifyError>>>,
+    error_signal: Arc<TokioNotify>,
     ack_sink: Arc<OnceLock<Arc<dyn AckSink>>>,
 ) {
     while let Some(event) = rx.recv().await {
@@ -986,6 +1087,7 @@ async fn flush_drainer_loop(
         let payload = KkvV1Payload::new(&inner.topic, offsets, IndexMap::new());
         if let Err(e) = inner.dispatch_batch(&payload).await {
             *error_state.lock().await = Some(e);
+            error_signal.notify_one();
             return;
         }
         // Successful POST => the batch is delivered. The flush event
