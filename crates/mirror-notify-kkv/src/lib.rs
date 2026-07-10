@@ -31,7 +31,7 @@ use indexmap::IndexMap;
 use mirror_config::{
     FanOut, FinalAction, NotifyApi, NotifyOutcome, NotifyOutcomes, NotifyRetry, NotifyTarget,
 };
-use mirror_core::{current_labels, AckSink, CacheState, Notifier, NotifyError, Record};
+use mirror_core::{AckSink, CacheState, Notifier, NotifyError, Record};
 use reqwest::Client;
 use serde::Serialize;
 use thiserror::Error;
@@ -332,6 +332,16 @@ impl KkvV1Notifier {
 }
 
 impl Inner {
+    /// Metric labels from the construction-time mirror identity.
+    /// The `MIRROR_LABELS` task-local is not available here: the
+    /// timer task and the flush drainer are `tokio::spawn`ed at
+    /// construction time, outside the run loop's scope, so
+    /// `current_labels()` would report `unknown/0` for every drain
+    /// they dispatch.
+    fn labels(&self) -> (String, String) {
+        (self.topic.clone(), self.partition.to_string())
+    }
+
     async fn dispatch_drained(&self, batch: DrainedBatch) -> Result<(), NotifyError> {
         let payload = KkvV1Payload::new(&self.topic, batch.offsets, batch.updates);
         self.dispatch_batch(&payload).await
@@ -455,7 +465,7 @@ impl Inner {
         let mut attempt: u32 = 1;
         let mut last_error: String = String::new();
         loop {
-            let (topic_l, partition_l) = current_labels();
+            let (topic_l, partition_l) = self.labels();
             // Per-attempt retry gauge; spec says 1-based, 0 when idle.
             metrics::gauge!(
                 "mirror_v3_notify_inflight_retry",
@@ -553,7 +563,7 @@ impl Inner {
         attempts: u32,
         last_error: String,
     ) -> Result<(), NotifyError> {
-        let (topic_l, partition_l) = current_labels();
+        let (topic_l, partition_l) = self.labels();
         // Reset retry gauge regardless of outcome; the request is
         // no longer in flight.
         metrics::gauge!(
@@ -681,7 +691,7 @@ impl Notifier for KkvV1Notifier {
             .cache_state
             .is_record_suppressed(&self.mirror_name, record.source_offset)
         {
-            let (topic_l, partition_l) = current_labels();
+            let (topic_l, partition_l) = self.inner.labels();
             metrics::counter!(
                 "mirror_v3_notify_suppressed_records_total",
                 "topic" => topic_l,
@@ -698,7 +708,7 @@ impl Notifier for KkvV1Notifier {
         // on edge cases instead of crashing.
         let key_str = render_key(record.key.as_deref());
 
-        let (topic_l, partition_l) = current_labels();
+        let (topic_l, partition_l) = self.inner.labels();
         metrics::counter!(
             "mirror_v3_notify_records_total",
             "topic" => topic_l.clone(),
