@@ -383,61 +383,127 @@ impl Inner {
         }
     }
 
-    /// Fan-out dispatch: resolve, then concurrent POSTs per address.
-    /// First per-address error wins (subsequent results are still
-    /// awaited so we don't leak in-flight requests).
+    /// Fan-out dispatch. The retry loop sits at the endpoint level:
+    /// each attempt resolves the address set fresh (the cache is
+    /// invalidated on any failure), POSTs once per address
+    /// concurrently, and retries the whole set on any retryable
+    /// per-address failure. Retrying a pinned per-address IP instead
+    /// would turn every receiver rolling restart into a mirror
+    /// crash: the dead pod IP eats the full retry budget while the
+    /// replacement pod is one re-resolve away. Addresses that
+    /// already accepted the batch get it again on a retry round;
+    /// kkv invalidations are idempotent and this is within
+    /// at-least-once.
     async fn dispatch_dns_a(
         &self,
         endpoint: &Endpoint,
         state: &DnsAState,
         payload: &KkvV1Payload<'_>,
     ) -> Result<(), NotifyError> {
-        let addrs = state.resolve_or_cached(self.resolver.as_ref()).await?;
-        if addrs.is_empty() {
-            return Err(NotifyError::Transport(format!(
-                "dns-a resolution of {} returned 0 addresses",
-                state.host
-            )));
-        }
-        let futures = addrs.iter().map(|sa| {
-            let mut per_addr_url = endpoint.url.clone();
-            // Set host to the IP literal; set port to the resolved
-            // socket's port (matches the URL's port in production,
-            // but lets test stubs aim at arbitrary axum servers).
-            // Both setters return `Result<(), …>` for malformed
-            // inputs; IPs and small ports never fail here so unwrap
-            // is justified.
-            per_addr_url
-                .set_ip_host(sa.ip())
-                .expect("set_ip_host on a valid URL always succeeds for an IpAddr");
-            per_addr_url
-                .set_port(Some(sa.port()))
-                .expect("set_port on a valid URL with an http(s) scheme succeeds");
-            let host_label = sa.to_string();
-            async move {
-                self.dispatch_to_address(&endpoint.client, per_addr_url, &host_label, payload)
+        let body = serde_json::to_vec(payload)
+            .map_err(|e| NotifyError::Transport(format!("payload serialization failed: {e}")))?;
+        let offsets_header = serde_json::to_string(&payload.offsets).map_err(|e| {
+            NotifyError::Transport(format!("offsets header serialization failed: {e}"))
+        })?;
+
+        let mut attempt: u32 = 1;
+        loop {
+            let addrs = state.resolve_or_cached(self.resolver.as_ref()).await?;
+            if addrs.is_empty() {
+                return Err(NotifyError::Transport(format!(
+                    "dns-a resolution of {} returned 0 addresses",
+                    state.host
+                )));
+            }
+            let futures = addrs.iter().map(|sa| {
+                let mut per_addr_url = endpoint.url.clone();
+                // Set host to the IP literal; set port to the resolved
+                // socket's port (matches the URL's port in production,
+                // but lets test stubs aim at arbitrary axum servers).
+                // Both setters return `Result<(), …>` for malformed
+                // inputs; IPs and small ports never fail here so unwrap
+                // is justified.
+                per_addr_url
+                    .set_ip_host(sa.ip())
+                    .expect("set_ip_host on a valid URL always succeeds for an IpAddr");
+                per_addr_url
+                    .set_port(Some(sa.port()))
+                    .expect("set_port on a valid URL with an http(s) scheme succeeds");
+                let host_label = sa.to_string();
+                let body = &body;
+                let offsets_header = &offsets_header;
+                async move {
+                    let mut last_error = String::new();
+                    let outcome = self
+                        .post_once(
+                            &endpoint.client,
+                            &per_addr_url,
+                            &host_label,
+                            body,
+                            offsets_header,
+                            attempt,
+                            &mut last_error,
+                        )
+                        .await;
+                    (per_addr_url, host_label, outcome, last_error)
+                }
+            });
+            let results = join_all(futures).await;
+
+            let mut want_retry = false;
+            let mut failures: Vec<(Url, String, Outcome, NotifyOutcome, String)> = Vec::new();
+            for (url, host_label, outcome, last_error) in results {
+                if matches!(outcome, Outcome::TwoXx) {
+                    continue;
+                }
+                let policy = self.outcomes.for_outcome(outcome);
+                if policy.retry {
+                    want_retry = true;
+                }
+                failures.push((url, host_label, outcome, policy, last_error));
+            }
+            if failures.is_empty() {
+                return Ok(());
+            }
+
+            // Any failure means the cached set may be stale (K8s
+            // scale-down or rollout mid-batch); the next attempt (or
+            // the next batch) re-resolves.
+            state.invalidate_cache().await;
+
+            if want_retry && attempt < self.retry.max_attempts {
+                let reasons: Vec<String> = failures
+                    .iter()
+                    .map(|(_, host, outcome, _, err)| format!("{host}: {outcome:?} {err}"))
+                    .collect();
+                tracing::warn!(
+                    endpoint = %endpoint.url,
+                    attempt,
+                    max_attempts = self.retry.max_attempts,
+                    failed_addresses = %reasons.join("; "),
+                    "notify dns-a retry with fresh resolution"
+                );
+                let backoff = backoff_for_attempt(self.retry.backoff_ms, attempt);
+                tokio::time::sleep(backoff).await;
+                attempt += 1;
+                continue;
+            }
+
+            // Terminal: apply each failing address's final action;
+            // any `fail` fails the batch.
+            let mut first_err: Option<NotifyError> = None;
+            for (url, host_label, outcome, policy, last_error) in failures {
+                if let Err(e) = self
+                    .apply_final_action(&url, &host_label, outcome, policy, attempt, last_error)
                     .await
+                {
+                    first_err.get_or_insert(e);
+                }
             }
-        });
-        let results = join_all(futures).await;
-        let mut first_err: Option<NotifyError> = None;
-        for r in results {
-            if let Err(e) = r {
-                first_err.get_or_insert(e);
-            }
-        }
-        match first_err {
-            Some(e) => {
-                // Per-spec: "Re-resolve when the cache TTL expires
-                // OR when an address fails repeatedly." Failure
-                // invalidates the cached set immediately so the next
-                // dispatch (after the supervisor restarts the
-                // mirror) picks up any K8s scale-down that happened
-                // mid-batch.
-                state.invalidate_cache().await;
-                Err(e)
-            }
-            None => Ok(()),
+            return match first_err {
+                Some(e) => Err(e),
+                None => Ok(()),
+            };
         }
     }
 
@@ -465,35 +531,17 @@ impl Inner {
         let mut attempt: u32 = 1;
         let mut last_error: String = String::new();
         loop {
-            let (topic_l, partition_l) = self.labels();
-            // Per-attempt retry gauge; spec says 1-based, 0 when idle.
-            metrics::gauge!(
-                "mirror_v3_notify_inflight_retry",
-                "topic" => topic_l.clone(),
-                "partition" => partition_l.clone(),
-                "target_host" => target_host.to_string(),
-            )
-            .set(attempt as f64);
-
-            let start = std::time::Instant::now();
-            let result = client
-                .post(url.clone())
-                .header("content-type", "application/json")
-                .header("x-kkv-topic", &self.topic)
-                .header("x-kkv-offsets", &offsets_header)
-                .body(body.clone())
-                .send()
+            let outcome = self
+                .post_once(
+                    client,
+                    &url,
+                    target_host,
+                    &body,
+                    &offsets_header,
+                    attempt,
+                    &mut last_error,
+                )
                 .await;
-
-            metrics::histogram!(
-                "mirror_v3_notify_post_duration_seconds",
-                "topic" => topic_l.clone(),
-                "partition" => partition_l.clone(),
-                "target_host" => target_host.to_string(),
-            )
-            .record(start.elapsed().as_secs_f64());
-
-            let outcome = classify(result, &mut last_error);
             let policy = self.outcomes.for_outcome(outcome);
 
             tracing::debug!(
@@ -507,21 +555,6 @@ impl Inner {
             );
 
             if matches!(outcome, Outcome::TwoXx) {
-                // Reset retry gauge on success.
-                metrics::gauge!(
-                    "mirror_v3_notify_inflight_retry",
-                    "topic" => topic_l.clone(),
-                    "partition" => partition_l.clone(),
-                    "target_host" => target_host.to_string(),
-                )
-                .set(0.0);
-                metrics::counter!(
-                    "mirror_v3_notify_batches_total",
-                    "topic" => topic_l,
-                    "partition" => partition_l,
-                    "result" => "ok",
-                )
-                .increment(1);
                 return Ok(());
             }
 
@@ -552,6 +585,70 @@ impl Inner {
                 )
                 .await;
         }
+    }
+
+    /// One POST attempt against one address: emits the per-attempt
+    /// retry gauge and duration histogram, classifies the response,
+    /// and on 2xx resets the gauge and counts the batch as ok.
+    /// Shared by the fan-out: none per-address retry loop and the
+    /// dns-a endpoint-level retry loop.
+    #[allow(clippy::too_many_arguments)]
+    async fn post_once(
+        self: &Inner,
+        client: &Client,
+        url: &Url,
+        target_host: &str,
+        body: &[u8],
+        offsets_header: &str,
+        attempt: u32,
+        last_error: &mut String,
+    ) -> Outcome {
+        let (topic_l, partition_l) = self.labels();
+        // Per-attempt retry gauge; spec says 1-based, 0 when idle.
+        metrics::gauge!(
+            "mirror_v3_notify_inflight_retry",
+            "topic" => topic_l.clone(),
+            "partition" => partition_l.clone(),
+            "target_host" => target_host.to_string(),
+        )
+        .set(attempt as f64);
+
+        let start = std::time::Instant::now();
+        let result = client
+            .post(url.clone())
+            .header("content-type", "application/json")
+            .header("x-kkv-topic", &self.topic)
+            .header("x-kkv-offsets", offsets_header)
+            .body(body.to_vec())
+            .send()
+            .await;
+
+        metrics::histogram!(
+            "mirror_v3_notify_post_duration_seconds",
+            "topic" => topic_l.clone(),
+            "partition" => partition_l.clone(),
+            "target_host" => target_host.to_string(),
+        )
+        .record(start.elapsed().as_secs_f64());
+
+        let outcome = classify(result, last_error);
+        if matches!(outcome, Outcome::TwoXx) {
+            metrics::gauge!(
+                "mirror_v3_notify_inflight_retry",
+                "topic" => topic_l.clone(),
+                "partition" => partition_l.clone(),
+                "target_host" => target_host.to_string(),
+            )
+            .set(0.0);
+            metrics::counter!(
+                "mirror_v3_notify_batches_total",
+                "topic" => topic_l,
+                "partition" => partition_l,
+                "result" => "ok",
+            )
+            .increment(1);
+        }
+        outcome
     }
 
     async fn apply_final_action(
