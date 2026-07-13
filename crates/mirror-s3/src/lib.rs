@@ -137,10 +137,19 @@ impl S3Sink {
         // Cache bootstrap: same shape as mirror-fs; replay durable
         // state into the shared CacheState. Compaction = read latest
         // snapshot; append + cache = scan + replay every object.
+        //
+        // The snapshot `view` is a `BTreeMap<key, Record>` whose
+        // `.values()` iterate in key order, not offset order, so
+        // `CacheState::apply_record`'s monotonic guard would drop
+        // every snapshot record whose key happens to land after a
+        // higher-offset key in the alphabet. Sort by `source_offset`
+        // ascending before dispatch (matches mirror-fs).
         if let Some(binding) = cfg.cache.as_ref() {
             match &view {
                 Some(v) => {
-                    for r in v.values() {
+                    let mut snapshot_records: Vec<&Record> = v.values().collect();
+                    snapshot_records.sort_by_key(|r| r.source_offset);
+                    for r in snapshot_records {
                         binding.state.apply_record(&binding.mirror_name, r);
                     }
                 }
@@ -490,6 +499,10 @@ impl Sink for S3Sink {
 
     fn set_flush_observer(&mut self, observer: Arc<dyn mirror_core::FlushObserver>) {
         self.flush_observer = Some(observer);
+    }
+
+    fn supports_flush_observer(&self) -> bool {
+        true
     }
 }
 

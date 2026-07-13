@@ -111,8 +111,8 @@ fn fs_spec(root: &std::path::Path) -> FilesystemSinkConfig {
 }
 
 /// Extract the `updates` map keys from a kkv-v1 notify body. The
-/// notifier POSTs JSON of shape `{"v":"v1","topic":..., "offsets":
-/// {...}, "updates": {"<key>": "<base64>"}}`.
+/// notifier POSTs JSON of shape `{"v":1,"topic":..., "offsets":
+/// {...}, "updates": {"<key>": null}}`.
 fn keys_in_body(body: &[u8]) -> HashSet<String> {
     let v: serde_json::Value = serde_json::from_slice(body).expect("notify body is JSON");
     v.get("updates")
@@ -366,6 +366,235 @@ async fn poll_for_committed(bootstrap: &str, group: &str, timeout: Duration) -> 
     let deadline = std::time::Instant::now() + timeout;
     loop {
         let cfg = KafkaSourceConfig::new(bootstrap.to_string(), group.to_string(), TOPIC, 0);
+        let mut s = KafkaSource::open(cfg).expect("re-open");
+        if let Ok(Some(off)) = s.fetch_committed_offset().await {
+            return Some(off);
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+const TOPIC_UNACKED: &str = "mirror-e2e-unacked-window-replays";
+
+/// The other half of the restart contract: records that are already
+/// durable on the destination but whose notify batch was never acked
+/// (committed) must re-fire after a restart. The destination state
+/// alone would resume above them; the supervisor closes the gap by
+/// setting the tee's resume floor to the committed offset, which
+/// re-reads `[committed, durable)` from the source, skips the
+/// destination writes and lets the suppression threshold (==
+/// committed) admit exactly the un-acked records.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unacked_notify_window_replays_after_restart() {
+    init_tracing();
+    let stack = DockerProvisioner.provision().await.expect("provision");
+    let source_bootstrap = stack.source_bootstrap();
+    let root = tempfile::tempdir().expect("tempdir");
+    create_topic(&source_bootstrap, TOPIC_UNACKED, 1)
+        .await
+        .expect("topic");
+
+    let group_id = format!("mirror-e2e-unacked-window-{}", uuid::Uuid::new_v4());
+    let receiver = WebhookReceiver::start().await;
+    let mut notify = notify_pointing_at(receiver.addr);
+    notify.targets[0].url = format!("http://{}", receiver.addr);
+
+    // Stage A: 5 records consumed and flushed durably, but the
+    // broker commit only reaches offset 3 - as if the receiver died
+    // after acking the first batch and the un-acked batch (offsets
+    // 3-4) never advanced the commit.
+    let pairs: Vec<(String, String)> = (0..5)
+        .map(|i| (format!("k{i:03}"), format!("v{i:03}")))
+        .collect();
+    produce_records(&source_bootstrap, TOPIC_UNACKED, 0, &pairs)
+        .await
+        .expect("produce stage A");
+
+    {
+        let cache = Arc::new(CacheState::new());
+        cache.register_mirror_with_topic("notify", 0, None, false, TOPIC_UNACKED, 0);
+        let cache_binding = CacheBinding {
+            state: Arc::clone(&cache),
+            mirror_name: "notify".into(),
+        };
+        let source = KafkaSource::open(KafkaSourceConfig::new(
+            source_bootstrap.clone(),
+            group_id.clone(),
+            TOPIC_UNACKED,
+            0,
+        ))
+        .expect("open source A");
+        let commit_handle = source.commit_handle();
+        let fs_cfg = FilesystemSinkConfig {
+            cache: Some(mirror_fs::CacheBinding {
+                state: Arc::clone(&cache),
+                mirror_name: "notify".into(),
+            }),
+            destination_name: "notify".into(),
+            ..fs_spec(root.path())
+        };
+        let sink: Box<dyn Sink> = Box::new(FilesystemSink::open(fs_cfg).expect("open fs sink A"));
+        let tee = TeeSink::open(vec![("notify".into(), sink)], Some(cache_binding))
+            .await
+            .expect("tee A");
+        let notifier = mirror_notify_kkv::KkvV1Notifier::from_config(
+            &notify,
+            TOPIC_UNACKED.into(),
+            0,
+            Arc::clone(&cache),
+            "notify".into(),
+        )
+        .expect("notifier A");
+
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+        let signal = async move {
+            let _ = shutdown_rx.changed().await;
+        };
+        let handle = tokio::spawn(async move {
+            run_mirror_with_notifier(
+                source,
+                tee,
+                notifier,
+                signal,
+                mirror_core::DEFAULT_HEARTBEAT_INTERVAL,
+            )
+            .await
+        });
+
+        receiver.wait_for(1, Duration::from_secs(15)).await;
+        let _ = shutdown_tx.send(true);
+        handle.await.expect("join A").expect("mirror A ok");
+        // The graceful shutdown flushed offsets 0-4 to the fs chain
+        // (durable head = 5); commit only through 3.
+        commit_handle.commit_through(3).expect("commit_through");
+        commit_handle.commit_pending().expect("commit_pending");
+    }
+
+    let observed = poll_for_committed_on(
+        &source_bootstrap,
+        &group_id,
+        TOPIC_UNACKED,
+        Duration::from_secs(10),
+    )
+    .await;
+    assert_eq!(observed, Some(3), "broker must report committed offset 3");
+
+    let baseline = receiver.request_count();
+
+    // Stage B: restart against the same fs root and group. Replicates
+    // the supervisor's startup recipe: threshold = committed,
+    // resume floor = max(committed, low watermark).
+    {
+        let cache = Arc::new(CacheState::new());
+        cache.register_mirror_with_topic("notify", 5, Some(3), false, TOPIC_UNACKED, 0);
+        let cache_binding = CacheBinding {
+            state: Arc::clone(&cache),
+            mirror_name: "notify".into(),
+        };
+        let source = KafkaSource::open(KafkaSourceConfig::new(
+            source_bootstrap.clone(),
+            group_id.clone(),
+            TOPIC_UNACKED,
+            0,
+        ))
+        .expect("open source B");
+        let fs_cfg = FilesystemSinkConfig {
+            cache: Some(mirror_fs::CacheBinding {
+                state: Arc::clone(&cache),
+                mirror_name: "notify".into(),
+            }),
+            destination_name: "notify".into(),
+            ..fs_spec(root.path())
+        };
+        let sink: Box<dyn Sink> = Box::new(FilesystemSink::open(fs_cfg).expect("open fs sink B"));
+        let mut tee = TeeSink::open(vec![("notify".into(), sink)], Some(cache_binding))
+            .await
+            .expect("tee B");
+        let durable_head = tee.heads().iter().map(|(_, h)| *h).min().unwrap();
+        assert_eq!(durable_head, 5, "stage A must have flushed 0-4 durably");
+        tee.set_resume_floor(3);
+
+        let notifier = mirror_notify_kkv::KkvV1Notifier::from_config(
+            &notify,
+            TOPIC_UNACKED.into(),
+            0,
+            Arc::clone(&cache),
+            "notify".into(),
+        )
+        .expect("notifier B");
+
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+        let signal = async move {
+            let _ = shutdown_rx.changed().await;
+        };
+        let handle = tokio::spawn(async move {
+            run_mirror_with_notifier(
+                source,
+                tee,
+                notifier,
+                signal,
+                mirror_core::DEFAULT_HEARTBEAT_INTERVAL,
+            )
+            .await
+        });
+
+        // No new records are produced: everything that arrives at the
+        // receiver is the replayed un-acked window.
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            if receiver.request_count() > baseline {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("stage B: no webhook fired for the un-acked window");
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let all_captured = receiver.captured().await;
+        let mut replay_keys: HashSet<String> = HashSet::new();
+        for req in &all_captured[baseline..] {
+            replay_keys.extend(keys_in_body(&req.body));
+        }
+        for i in 3..5 {
+            let want = format!("k{i:03}");
+            assert!(
+                replay_keys.contains(&want),
+                "un-acked window key {want} must re-fire; got {replay_keys:?}"
+            );
+        }
+        for i in 0..3 {
+            let unwanted = format!("k{i:03}");
+            assert!(
+                !replay_keys.contains(&unwanted),
+                "committed key {unwanted} must stay suppressed; got {replay_keys:?}"
+            );
+        }
+
+        let _ = shutdown_tx.send(true);
+        handle.await.expect("join B").expect("mirror B ok");
+    }
+
+    // The replay must not have duplicated destination data: the
+    // chain still ends at offset 4.
+    let sink_check = FilesystemSink::open(fs_spec(root.path())).expect("re-open for check");
+    let mut boxed: Box<dyn Sink> = Box::new(sink_check);
+    let head = boxed.next_expected_offset().await.expect("head check");
+    assert_eq!(head, 5, "destination chain must be unchanged by the replay");
+}
+
+async fn poll_for_committed_on(
+    bootstrap: &str,
+    group: &str,
+    topic: &str,
+    timeout: Duration,
+) -> Option<u64> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let cfg = KafkaSourceConfig::new(bootstrap.to_string(), group.to_string(), topic, 0);
         let mut s = KafkaSource::open(cfg).expect("re-open");
         if let Ok(Some(off)) = s.fetch_committed_offset().await {
             return Some(off);

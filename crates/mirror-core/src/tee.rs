@@ -64,6 +64,17 @@ struct InnerSink {
 pub struct TeeSink {
     inners: Vec<InnerSink>,
     cache: Option<CacheBinding>,
+    /// Resume cursor for notify re-delivery. When the supervisor
+    /// sets a floor below the inner sinks' heads (the broker-side
+    /// committed offset of a notify mirror), the tee reports it as
+    /// `next_expected_offset` so the source seeks there and the run
+    /// loop re-presents `[floor, min(heads))` to the notifier; the
+    /// per-sink head skip keeps the destinations write-idempotent
+    /// through the replay. The cursor then advances with every
+    /// `write` call (including fully-skipped replays) so the idle
+    /// drift re-check, which requires `next_expected_offset ==` the
+    /// loop's own tracker, stays satisfied mid-replay.
+    resume_cursor: Option<u64>,
 }
 
 impl TeeSink {
@@ -89,7 +100,23 @@ impl TeeSink {
             let head = sink.next_expected_offset().await?;
             inners.push(InnerSink { name, sink, head });
         }
-        Ok(Self { inners, cache })
+        Ok(Self {
+            inners,
+            cache,
+            resume_cursor: None,
+        })
+    }
+
+    /// Lower the tee's reported resume position to `floor` so the
+    /// run loop re-reads `[floor, min(heads))` from the source. Used
+    /// by the supervisor for notify mirrors: records that were made
+    /// durable on the destinations but whose webhook batch was never
+    /// acked (committed) get re-presented to the notifier, closing
+    /// the at-least-once gap across restarts. A floor at or above
+    /// the inner minimum is a no-op. Call before the run loop
+    /// starts; the cursor is not meant to move backwards mid-run.
+    pub fn set_resume_floor(&mut self, floor: u64) {
+        self.resume_cursor = Some(floor);
     }
 
     /// Test-only / mirror-bin-style constructor that skips the open
@@ -107,6 +134,18 @@ impl TeeSink {
                 .map(|(name, sink, head)| InnerSink { name, sink, head })
                 .collect(),
             cache,
+            resume_cursor: None,
+        }
+    }
+
+    /// Keep the resume cursor in step with the run loop's `expected`
+    /// tracker: every write call (skipped or fanned out) means the
+    /// loop is about to expect `record_offset + 1`. The idle drift
+    /// re-check compares `next_expected_offset()` for equality, so a
+    /// stale cursor would fail it mid-replay.
+    fn advance_resume_cursor(&mut self, record_offset: u64) {
+        if let Some(cursor) = self.resume_cursor {
+            self.resume_cursor = Some(cursor.max(record_offset + 1));
         }
     }
 
@@ -140,12 +179,19 @@ impl Sink for TeeSink {
                 inner.head = head;
             }
         }
-        Ok(self
+        let inner_min = self
             .inners
             .iter()
             .map(|i| i.head)
             .min()
-            .expect("non-empty by construction"))
+            .expect("non-empty by construction");
+        // The resume cursor can only lower the reported position
+        // (replay for notify re-delivery); it never holds the tee
+        // above the inner minimum.
+        Ok(match self.resume_cursor {
+            Some(cursor) => inner_min.min(cursor),
+            None => inner_min,
+        })
     }
 
     async fn write(&mut self, record: Record) -> Result<(), SinkError> {
@@ -168,9 +214,13 @@ impl Sink for TeeSink {
             }
         }
         if indices.is_empty() {
-            // Every inner sink is already past this offset (rare:
-            // only happens during restart with all sinks recovered
-            // to or beyond `record_offset`). Drop the record.
+            // Every inner sink is already past this offset: the
+            // notify-resume replay window, or a restart with all
+            // sinks recovered beyond `record_offset`. Drop the
+            // record for the destinations (the run loop still hands
+            // it to the notifier) but keep the resume cursor in step
+            // with the loop's `expected` tracker.
+            self.advance_resume_cursor(record_offset);
             return Ok(());
         }
 
@@ -217,6 +267,7 @@ impl Sink for TeeSink {
         if let Some((name, e)) = first_err {
             return Err(SinkError::Transport(format!("inner sink {name}: {e}")));
         }
+        self.advance_resume_cursor(record_offset);
         Ok(())
     }
 
@@ -306,25 +357,58 @@ impl Sink for TeeSink {
     }
 
     fn set_flush_observer(&mut self, observer: Arc<dyn FlushObserver>) {
-        if self.inners.len() == 1 {
-            // Length-1 tee (the common case for single-destination
-            // mirrors): forward the observer to the only inner sink
-            // unchanged. `from`/`to` flow through verbatim.
-            self.inners[0].sink.set_flush_observer(observer);
-            return;
+        // Only sinks that actually fire flush events participate in
+        // the min-coordination. A per-record sink (Kafka) never
+        // calls its observer, so including it would pin the min at
+        // 0 and the outer observer would never fire on a mixed
+        // blob+kafka mirror.
+        let supporting: Vec<usize> = self
+            .inners
+            .iter()
+            .enumerate()
+            .filter(|(_, inner)| inner.sink.supports_flush_observer())
+            .map(|(i, _)| i)
+            .collect();
+        match supporting.len() {
+            0 => {
+                // The config validator rejects destination-flush
+                // without a blob destination, so this is a
+                // programming error rather than an operator one;
+                // keep it loud.
+                tracing::error!(
+                    "set_flush_observer on a tee with no flush-capable inner sink; flush notifications will never fire"
+                );
+            }
+            1 => {
+                // Single flush-capable sink (covers the common
+                // single-destination mirror): forward the observer
+                // unchanged. `from`/`to` flow through verbatim.
+                self.inners[supporting[0]].sink.set_flush_observer(observer);
+            }
+            n => {
+                // Multiple flush-capable sinks: wrap the outer
+                // observer with a per-sink relay + min-coordinator.
+                // The outer observer fires only when every
+                // flush-capable inner sink has committed past a
+                // watermark - the spec's "fire when ALL destinations
+                // have committed past the batch's high-water offset".
+                let coordinator = Arc::new(MinFlushCoordinator::new(n, observer));
+                for (relay_index, inner_index) in supporting.into_iter().enumerate() {
+                    self.inners[inner_index]
+                        .sink
+                        .set_flush_observer(Arc::new(PerSinkRelay {
+                            sink_index: relay_index,
+                            coordinator: Arc::clone(&coordinator),
+                        }));
+                }
+            }
         }
-        // Multi-destination: wrap the outer observer with a per-sink
-        // relay + a min-coordinator. The outer observer fires only
-        // when *every* inner sink has committed past a watermark -
-        // matching the spec's "fire when ALL destinations have
-        // committed past the batch's high-water offset".
-        let coordinator = Arc::new(MinFlushCoordinator::new(self.inners.len(), observer));
-        for (sink_index, inner) in self.inners.iter_mut().enumerate() {
-            inner.sink.set_flush_observer(Arc::new(PerSinkRelay {
-                sink_index,
-                coordinator: Arc::clone(&coordinator),
-            }));
-        }
+    }
+
+    fn supports_flush_observer(&self) -> bool {
+        self.inners
+            .iter()
+            .any(|inner| inner.sink.supports_flush_observer())
     }
 }
 
@@ -428,6 +512,10 @@ mod tests {
         flush_count: Arc<Mutex<u32>>,
         fail_on_offset: Option<u64>,
         allow_compacted: bool,
+        /// Mirrors the FS/S3 (`true`) vs Kafka (`false`) split in
+        /// `Sink::supports_flush_observer`. Default true so the
+        /// existing flush-coordination tests model blob sinks.
+        flush_capable: bool,
         aligned_to: Arc<Mutex<Option<u64>>>,
         /// The observer the tee installed via `set_flush_observer`,
         /// if any. Tests fire it explicitly via [`Self::simulate_flush`]
@@ -455,6 +543,7 @@ mod tests {
                     flush_count,
                     fail_on_offset: None,
                     allow_compacted: false,
+                    flush_capable: true,
                     aligned_to,
                     observer,
                 },
@@ -467,6 +556,13 @@ mod tests {
         }
         fn with_allow_compacted(mut self, allow: bool) -> Self {
             self.allow_compacted = allow;
+            self
+        }
+        /// Model a per-record sink (Kafka): accepts an observer
+        /// install but never fires it and reports itself
+        /// flush-incapable.
+        fn without_flush_support(mut self) -> Self {
+            self.flush_capable = false;
             self
         }
     }
@@ -533,6 +629,9 @@ mod tests {
         }
         fn set_flush_observer(&mut self, observer: Arc<dyn crate::FlushObserver>) {
             *self.observer.lock().unwrap() = Some(observer);
+        }
+        fn supports_flush_observer(&self) -> bool {
+            self.flush_capable
         }
     }
 
@@ -772,5 +871,79 @@ mod tests {
         // a re-reports 5; min doesn't advance; no fire.
         ra.simulate_flush(0, 5);
         assert_eq!(obs.fires.lock().unwrap().clone(), vec![(0, 5)]);
+    }
+
+    #[tokio::test]
+    async fn resume_floor_lowers_reported_start_and_tracks_replay() {
+        let (a, ra) = Recording::new(5);
+        let mut tee = TeeSink::open(vec![("a".into(), boxed(a))], None)
+            .await
+            .unwrap();
+        tee.set_resume_floor(2);
+        assert_eq!(
+            tee.next_expected_offset().await.unwrap(),
+            2,
+            "floor lowers the reported start below the inner head"
+        );
+        // Replay window 2..=4: dropped for the destination, but the
+        // reported next-expected must track the loop's tracker or
+        // the idle drift re-check fails mid-replay.
+        for offset in 2..=4 {
+            tee.write(rec(offset)).await.unwrap();
+            assert_eq!(tee.next_expected_offset().await.unwrap(), offset + 1);
+        }
+        assert_eq!(
+            ra.writes(),
+            Vec::<u64>::new(),
+            "replay must not re-write to the destination"
+        );
+        // From the destination head onward, writes fan out normally
+        // and the cursor converges with the inner heads.
+        for offset in 5..=7 {
+            tee.write(rec(offset)).await.unwrap();
+        }
+        assert_eq!(ra.writes(), vec![5, 6, 7]);
+        assert_eq!(tee.next_expected_offset().await.unwrap(), 8);
+    }
+
+    #[tokio::test]
+    async fn resume_floor_at_or_above_inner_min_is_a_noop() {
+        let (a, _ra) = Recording::new(3);
+        let mut tee = TeeSink::open(vec![("a".into(), boxed(a))], None)
+            .await
+            .unwrap();
+        tee.set_resume_floor(9);
+        assert_eq!(
+            tee.next_expected_offset().await.unwrap(),
+            3,
+            "the cursor never raises the tee above the inner minimum"
+        );
+    }
+
+    /// The mixed blob+kafka regression: a per-record sink must not
+    /// pin the flush min at 0. With the kafka-like sink excluded
+    /// from coordination, the blob sink's flush alone drives the
+    /// outer observer.
+    #[tokio::test]
+    async fn flush_observer_ignores_sinks_that_never_flush() {
+        let (blob, r_blob) = Recording::new(0);
+        let (kafka, _r_kafka) = Recording::new(0);
+        let kafka = kafka.without_flush_support();
+        let mut tee = TeeSink::open(
+            vec![("blob".into(), boxed(blob)), ("kafka".into(), boxed(kafka))],
+            None,
+        )
+        .await
+        .unwrap();
+        let obs = Arc::new(RecordingObserver::default());
+        tee.set_flush_observer(obs.clone() as Arc<dyn crate::FlushObserver>);
+        assert!(tee.supports_flush_observer());
+
+        r_blob.simulate_flush(0, 9);
+        assert_eq!(
+            obs.fires.lock().unwrap().clone(),
+            vec![(0, 9)],
+            "the blob sink's flush must fire the outer observer even though the kafka sink never flushes"
+        );
     }
 }

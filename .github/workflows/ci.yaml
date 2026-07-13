@@ -40,6 +40,11 @@ jobs:
       with:
         components: rustfmt, clippy
     - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
+      with:
+        # PRs restore from main's cache but don't write their own —
+        # otherwise every (rustc, Cargo.lock) tuple per PR adds a
+        # ~500 MB entry and the per-repo cache budget blows up.
+        save-if: ${{ github.ref == 'refs/heads/main' }}
     - run: cargo fmt --all -- --check
     - run: cargo clippy --workspace --all-targets --locked -- -Dwarnings
     - name: unit + integration tests (no docker)
@@ -56,11 +61,15 @@ jobs:
       run: sudo apt-get update && sudo apt-get install -y --no-install-recommends $LIBRDKAFKA_BUILD_DEPS
     - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable as of 2026-03-27
     - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
+      with:
+        # See note in the `test` job: PRs restore but don't save,
+        # so PR runs don't proliferate the per-repo cache budget.
+        save-if: ${{ github.ref == 'refs/heads/main' }}
     - name: prepull e2e images
       run: |
-        docker pull quay.io/ogunalp/kafka-native:latest &
-        docker pull docker.io/redpandadata/redpanda:latest &
-        docker pull docker.io/versity/versitygw:latest &
+        docker pull quay.io/ogunalp/kafka-native:latest@sha256:9ae667c854cd25a86a2d263e0cd7352cd6ffa6395c2dec5f90ab9056cc60b14f &
+        docker pull docker.io/redpandadata/redpanda:v26.1.12 &
+        docker pull docker.io/versity/versitygw:v1.6.0 &
         docker pull ghcr.io/shopify/toxiproxy:2.12.0 &
         wait
     - name: cargo test mirror-e2e
@@ -73,6 +82,9 @@ jobs:
     permissions:
       packages: write
       contents: read
+      # The prune-superseded-caches step at the end of this job
+      # deletes obsolete buildkit blobs via `gh cache delete`.
+      actions: write
     steps:
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
     - uses: docker/setup-qemu-action@ce360397dd3f832beb865e1373c09c0e9f86d70a  # v4.0.0
@@ -87,7 +99,9 @@ jobs:
     - id: meta
       uses: docker/metadata-action@030e881283bb7a6894de51c315a6bfe6a94e05cf  # v6.0.0
       with:
-        images: ghcr.io/yolean/mirror-v3
+        # repository_owner keeps pushes working from forks (e.g.
+        # YoleanAgents); metadata-action lowercases the owner.
+        images: ghcr.io/${{ github.repository_owner }}/mirror-v3
         # Tag rules (sha tag is the full 40-char commit SHA, no prefix):
         #   - push to main          -> :main and :latest and :<full-sha>
         #   - push to tag vX.Y.Z    -> :vX.Y.Z (and :latest if default-branch)
@@ -117,3 +131,40 @@ jobs:
         cache-from: type=gha
         cache-to: type=gha,mode=max
         provenance: false
+    - name: prune superseded main buildkit caches
+      # Buildx writes content-addressed blobs and an index per build.
+      # Blobs are NOT re-uploaded when their content is unchanged, so
+      # a stable base layer keeps the createdAt of the build that
+      # first uploaded it while still being referenced by every newer
+      # index. Pruning by creation time would therefore delete the
+      # most stable, still-referenced blobs first and send the next
+      # build partially cold. lastAccessedAt is the safe ordering:
+      # restores touch every blob they read, so anything the latest
+      # main build actually used sorts to the top and the deletions
+      # hit genuinely dead entries. Keep the top N most-recently-
+      # accessed buildkit-* / index-buildkit-* entries on
+      # refs/heads/main; delete the rest.
+      #
+      # N=200 is roughly 2-4 main builds' worth (one multi-arch build
+      # writes ~30-50 entries). Adjust if a single build ever pushes
+      # close to the limit — symptom is the *next* main build going
+      # cold despite this step running.
+      if: github.ref == 'refs/heads/main' && github.event_name == 'push' && success()
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        set -euo pipefail
+        to_delete=$(gh cache list -R "$GITHUB_REPOSITORY" -L 1000 \
+          --json id,key,ref,lastAccessedAt \
+          --jq '[ .[]
+                  | select(.ref == "refs/heads/main")
+                  | select((.key | startswith("buildkit-")) or (.key | startswith("index-buildkit-")))
+                ]
+                | sort_by(.lastAccessedAt) | reverse | .[200:] | .[].id')
+        if [ -n "${to_delete:-}" ]; then
+          count=$(echo "$to_delete" | wc -l | tr -d ' ')
+          echo "Pruning $count superseded buildkit cache entries on main"
+          echo "$to_delete" | xargs -I {} gh cache delete -R "$GITHUB_REPOSITORY" {}
+        else
+          echo "No superseded buildkit caches to prune"
+        fi

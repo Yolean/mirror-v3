@@ -535,3 +535,70 @@ async fn compaction_idle_flush_now_does_not_emit_file() {
         "idle flush in compaction mode must not emit a file"
     );
 }
+
+#[tokio::test]
+async fn compaction_snapshot_replay_populates_full_cache_view() {
+    // Regression: BTreeMap<key, Record>.values() yields snapshot
+    // records in lexicographic key order. CacheState::apply_record
+    // enforces per-(topic, partition) offset monotonicity, so if the
+    // first replayed record's offset clamps `last_seen`, every
+    // later snapshot record at a lower offset is silently dropped
+    // and the in-memory cache ends up as a random subset of the
+    // snapshot. The supervisor's bootstrap path must sort by
+    // source_offset before dispatch.
+    //
+    // Construct keys whose alphabetic order disagrees with their
+    // source-offset order: "z-first" lands at the highest offset
+    // but its key sorts first under most ordinal expectations after
+    // the lower-offset "a-…" keys; pick a layout that exposes the
+    // bug in EITHER direction.
+    use mirror_core::CacheBinding;
+    use mirror_fs::CacheBinding as FsCacheBinding;
+    let tmp = tempfile::tempdir().unwrap();
+    // Write a snapshot by emitting 4 records that flush together.
+    let mut writer_cfg = cfg_compacted(tmp.path(), 4);
+    writer_cfg.cache = None;
+    let mut sink = FilesystemSink::open(writer_cfg).unwrap();
+    // alphabetical key order: alpha < beta < gamma < zeta
+    // source-offset order:    zeta=0, gamma=1, beta=2, alpha=3
+    sink.write(rec_kv(0, "zeta", Some("vz"))).await.unwrap();
+    sink.write(rec_kv(1, "gamma", Some("vg"))).await.unwrap();
+    sink.write(rec_kv(2, "beta", Some("vb"))).await.unwrap();
+    sink.write(rec_kv(3, "alpha", Some("va"))).await.unwrap();
+    drop(sink); // close + flush via Drop is not enough; flush explicitly
+    let mut sink = FilesystemSink::open(cfg_compacted(tmp.path(), 100)).unwrap();
+    sink.flush_now().await.unwrap();
+    drop(sink);
+    // Snapshot file exists; now re-open with a cache binding and
+    // assert every key is in the bootstrapped view.
+    let cache_state = std::sync::Arc::new(mirror_core::CacheState::new());
+    cache_state.register_mirror("ops", 0, None, false);
+    let mut reopen_cfg = cfg_compacted(tmp.path(), 100);
+    reopen_cfg.cache = Some(FsCacheBinding {
+        state: std::sync::Arc::clone(&cache_state),
+        mirror_name: "ops".into(),
+    });
+    // Cross-check that the binding alias matches mirror-core's
+    // shape — both crates re-export the same struct.
+    let _: CacheBinding = CacheBinding {
+        state: std::sync::Arc::clone(&cache_state),
+        mirror_name: "ops".into(),
+    };
+    let _sink = FilesystemSink::open(reopen_cfg).unwrap();
+    assert_eq!(
+        cache_state.get_value_for("ops", "alpha").as_deref(),
+        Some(b"va".as_ref())
+    );
+    assert_eq!(
+        cache_state.get_value_for("ops", "beta").as_deref(),
+        Some(b"vb".as_ref())
+    );
+    assert_eq!(
+        cache_state.get_value_for("ops", "gamma").as_deref(),
+        Some(b"vg".as_ref())
+    );
+    assert_eq!(
+        cache_state.get_value_for("ops", "zeta").as_deref(),
+        Some(b"vz".as_ref())
+    );
+}

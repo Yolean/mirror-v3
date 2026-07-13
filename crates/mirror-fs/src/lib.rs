@@ -163,10 +163,24 @@ impl FilesystemSink {
         // - compaction:log → fold the loaded snapshot view.
         // - append → replay the whole chain (cost is linear in the
         //   total record count; documented for large topics).
+        //
+        // `apply_record` enforces per-(topic, partition) offset
+        // monotonicity and silently skips records with
+        // `source_offset <= last_seen`. The compacted snapshot is a
+        // `BTreeMap<key, Record>` whose `.values()` iterate in
+        // lexicographic key order, NOT offset order — without
+        // sorting, the first replayed record's offset would clamp
+        // every subsequent record whose key happens to land
+        // alphabetically later but at a lower offset, leaving the
+        // in-memory view with a key-order-dependent subset of the
+        // snapshot. Sort by `source_offset` ascending before
+        // dispatch so every snapshot record passes the guard.
         if let Some(binding) = cfg.cache.as_ref() {
             match &view {
                 Some(v) => {
-                    for r in v.values() {
+                    let mut snapshot_records: Vec<&Record> = v.values().collect();
+                    snapshot_records.sort_by_key(|r| r.source_offset);
+                    for r in snapshot_records {
                         binding.state.apply_record(&binding.mirror_name, r);
                     }
                 }
@@ -545,6 +559,10 @@ impl Sink for FilesystemSink {
 
     fn set_flush_observer(&mut self, observer: std::sync::Arc<dyn mirror_core::FlushObserver>) {
         self.flush_observer = Some(observer);
+    }
+
+    fn supports_flush_observer(&self) -> bool {
+        true
     }
 }
 

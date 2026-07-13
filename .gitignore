@@ -1,1 +1,6 @@
 /target
+
+# Local design memos / shelf notes — useful for human resumption
+# of in-flight design work but not stable enough to commit. Files
+# matching this pattern stay in the working tree, unversioned.
+NOTES_*.md
