@@ -272,3 +272,37 @@ async fn buffer_continues_to_accept_after_inline_drain() {
     assert_eq!(body0["offsets"], serde_json::json!({"0": 11}));
     assert_eq!(body1["offsets"], serde_json::json!({"0": 13}));
 }
+
+/// Idle-topic variant of timer-drain failure: with no further
+/// on_record call there is nothing to surface the stashed error, so
+/// the supervisor needs the terminal-error watch to learn the
+/// notify pipeline is dead.
+#[tokio::test]
+async fn terminal_error_watch_fires_on_timer_exhaustion_without_further_records() {
+    let server = TestServer::start(Reply::Status(500), vec![]).await;
+    let cfg = notify_pointing_at_debounced(
+        server.addr,
+        NotifyOutcomes::default(),
+        NotifyRetry {
+            max_attempts: 2,
+            backoff_ms: 1,
+        },
+        1000,
+        NotifyDebounce {
+            max_records: 100,
+            max_time_ms: 20,
+        },
+    );
+    let mut notifier =
+        KkvV1Notifier::from_config(&cfg, "t".into(), 0, ready_cache("m"), "m".into()).unwrap();
+    let watch = notifier.terminal_error_watch();
+
+    // One record, then silence: the timer drains it after
+    // max-time-ms and exhausts retries against the 500-only server.
+    notifier.on_record(&rec(0, "k0")).await.unwrap();
+
+    let err = tokio::time::timeout(Duration::from_secs(5), watch.wait())
+        .await
+        .expect("watch must resolve on timer-drain exhaustion");
+    assert!(format!("{err}").to_lowercase().contains("exhausted"));
+}
