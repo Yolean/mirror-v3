@@ -578,6 +578,19 @@ impl CacheState {
             })
     }
 
+    /// Whether the mirror serves `/cache/v1` (keeps values). Only these
+    /// mirrors gate the process's readiness.
+    pub fn serves_values(&self, mirror_name: &str) -> bool {
+        let mirrors = self.mirrors.read().expect("cache mirrors poisoned");
+        mirrors.get(mirror_name).is_some_and(|slot| {
+            slot.data
+                .read()
+                .expect("mirror data poisoned")
+                .view
+                .is_some()
+        })
+    }
+
     /// Whether the mirror has applied every record that was in its
     /// source partition when the process started. Sticky: the last
     /// applied offset only grows. `false` for an unknown mirror.

@@ -2,7 +2,7 @@
 
 Exactly-once Kafka topic+partition mirroring to **Kafka**, **Filesystem**, or **S3**, in one deployment.
 
-> **Status:** feature-complete for the `checkit/mirror-v3` cutover: Kafka source + Kafka/Filesystem/S3 sinks, `/cache/v1` HTTP surface, kkv-v1 notify webhooks, committed-offset delivery semantics and non-sticky readiness. See [AGENTS.md](AGENTS.md) for the development history.
+> **Status:** feature-complete for the `checkit/mirror-v3` cutover: Kafka source + Kafka/Filesystem/S3 sinks, `/cache/v1` HTTP surface, kkv-v1 notify webhooks, committed-offset delivery semantics and sticky readiness (as kafka-keyvalue). See [AGENTS.md](AGENTS.md) for the development history.
 
 ## What this gives you
 
@@ -74,7 +74,7 @@ GET /cache/v1/{mirror}/keys                       → newline-separated keys
 GET /cache/v1/{mirror}/values                     → newline-separated raw values
 ```
 
-Each mirror owns its own `key → latest-value` view; a key only shows up under the mirror that consumed it. Reads carry `x-kkv-last-seen-offsets: <JSON>` and return **503** until that mirror is `ready` (non-sticky, lag-based; see [Readiness](#readiness)) — same readiness contract as KKV, so dependents don't transiently see an older state across reloads. The view updates per-record from the consume loop, decoupled from disk flush cadence (set `flush.max-time-ms` high to save bucket ops without sacrificing freshness). Updates are monotonic; if a future feature ever rewinds source consumption, the cache stays at the highest offset seen.
+Each mirror owns its own `key → latest-value` view; a key only shows up under the mirror that consumed it. Reads carry `x-kkv-last-seen-offsets: <JSON>` and return **503** until that mirror has caught up to its source's high watermark at startup, and never again afterwards (sticky, as kafka-keyvalue; see [Readiness](#readiness)), so dependents don't see a partially rebuilt state. The view updates per-record from the consume loop, decoupled from disk flush cadence (set `flush.max-time-ms` high to save bucket ops without sacrificing freshness). Updates are monotonic; if a future feature ever rewinds source consumption, the cache stays at the highest offset seen.
 
 To keep existing kkv consumers working unmodified during a migration, **one** mirror per process may additionally set `cache-v1-main: {}`. That mounts the unprefixed `/cache/v1/...` paths onto that mirror's view (alias-only — same handlers, no separate data path). The validator rejects more than one `cache-v1-main` in the config. Mirror names that collide with the literal path segments `raw | offset | keys | values` are rejected.
 
@@ -182,30 +182,33 @@ docker run --rm -v "$PWD/examples:/cfg" mirror-v3:dev validate --config /cfg/kaf
 
 ```json
 {
-  "ready": "ready" | "warming" | "degraded",
+  "ready": "ready" | "warming",
   "mirrors": [
     {
       "name": "userstate",
+      "gates_readiness": true,
+      "caught_up": true,
       "status": "ready" | "warming" | "lag_behind_source"
               | "source_unassigned" | "destination_lagging",
       "source": {
         "topic": "userstate", "partition": 0, "assigned": true,
         "end_offset": 12345, "last_applied_offset": 12345, "lag": 0
-      },
-      "destination": { "name": "userstate-gcs", "lag": 5 }
+      }
     }
   ],
-  "unhealthy": ["userstate"]
+  "unhealthy": []
 }
 ```
 
-HTTP status is `200` iff every mirror is `ready`; `503` otherwise. The drop-in `@yolean/kafka-keyvalue` Node client only inspects the status code, so the body is transparent to legacy consumers but greppable for on-call.
+HTTP status is `200` once every mirror that serves `/cache/v1` (`gates_readiness`) has caught up to its source's high watermark at startup, and stays `200` (sticky, as kafka-keyvalue); `503` before. A moment's lag after that is not an outage: it is the `status`/`lag` fields here and the `mirror_v3_source_lag_offsets` metric. Mirrors without `http-access` are listed but do not gate: a blob mirror waiting for S3 does not take the cache out of its Service. The drop-in `@yolean/kafka-keyvalue` Node client only inspects the status code.
 
-Per-mirror `/cache/v1/{mirror}/...` routes return the matching `mirrors[i]` element as the `503` body, so a polling consumer sees a meaningful retry signal instead of opaque `503`.
+`GET /q/health/live` answers `200` while the process serves HTTP.
+
+Per-mirror `/cache/v1/{mirror}/...` routes return the matching `mirrors[i]` element as the `503` body before their mirror has caught up.
 
 Tuning:
 
-- `MIRROR_V3_READINESS_LAG` (default `0`) — offsets of lag tolerated before `LagBehindSource` fires.
+- `MIRROR_V3_READINESS_LAG` (default `0`) — offsets of lag tolerated before the body's `status` says `lag_behind_source` (it does not change the HTTP status).
 - `MIRROR_V3_READINESS_POLL_MS` (default `2000`) — how often each mirror's broker high-watermark + consumer assignment is re-checked. `0` disables the poller.
 - `MIRROR_V3_OFFSET_COMMIT_INTERVAL_MS` (default `5000`) — how often the supervisor commits the consumer's progress back to the broker. `0` disables (the mirror still works but loses the between-pods notify guarantee on the next restart).
 

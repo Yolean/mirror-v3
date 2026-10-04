@@ -108,6 +108,21 @@ pub fn spawn_readiness_poller(
                         Ok(Ok(hwm)) => {
                             spec.cache
                                 .set_broker_end_offset(&spec.mirror_name, hwm.max(0) as u64);
+                            // Lag is a metric, not an HTTP status (readiness
+                            // is sticky once caught up).
+                            if let Some(s) = spec
+                                .cache
+                                .status_snapshot()
+                                .into_iter()
+                                .find(|s| s.name == spec.mirror_name)
+                            {
+                                metrics::gauge!(
+                                    "mirror_v3_source_lag_offsets",
+                                    "topic" => spec.topic.clone(),
+                                    "partition" => spec.partition.to_string(),
+                                )
+                                .set(s.broker_end_offset.saturating_sub(s.last_applied_offset) as f64);
+                            }
                         }
                         Ok(Err(e)) => {
                             tracing::warn!(

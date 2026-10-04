@@ -89,7 +89,7 @@
             "description": "Mirror unknown"
           },
           "503": {
-            "description": "Mirror is not currently Ready; body is a MirrorReadiness object",
+            "description": "Mirror has not caught up to its source yet; body is a MirrorReadiness object",
             "content": {
               "application/json": {
                 "schema": {
@@ -209,7 +209,7 @@
             "description": "Mirror unknown, or key not in cache"
           },
           "503": {
-            "description": "Mirror is not currently Ready; body is a MirrorReadiness object",
+            "description": "Mirror has not caught up to its source yet; body is a MirrorReadiness object",
             "content": {
               "application/json": {
                 "schema": {
@@ -259,7 +259,7 @@
             "description": "Mirror unknown"
           },
           "503": {
-            "description": "Mirror is not currently Ready; body is a MirrorReadiness object",
+            "description": "Mirror has not caught up to its source yet; body is a MirrorReadiness object",
             "content": {
               "application/json": {
                 "schema": {
@@ -276,11 +276,10 @@
     "schemas": {
       "AggregateReadiness": {
         "type": "string",
-        "description": "Aggregate readiness state for the process. The discriminator\nstring lets a grep-friendly consumer distinguish \"warming up but\nexpected to clear shortly\" (a cold start) from \"something is\nwrong\" (a mirror went degraded after first reaching Ready).",
+        "description": "Aggregate readiness of the process.",
         "enum": [
           "ready",
-          "warming",
-          "degraded"
+          "warming"
         ]
       },
       "MirrorReadiness": {
@@ -288,10 +287,16 @@
         "description": "One mirror's slice of the readiness response. Returned both as\nan element of [`ReadinessReport::mirrors`] and as the standalone\nbody of the per-mirror `/cache/v1/{mirror}/...` 503 response so a\nclient library can surface the reason without a second request.",
         "required": [
           "name",
+          "gates_readiness",
+          "caught_up",
           "status",
           "source"
         ],
         "properties": {
+          "caught_up": {
+            "type": "boolean",
+            "description": "Whether it has applied everything its source held at startup\n(sticky)."
+          },
           "destination": {
             "oneOf": [
               {
@@ -302,6 +307,10 @@
                 "description": "Status-specific detail: the lagging destination's name + lag\n(when `status == \"destination_lagging\"`), or the source lag\n(when `status == \"lag_behind_source\"`). `None` otherwise."
               }
             ]
+          },
+          "gates_readiness": {
+            "type": "boolean",
+            "description": "Whether this mirror serves `/cache/v1` and so gates readiness."
           },
           "name": {
             "type": "string"
