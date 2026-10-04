@@ -230,13 +230,10 @@ pub trait Source: Send {
         Ok(0)
     }
 
-    /// Highest offset still retained by the source (Kafka "high
-    /// watermark"; i.e. `last_offset + 1` if the source has any
-    /// records, or `0` if it's empty). The run loop doesn't query
-    /// this today - the default `Ok(u64::MAX)` is the
-    /// "always-satisfiable" sentinel, so future spec changes (e.g.
-    /// "fatal if sink_next_expected > source_high_watermark") can be
-    /// added without breaking sources that don't implement it.
+    /// The source's high watermark (`last_offset + 1`, or `0` when
+    /// empty). The run loop checks at startup that the destination is
+    /// not ahead of it. The default `Ok(u64::MAX)` never trips the
+    /// check (mocks).
     ///
     /// Implementations should query the broker rather than caching
     /// (same contract as [`Self::low_watermark`]). The Kafka source
@@ -565,6 +562,17 @@ pub enum MirrorError {
     /// a topic reset.
     #[error("destination drift while idle: expected next-offset {expected}, found {actual}")]
     DestinationDrift { expected: u64, actual: u64 },
+    /// The destination holds offsets the source does not have: the
+    /// topic was recreated (a re-provisioned broker that lost its data
+    /// while the destination kept its), or the partition was truncated
+    /// by an unclean leader election.
+    #[error(
+        "the destination is ahead of the source: it continues at offset {sink_offset}, \
+         but the source's high watermark is {source_hwm}. Was the topic recreated, or \
+         truncated? Mirroring would append another topic's records to this chain; move the \
+         destination aside or point the mirror at a fresh one"
+    )]
+    SinkAheadOfSource { sink_offset: u64, source_hwm: u64 },
     /// Source's earliest available offset is greater than the sink's
     /// next-expected-offset, and the sink is not willing to skip
     /// records (i.e. it's not a compaction:log destination). This
@@ -661,6 +669,17 @@ where
 {
     let sink_start = sink.next_expected_offset().await?;
     let low_watermark = source.low_watermark().await?;
+    let high_watermark = source.high_watermark().await?;
+    if sink_start > high_watermark {
+        // Without this, a recreated topic either
+        // delivered offset 0 (SourceWentBackwards, a misleading crash
+        // loop) or, once refilled past the destination, got appended
+        // to the old topic's chain with no error at all.
+        return Err(MirrorError::SinkAheadOfSource {
+            sink_offset: sink_start,
+            source_hwm: high_watermark,
+        });
+    }
     let compaction_mode = if sink.allows_compacted_source() {
         "log"
     } else {

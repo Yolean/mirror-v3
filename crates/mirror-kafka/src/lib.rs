@@ -369,6 +369,24 @@ impl Source for KafkaSource {
         Ok(low.max(0) as u64)
     }
 
+    async fn high_watermark(&mut self) -> Result<u64, SourceError> {
+        let bootstrap = self.bootstrap_servers.clone();
+        let topic = self.topic.clone();
+        let partition = self.partition;
+        let high = tokio::task::spawn_blocking(move || {
+            fetch_high_watermark(&bootstrap, &topic, partition, DEFAULT_WATERMARK_TIMEOUT)
+        })
+        .await
+        .map_err(|e| SourceError::Transport(format!("high_watermark join: {e}")))?
+        .map_err(|e| SourceError::Transport(format!("fetch_high_watermark: {e}")))?;
+        u64::try_from(high).map_err(|_| {
+            SourceError::Transport(format!(
+                "fetch_high_watermark returned {high} for {}/{partition}",
+                self.topic
+            ))
+        })
+    }
+
     async fn commit_through(&mut self, through: u64) -> Result<(), SourceError> {
         // Forwards into the shared helper so the trait path and the
         // `KafkaCommitHandle` path observe the same monotonic guard.
