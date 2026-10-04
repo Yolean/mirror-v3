@@ -84,6 +84,11 @@ pub trait BlobStore: Send + Sync {
     async fn put_new(&self, name: &str, bytes: Vec<u8>) -> Result<(), BlobError>;
     /// Read the object `name`.
     async fn get(&self, name: &str) -> Result<Vec<u8>, BlobError>;
+    /// Names sorting after `after` (all names when `None`). S3 serves
+    /// this as one ListObjectsV2 with start-after.
+    async fn list_after(&self, after: Option<&str>) -> Result<Vec<String>, BlobError>;
+    /// Whether the object `name` exists.
+    async fn exists(&self, name: &str) -> Result<bool, BlobError>;
     /// Where `name` lives, for logs and errors.
     fn location(&self, name: &str) -> String;
 }
@@ -95,7 +100,18 @@ pub struct Chain {
     pub durable: u64,
     /// Compaction mode: the newest snapshot, which holds the view.
     pub latest: Option<String>,
+    /// The object with the highest `to`: the end of the chain.
+    pub last: Option<String>,
 }
+
+/// How often an idle blob mirror checks its destination for objects it
+/// did not write. This process is the destination's only writer, so its
+/// position is kept in memory; the check is the guard against a second
+/// writer or a manual change, and costs one HEAD and one LIST that
+/// starts after the last object (the previous check
+/// listed the whole prefix every 2 s, 23M LISTs a day for a year-old
+/// archive, and a sustained readdir on versitygw).
+pub const DRIFT_CHECK_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Validate a listing. Append mode requires a contiguous chain of
 /// `<from>-<to>` names from 0; compaction mode allows gaps (snapshots
@@ -139,6 +155,7 @@ pub fn validate_chain(
             Ok(Chain {
                 durable: expected_next,
                 latest: None,
+                last: entries.last().map(|(_, _, n)| n.to_string()),
             })
         }
         Some(CompactionMode::Log) => {
@@ -154,9 +171,11 @@ pub fn validate_chain(
                 }
                 prev_to = Some(*to);
             }
+            let last = entries.last().map(|(_, _, n)| n.to_string());
             Ok(Chain {
                 durable: prev_to.map(|t| t + 1).unwrap_or(0),
-                latest: entries.last().map(|(_, _, n)| n.to_string()),
+                latest: last.clone(),
+                last,
             })
         }
     }
@@ -239,6 +258,10 @@ pub struct BlobSink<S> {
     next_daily_unix: Option<u64>,
     clock: UnixClock,
     flush_observer: Option<Arc<dyn FlushObserver>>,
+    /// The last object this process wrote or found at open.
+    last_name: Option<String>,
+    last_drift_check: Instant,
+    drift_check_interval: Duration,
 }
 
 impl<S: BlobStore> BlobSink<S> {
@@ -288,7 +311,18 @@ impl<S: BlobStore> BlobSink<S> {
             next_daily_unix,
             clock,
             flush_observer: None,
+            last_name: chain.last,
+            last_drift_check: Instant::now(),
+            drift_check_interval: DRIFT_CHECK_INTERVAL,
         })
+    }
+
+    /// Check for foreign objects this often instead of every
+    /// [`DRIFT_CHECK_INTERVAL`] (tests).
+    #[doc(hidden)]
+    pub fn with_drift_check_interval(mut self, interval: Duration) -> Self {
+        self.drift_check_interval = interval;
+        self
     }
 
     /// List, validate and (compaction mode) read the latest snapshot.
@@ -410,6 +444,7 @@ impl<S: BlobStore> BlobSink<S> {
         }
 
         self.durable_position = to + 1;
+        self.last_name = Some(name);
         self.buffer.clear();
         self.buffer_bytes = 0;
         self.buffer_started = None;
@@ -465,15 +500,37 @@ impl<S: BlobStore> BlobSink<S> {
         Ok(())
     }
 
-    async fn remote_position(&self) -> Result<u64, SinkError> {
-        let names = self
+    /// The destination must hold exactly what this process wrote: the
+    /// last object is still there, and nothing sorts after it.
+    async fn check_drift(&mut self) -> Result<(), SinkError> {
+        let transport = |e: BlobError| SinkError::Transport(e.to_string());
+        if let Some(last) = self.last_name.as_deref() {
+            if !self.store.exists(last).await.map_err(transport)? {
+                return Err(SinkError::Transport(format!(
+                    "destination drift: {} is gone; it is the end of this mirror's chain",
+                    self.store.location(last)
+                )));
+            }
+        }
+        let after = self
             .store
-            .list()
+            .list_after(self.last_name.as_deref())
             .await
-            .map_err(|e| SinkError::Transport(e.to_string()))?;
-        let chain = validate_chain(&names, self.spec.format, self.spec.compaction)
-            .map_err(|e| SinkError::Transport(e.to_string()))?;
-        Ok(chain.durable)
+            .map_err(transport)?;
+        let ext = self.spec.format.extension();
+        if let Some(foreign) = after
+            .iter()
+            .find(|n| naming::parse_filename(n, ext).is_some())
+        {
+            return Err(SinkError::Transport(format!(
+                "destination drift: {} was not written by this process (a second writer, \
+                 or a manual change); this mirror's chain ends before it, at next offset {}",
+                self.store.location(foreign),
+                self.durable_position
+            )));
+        }
+        self.last_drift_check = Instant::now();
+        Ok(())
     }
 }
 
@@ -481,15 +538,8 @@ impl<S: BlobStore> BlobSink<S> {
 impl<S: BlobStore> Sink for BlobSink<S> {
     async fn next_expected_offset(&mut self) -> Result<u64, SinkError> {
         self.tick_daily().await?;
-        let on_remote = self.remote_position().await?;
-        // Drift = the destination advanced past what this process
-        // wrote (an out-of-band write). The reverse is normal right
-        // after `align_to_source_low_watermark`.
-        if on_remote > self.durable_position {
-            return Err(SinkError::UnexpectedPosition {
-                expected: self.durable_position,
-                actual: on_remote,
-            });
+        if self.last_drift_check.elapsed() >= self.drift_check_interval {
+            self.check_drift().await?;
         }
         Ok(self.buffered_head())
     }

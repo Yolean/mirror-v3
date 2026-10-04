@@ -287,9 +287,12 @@ pub trait Source: Send {
 #[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait Sink: Send {
-    /// The source offset the destination will accept next. Must be
-    /// re-derived from durable destination state, not cached in memory
-    /// (otherwise the idle-drift check is meaningless).
+    /// The source offset the destination will accept next. Derived from
+    /// durable destination state at open; a sink may keep it in memory
+    /// afterwards (this process is the only writer), but must then
+    /// verify the destination on idle calls, at a cost that does not
+    /// grow with the destination (the drift check), and fail if anything
+    /// else wrote to it.
     async fn next_expected_offset(&mut self) -> Result<u64, SinkError>;
 
     /// Atomically commit `record` at exactly `record.source_offset`.

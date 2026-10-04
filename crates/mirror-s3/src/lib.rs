@@ -125,6 +125,32 @@ impl BlobStore for S3Store {
     fn location(&self, name: &str) -> String {
         self.path(name).to_string()
     }
+
+    async fn list_after(&self, after: Option<&str>) -> Result<Vec<String>, BlobError> {
+        let mut stream = match after {
+            Some(name) => self
+                .store
+                .list_with_offset(Some(&self.partition_prefix), &self.path(name)),
+            None => self.store.list(Some(&self.partition_prefix)),
+        };
+        let mut names = Vec::new();
+        while let Some(meta) = stream.next().await {
+            let meta = meta.map_err(|e| BlobError::Store(format!("object store: {e}")))?;
+            if let Some(name) = meta.location.filename() {
+                names.push(name.to_string());
+            }
+        }
+        Ok(names)
+    }
+
+    async fn exists(&self, name: &str) -> Result<bool, BlobError> {
+        let path = self.path(name);
+        match self.store.head(&path).await {
+            Ok(_) => Ok(true),
+            Err(object_store::Error::NotFound { .. }) => Ok(false),
+            Err(e) => Err(BlobError::Store(format!("head {path}: {e}"))),
+        }
+    }
 }
 
 /// The S3 destination.
@@ -153,6 +179,11 @@ impl S3Sink {
 
     pub async fn flush_now(&mut self) -> Result<(), SinkError> {
         self.0.flush_now().await
+    }
+
+    #[doc(hidden)]
+    pub fn with_drift_check_interval(self, interval: std::time::Duration) -> Self {
+        Self(self.0.with_drift_check_interval(interval))
     }
 }
 

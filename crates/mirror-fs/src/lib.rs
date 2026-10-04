@@ -148,6 +148,23 @@ impl BlobStore for FsStore {
         self.get_sync(name)
     }
 
+    async fn list_after(&self, after: Option<&str>) -> Result<Vec<String>, BlobError> {
+        let mut names = self.list_sync()?;
+        if let Some(after) = after {
+            names.retain(|n| n.as_str() > after);
+        }
+        Ok(names)
+    }
+
+    async fn exists(&self, name: &str) -> Result<bool, BlobError> {
+        let path = self.dir.join(name);
+        match tokio::fs::metadata(&path).await {
+            Ok(_) => Ok(true),
+            Err(e) if e.kind() == ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(io_error(&path, e)),
+        }
+    }
+
     fn location(&self, name: &str) -> String {
         self.dir.join(name).display().to_string()
     }
