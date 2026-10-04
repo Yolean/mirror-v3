@@ -914,6 +914,41 @@ fn validate(cfg: &Config) -> Result<(), LoadError> {
         }
         validate_mirror(m)?;
     }
+    // Cross-mirror: two blob destinations writing the same directory
+    // are two writers of one chain, the corruption the single-writer
+    // invariant exists to prevent: the destination path holds no
+    // topic.
+    let mut blob_dirs: std::collections::HashMap<String, &str> = std::collections::HashMap::new();
+    for m in &cfg.mirrors {
+        for d in &m.destinations {
+            let dir = match d {
+                Destination::S3(s3) => format!(
+                    "s3://{}/{}{}/{}",
+                    s3.bucket,
+                    s3.prefix
+                        .as_deref()
+                        .map(|p| format!("{}/", p.trim_matches('/')))
+                        .unwrap_or_default(),
+                    d.effective_name(&m.name),
+                    m.partition
+                ),
+                Destination::Filesystem(fs) => format!(
+                    "{}/{}/{}",
+                    fs.root.display(),
+                    d.effective_name(&m.name),
+                    m.partition
+                ),
+                Destination::Kafka(_) => continue,
+            };
+            if let Some(other) = blob_dirs.insert(dir.clone(), &m.name) {
+                return Err(LoadError::Validation(format!(
+                    "mirrors {other:?} and {:?} both write {dir}; give one destination another \
+                     `name`, prefix or bucket",
+                    m.name
+                )));
+            }
+        }
+    }
     // Cross-mirror: `cache-v1-main` mounts the unprefixed
     // /cache/v1/... routes onto exactly one mirror's view. Two
     // mains would race over the same paths so the supervisor would

@@ -954,3 +954,29 @@ mirrors:
         );
     }
 }
+
+#[test]
+fn two_mirrors_writing_one_blob_directory_are_rejected() {
+    let yaml = r#"
+mirrors:
+  - name: a
+    source: { bootstrap-servers: k:9092 }
+    topic: ops
+    partition: 0
+    destinations:
+      - { type: filesystem, name: archive, root: /data }
+    flush: { max-time-ms: 1000, max-bytes: 1000, max-offsets: 10 }
+  - name: b
+    source: { bootstrap-servers: k:9092 }
+    topic: other
+    partition: 0
+    destinations:
+      - { type: filesystem, name: archive, root: /data }
+    flush: { max-time-ms: 1000, max-bytes: 1000, max-offsets: 10 }
+"#;
+    let err = load_from_str(yaml).expect_err("one directory, two writers");
+    assert!(
+        format!("{err}").contains("both write /data/archive/0"),
+        "{err}"
+    );
+}
