@@ -19,8 +19,11 @@
 pub use mirror_core::ColumnType;
 use mirror_core::Record;
 
+pub mod keys;
 pub mod ndjson;
 pub mod parquet;
+
+pub use keys::{Keyring, KeysError, ParquetKey};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Format {

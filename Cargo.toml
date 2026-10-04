@@ -54,7 +54,7 @@ bytes = "1"
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.17", default-features = false, features = ["http-listener"] }
 arrow = "60"
-parquet = { version = "60", default-features = false, features = ["arrow", "zstd", "snap", "lz4"] }
+parquet = { version = "60", default-features = false, features = ["arrow", "zstd", "snap", "lz4", "encryption"] }
 axum = "0.8"
 tower = "0.5"
 tower-http = { version = "0.6", features = ["trace"] }

@@ -38,13 +38,16 @@ use arrow::array::{
 use arrow::buffer::NullBuffer;
 use arrow::datatypes::{DataType, Field, Fields, Schema, SchemaRef};
 use mirror_core::{Header, Record, TimestampType};
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use parquet::arrow::arrow_reader::{ArrowReaderOptions, ParquetRecordBatchReaderBuilder};
+use parquet::encryption::decrypt::FileDecryptionProperties;
+use parquet::encryption::encrypt::FileEncryptionProperties;
+
 use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
 use parquet::basic::ZstdLevel;
 use parquet::file::properties::{EnabledStatistics, WriterProperties};
 
-use crate::{ColumnType, EnvelopeError, ParquetCompression};
+use crate::{ColumnType, EnvelopeError, ParquetCompression, ParquetKey};
 
 fn header_struct_fields() -> Fields {
     Fields::from(vec![
@@ -111,14 +114,46 @@ pub fn encode_batch(
     keys: ColumnType,
     values: ColumnType,
 ) -> Result<Vec<u8>, EnvelopeError> {
+    encode(records, compression, keys, values, None)
+}
+
+/// Like [`encode_batch`], with Parquet modular encryption: the footer
+/// and every column encrypted with `key` (AES-GCM, uniform encryption,
+/// encrypted footer), the layout DuckDB reads with
+/// `PRAGMA add_parquet_key` and `encryption_config = {footer_key: ...}`.
+/// The encrypted footer also hides the min/max statistics of `key` and
+/// `value`, which a plaintext footer would leak.
+pub fn encode_batch_encrypted(
+    records: &[Record],
+    compression: ParquetCompression,
+    keys: ColumnType,
+    values: ColumnType,
+    key: &ParquetKey,
+) -> Result<Vec<u8>, EnvelopeError> {
+    encode(records, compression, keys, values, Some(key))
+}
+
+fn encode(
+    records: &[Record],
+    compression: ParquetCompression,
+    keys: ColumnType,
+    values: ColumnType,
+    key: Option<&ParquetKey>,
+) -> Result<Vec<u8>, EnvelopeError> {
     let schema = build_schema(keys, values);
     let batch = build_record_batch(records, &schema, keys, values)?;
 
-    let props = WriterProperties::builder()
+    let mut props = WriterProperties::builder()
         .set_compression(to_compression(compression))
         .set_dictionary_enabled(true)
-        .set_statistics_enabled(EnabledStatistics::Chunk)
-        .build();
+        .set_statistics_enabled(EnabledStatistics::Chunk);
+    if let Some(key) = key {
+        let encryption = FileEncryptionProperties::builder(key.0.to_vec())
+            .build()
+            .map_err(|e| EnvelopeError::Encode(format!("encryption properties: {e}")))?;
+        props = props.with_file_encryption_properties(encryption);
+    }
+    let props = props.build();
 
     let mut buf: Vec<u8> = Vec::with_capacity(records.len() * 64);
     {
@@ -260,8 +295,27 @@ fn append_headers(builder: &mut ListBuilder<StructBuilder>, headers: &[Header]) 
 }
 
 pub fn decode_batch(bytes: &[u8]) -> Result<Vec<Record>, EnvelopeError> {
+    decode(bytes, None)
+}
+
+/// Decode a file written by [`encode_batch_encrypted`] with `key`.
+pub fn decode_batch_encrypted(
+    bytes: &[u8],
+    key: &ParquetKey,
+) -> Result<Vec<Record>, EnvelopeError> {
+    decode(bytes, Some(key))
+}
+
+fn decode(bytes: &[u8], key: Option<&ParquetKey>) -> Result<Vec<Record>, EnvelopeError> {
     let cursor = bytes::Bytes::copy_from_slice(bytes);
-    let reader = ParquetRecordBatchReaderBuilder::try_new(cursor)
+    let mut options = ArrowReaderOptions::new();
+    if let Some(key) = key {
+        let decryption = FileDecryptionProperties::builder(key.0.to_vec())
+            .build()
+            .map_err(|e| EnvelopeError::Decode(format!("decryption properties: {e}")))?;
+        options = options.with_file_decryption_properties(decryption);
+    }
+    let reader = ParquetRecordBatchReaderBuilder::try_new_with_options(cursor, options)
         .map_err(|e| EnvelopeError::Decode(format!("reader init: {e}")))?
         .build()
         .map_err(|e| EnvelopeError::Decode(format!("reader build: {e}")))?;

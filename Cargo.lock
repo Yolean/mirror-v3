@@ -1879,6 +1879,7 @@ dependencies = [
  "parquet",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
 ]
 
@@ -2169,6 +2170,7 @@ dependencies = [
  "num-bigint 0.5.1",
  "num-integer",
  "num-traits",
+ "ring",
  "seq-macro",
  "snap",
  "twox-hash",
