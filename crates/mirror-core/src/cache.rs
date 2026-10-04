@@ -165,10 +165,37 @@ struct MirrorSlot {
     /// Iteration order is insertion order (the position a
     /// key gets the *first* time it's seen). Overwrites don't change
     /// position. Tombstones shift subsequent keys down.
-    view: Option<RwLock<IndexMap<String, Vec<u8>>>>,
-    /// Last-seen source offset per (topic, partition) within this
-    /// mirror. Monotonic.
-    offsets: RwLock<HashMap<TopicPartition, u64>>,
+    /// The view and the last-seen offsets share one lock, so a read
+    /// sees a value together with the offsets of the same state, and
+    /// each value carries the offset of the record that wrote it
+    /// (the offset was
+    /// published before the value under a separate lock, and a reader
+    /// could get the old value with a header claiming the new offset,
+    /// which a read-your-write `get(K, {requireOffset})` accepted).
+    data: RwLock<SlotData>,
+}
+
+#[derive(Debug, Default)]
+struct SlotData {
+    view: Option<IndexMap<String, Entry>>,
+    /// Last-seen source offset per (topic, partition). Monotonic.
+    offsets: HashMap<TopicPartition, u64>,
+}
+
+#[derive(Debug, Clone)]
+struct Entry {
+    value: Vec<u8>,
+    offset: u64,
+}
+
+/// A key's value and the offsets of the state it was read from, taken
+/// under one lock. See [`CacheState::read_value`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValueRead {
+    /// The value and the source offset of the record that wrote it;
+    /// `None` when the key is absent.
+    pub value: Option<(Vec<u8>, u64)>,
+    pub offsets: Vec<TopicPartitionOffset>,
 }
 
 #[derive(Debug, Default)]
@@ -319,8 +346,10 @@ impl CacheState {
                 broker_end_offset: AtomicU64::new(bootstrap_hwm),
                 source_assigned: AtomicBool::new(true),
                 status: RwLock::new(initial_status),
-                view: keeps_values.then(|| RwLock::new(IndexMap::new())),
-                offsets: RwLock::new(HashMap::new()),
+                data: RwLock::new(SlotData {
+                    view: keeps_values.then(IndexMap::new),
+                    offsets: HashMap::new(),
+                }),
             },
         );
     }
@@ -362,18 +391,16 @@ impl CacheState {
             partition: record.partition as u32,
         };
         {
-            let mut offsets = slot.offsets.write().expect("mirror offsets poisoned");
-            if let Some(&last) = offsets.get(&tp) {
+            let mut data = slot.data.write().expect("mirror data poisoned");
+            if let Some(&last) = data.offsets.get(&tp) {
                 if record.source_offset <= last {
                     return; // monotonic guard — never rewind the cache
                 }
             }
-            offsets.insert(tp, record.source_offset);
-        }
-        // Drop the offsets lock before touching the view lock.
-        // Order is consistent across all paths to avoid deadlocks.
-        if let Some(view) = slot.view.as_ref() {
-            Self::apply_value(view, record);
+            if let Some(view) = data.view.as_mut() {
+                Self::apply_value(view, record);
+            }
+            data.offsets.insert(tp, record.source_offset);
         }
         // Advance the per-mirror `last_applied_offset` and recompute
         // the status. Both the per-`TopicPartition` `offsets` map
@@ -384,7 +411,7 @@ impl CacheState {
         Self::recompute_status_locked(slot, self.readiness_lag_tolerance);
     }
 
-    fn apply_value(view: &RwLock<IndexMap<String, Vec<u8>>>, record: &Record) {
+    fn apply_value(view: &mut IndexMap<String, Entry>, record: &Record) {
         let key = match record
             .key
             .as_ref()
@@ -396,23 +423,25 @@ impl CacheState {
             // production. Skip silently rather than panicking.
             None => return,
         };
-        {
-            let mut view = view.write().expect("mirror view poisoned");
-            match record.value.as_ref() {
-                Some(v) => {
-                    // IndexMap::insert keeps the existing position on
-                    // overwrite and appends only on first sighting —
-                    // which is the contract clients want for `/keys`
-                    // ordering ("new keys appear at the end").
-                    view.insert(key, v.clone());
-                }
-                None => {
-                    // shift_remove preserves the relative order of
-                    // the remaining entries; swap_remove would be
-                    // faster but shuffle the trailing key into the
-                    // gap, breaking determinism.
-                    view.shift_remove(&key);
-                }
+        match record.value.as_ref() {
+            Some(v) => {
+                // IndexMap::insert keeps the existing position on
+                // overwrite and appends only on first sighting —
+                // which is the contract clients want for `/keys`
+                // ordering ("new keys appear at the end").
+                view.insert(
+                    key,
+                    Entry {
+                        value: v.clone(),
+                        offset: record.source_offset,
+                    },
+                );
+            }
+            None => {
+                // shift_remove preserves the relative order of the
+                // remaining entries; swap_remove would be faster but
+                // shuffle the trailing key into the gap.
+                view.shift_remove(&key);
             }
         }
     }
@@ -619,10 +648,21 @@ impl CacheState {
     /// `mirror_name` is unknown — the HTTP handler maps unknown
     /// mirrors to 404 anyway, so the call sites stay tight.
     pub fn get_value_for(&self, mirror_name: &str, key: &str) -> Option<Vec<u8>> {
+        self.read_value(mirror_name, key)?.value.map(|(v, _)| v)
+    }
+
+    /// A key's value with the offset that wrote it, and the mirror's
+    /// last-seen offsets, from one consistent state. `None` for an
+    /// unknown mirror or one that keeps no values.
+    pub fn read_value(&self, mirror_name: &str, key: &str) -> Option<ValueRead> {
         let mirrors = self.mirrors.read().expect("cache mirrors poisoned");
         let slot = mirrors.get(mirror_name)?;
-        let view = slot.view.as_ref()?.read().expect("mirror view poisoned");
-        view.get(key).cloned()
+        let data = slot.data.read().expect("mirror data poisoned");
+        let view = data.view.as_ref()?;
+        Some(ValueRead {
+            value: view.get(key).map(|e| (e.value.clone(), e.offset)),
+            offsets: sorted_offsets(&data.offsets),
+        })
     }
 
     /// Snapshot of every key currently in the named mirror's view,
@@ -630,8 +670,8 @@ impl CacheState {
     pub fn snapshot_keys_for(&self, mirror_name: &str) -> Option<Vec<String>> {
         let mirrors = self.mirrors.read().expect("cache mirrors poisoned");
         let slot = mirrors.get(mirror_name)?;
-        let view = slot.view.as_ref()?.read().expect("mirror view poisoned");
-        Some(view.keys().cloned().collect())
+        let data = slot.data.read().expect("mirror data poisoned");
+        Some(data.view.as_ref()?.keys().cloned().collect())
     }
 
     /// Snapshot of every value in the named mirror's view, in the
@@ -640,8 +680,14 @@ impl CacheState {
     pub fn snapshot_values_for(&self, mirror_name: &str) -> Option<Vec<Vec<u8>>> {
         let mirrors = self.mirrors.read().expect("cache mirrors poisoned");
         let slot = mirrors.get(mirror_name)?;
-        let view = slot.view.as_ref()?.read().expect("mirror view poisoned");
-        Some(view.values().cloned().collect())
+        let data = slot.data.read().expect("mirror data poisoned");
+        Some(
+            data.view
+                .as_ref()?
+                .values()
+                .map(|e| e.value.clone())
+                .collect(),
+        )
     }
 
     /// Last-seen offset within `mirror_name` for one source
@@ -650,8 +696,8 @@ impl CacheState {
     pub fn get_offset_for(&self, mirror_name: &str, topic: &str, partition: u32) -> Option<u64> {
         let mirrors = self.mirrors.read().expect("cache mirrors poisoned");
         let slot = mirrors.get(mirror_name)?;
-        let offsets = slot.offsets.read().expect("mirror offsets poisoned");
-        offsets
+        let data = slot.data.read().expect("mirror data poisoned");
+        data.offsets
             .get(&TopicPartition {
                 topic: topic.to_string(),
                 partition,
@@ -665,18 +711,22 @@ impl CacheState {
     pub fn snapshot_offsets_for(&self, mirror_name: &str) -> Option<Vec<TopicPartitionOffset>> {
         let mirrors = self.mirrors.read().expect("cache mirrors poisoned");
         let slot = mirrors.get(mirror_name)?;
-        let offsets = slot.offsets.read().expect("mirror offsets poisoned");
-        let mut out: Vec<TopicPartitionOffset> = offsets
-            .iter()
-            .map(|(tp, off)| TopicPartitionOffset {
-                topic: tp.topic.clone(),
-                partition: tp.partition,
-                offset: *off,
-            })
-            .collect();
-        out.sort_by(|a, b| a.topic.cmp(&b.topic).then(a.partition.cmp(&b.partition)));
-        Some(out)
+        let data = slot.data.read().expect("mirror data poisoned");
+        Some(sorted_offsets(&data.offsets))
     }
+}
+
+fn sorted_offsets(offsets: &HashMap<TopicPartition, u64>) -> Vec<TopicPartitionOffset> {
+    let mut out: Vec<TopicPartitionOffset> = offsets
+        .iter()
+        .map(|(tp, off)| TopicPartitionOffset {
+            topic: tp.topic.clone(),
+            partition: tp.partition,
+            offset: *off,
+        })
+        .collect();
+    out.sort_by(|a, b| a.topic.cmp(&b.topic).then(a.partition.cmp(&b.partition)));
+    out
 }
 
 #[cfg(test)]
@@ -877,6 +927,45 @@ mod tests {
         assert_eq!(s.get_value_for("b", "k-b").as_deref(), Some(b"vb".as_ref()));
         assert!(s.get_value_for("missing", "anything").is_none());
         assert!(s.snapshot_keys_for("missing").is_none());
+    }
+
+    /// A probe found about two thirds of reads with a header offset
+    /// newer than the value. With
+    /// one writer of one key, every read must return the value written
+    /// at exactly the offset the state claims.
+    #[test]
+    fn value_and_offsets_are_read_from_one_state() {
+        let s = Arc::new(CacheState::new());
+        s.register_mirror_with_topic("m", 0, None, true, "t", 0);
+        let stop = Arc::new(AtomicBool::new(false));
+        let readers: Vec<_> = (0..3)
+            .map(|_| {
+                let s = Arc::clone(&s);
+                let stop = Arc::clone(&stop);
+                std::thread::spawn(move || {
+                    let mut reads = 0u64;
+                    while !stop.load(Ordering::Relaxed) {
+                        let Some(read) = s.read_value("m", "k") else {
+                            continue;
+                        };
+                        let Some((value, offset)) = read.value else {
+                            continue;
+                        };
+                        let written: u64 = std::str::from_utf8(&value).unwrap().parse().unwrap();
+                        assert_eq!(written, offset, "the value carries its own offset");
+                        assert_eq!(read.offsets[0].offset, offset, "header from the same state");
+                        reads += 1;
+                    }
+                    reads
+                })
+            })
+            .collect();
+        for o in 0..100_000u64 {
+            s.apply_record("m", &rec("t", 0, o, "k", Some(o.to_string().as_bytes())));
+        }
+        stop.store(true, Ordering::Relaxed);
+        let reads: u64 = readers.into_iter().map(|r| r.join().unwrap()).sum();
+        assert!(reads > 0);
     }
 
     #[test]

@@ -497,3 +497,44 @@ async fn q_health_ready_is_not_in_openapi_spec() {
         "/q/health/ready must stay off the OpenAPI spec; got: {body}"
     );
 }
+
+#[tokio::test]
+async fn raw_carries_the_offset_that_wrote_the_value() {
+    let state = std::sync::Arc::new(mirror_core::CacheState::new());
+    state.register_mirror_with_topic("m", 0, None, true, "t", 0);
+    for (o, v) in [(3u64, "a"), (4, "b")] {
+        state.apply_record(
+            "m",
+            &mirror_core::Record {
+                topic: "t".into(),
+                partition: 0,
+                source_offset: o,
+                timestamp_ms: None,
+                timestamp_type: mirror_core::TimestampType::NotAvailable,
+                key: Some(if o == 3 {
+                    b"k".to_vec()
+                } else {
+                    b"other".to_vec()
+                }),
+                value: Some(v.as_bytes().to_vec()),
+                headers: vec![],
+            },
+        );
+    }
+    let app = router_with(std::sync::Arc::clone(&state));
+    let resp = tower::ServiceExt::oneshot(
+        app,
+        axum::http::Request::builder()
+            .uri("/cache/v1/raw/k")
+            .body(axum::body::Body::empty())
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    assert_eq!(resp.headers()["x-kkv-key-offset"], "3");
+    assert_eq!(
+        resp.headers()["x-kkv-last-seen-offsets"],
+        r#"[{"offset":4,"partition":0,"topic":"t"}]"#
+    );
+}

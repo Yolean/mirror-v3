@@ -58,6 +58,11 @@ use utoipa_scalar::{Scalar, Servable};
 /// byte-for-byte so unchanged clients keep parsing the response.
 pub const KKV_OFFSETS_HEADER: &str = "x-kkv-last-seen-offsets";
 
+/// Response header on `/raw/{key}`: the source offset of the record
+/// that wrote the returned value. Additive (kafka-keyvalue has none);
+/// read in the same lock as the value and `x-kkv-last-seen-offsets`.
+pub const KKV_KEY_OFFSET_HEADER: &str = "x-kkv-key-offset";
+
 /// `{topic, partition, offset}` shape serialized into the
 /// `x-kkv-last-seen-offsets` header. Mirrors KKV's
 /// `TopicPartitionOffset`, including JSON property order.
@@ -511,10 +516,14 @@ fn resolve_mirror(state: &AppState, mirror: &str) -> Result<(), Response> {
 }
 
 fn offsets_header_for(state: &AppState, mirror: &str) -> HeaderMap {
+    match state.cache.snapshot_offsets_for(mirror) {
+        Some(offsets) => offsets_header(&offsets),
+        None => HeaderMap::new(),
+    }
+}
+
+fn offsets_header(offsets: &[mirror_core::cache::TopicPartitionOffset]) -> HeaderMap {
     let mut headers = HeaderMap::new();
-    let Some(offsets) = state.cache.snapshot_offsets_for(mirror) else {
-        return headers;
-    };
     let payload: Vec<TopicPartitionOffsetJson> =
         offsets.iter().map(TopicPartitionOffsetJson::from).collect();
     if let Ok(value) = serde_json::to_string(&payload) {
@@ -555,10 +564,19 @@ async fn raw_by_key(
     if key.is_empty() {
         return StatusCode::BAD_REQUEST.into_response();
     }
-    match state.cache.get_value_for(&mirror, &key) {
+    // One read: the value, the offset that wrote it, and the offsets
+    // header all come from the same state.
+    let Some(read) = state.cache.read_value(&mirror, &key) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    match read.value {
         None => StatusCode::NOT_FOUND.into_response(),
-        Some(bytes) => {
-            let mut headers = offsets_header_for(&state, &mirror);
+        Some((bytes, offset)) => {
+            let mut headers = offsets_header(&read.offsets);
+            headers.insert(
+                KKV_KEY_OFFSET_HEADER,
+                HeaderValue::from_str(&offset.to_string()).expect("digits are a header value"),
+            );
             headers.insert(
                 axum::http::header::CONTENT_TYPE,
                 HeaderValue::from_static("application/octet-stream"),
