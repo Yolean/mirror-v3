@@ -89,11 +89,10 @@ async fn posts_to_default_kkv_path_with_canonical_body() {
     );
 }
 
+/// kafka-keyvalue does not notify a record without a key (it used to
+/// go out here as `""`, which no consumer can re-read meaningfully).
 #[tokio::test]
-async fn null_key_serializes_as_empty_string() {
-    // The Node consumer keys cache invalidations by string; a missing
-    // key turns into "" so it has SOMETHING to call `getValue("")`
-    // with; same as the legacy kkv null handling.
+async fn a_record_without_a_key_is_not_notified() {
     let server = TestServer::start(Reply::Status(200), vec![]).await;
     let cfg = notify_pointing_at(server.addr, NotifyOutcomes::default(), fast_retry(), 1000);
     let mut notifier =
@@ -102,10 +101,12 @@ async fn null_key_serializes_as_empty_string() {
     let mut record = rec(7, "", "v");
     record.key = None;
     notifier.on_record(&record).await.unwrap();
+    notifier.on_record(&rec(8, "k8", "v")).await.unwrap();
     wait_until("one POST", WAIT, || server.request_count() == 1).await;
-
+    tokio::time::sleep(Duration::from_millis(50)).await;
     let body: Value = serde_json::from_slice(&server.captured().await[0].body).unwrap();
-    assert_eq!(body["updates"], serde_json::json!({"": null}));
+    assert_eq!(body["updates"], serde_json::json!({"k8": null}));
+    assert_eq!(server.request_count(), 1);
 }
 
 #[tokio::test]

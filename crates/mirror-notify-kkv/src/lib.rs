@@ -740,7 +740,27 @@ impl Notifier for KkvV1Notifier {
             return Ok(());
         }
 
-        let key_str = render_key(record.key.as_deref());
+        // kafka-keyvalue does not notify a record without a key; nor a
+        // key that is not UTF-8 here (the consumer re-reads it as a
+        // /raw/{key} path, and the cache skipped it too).
+        let key_str = match record.key.as_deref().map(std::str::from_utf8) {
+            Some(Ok(k)) => k.to_string(),
+            other => {
+                let reason = if other.is_none() {
+                    "null_key"
+                } else {
+                    "non_utf8_key"
+                };
+                metrics::counter!(
+                    "mirror_v3_notify_skipped_records_total",
+                    "topic" => topic_l,
+                    "partition" => partition_l,
+                    "reason" => reason,
+                )
+                .increment(1);
+                return Ok(());
+            }
+        };
         metrics::counter!(
             "mirror_v3_notify_records_total",
             "topic" => topic_l.clone(),
@@ -1193,13 +1213,6 @@ fn build_endpoint(target: &NotifyTarget, client: Client) -> Result<Endpoint, Bui
     })
 }
 
-fn render_key(key: Option<&[u8]>) -> String {
-    match key {
-        None => String::new(),
-        Some(bytes) => String::from_utf8_lossy(bytes).into_owned(),
-    }
-}
-
 /// Exponential backoff capped at 30s. `base * 2^(attempt-1)`. Attempt
 /// 1 (first retry) is one base interval; attempt 5 is 16×.
 fn backoff_for_attempt(base_ms: u64, attempt: u32) -> Duration {
@@ -1265,13 +1278,11 @@ fn classify(result: reqwest::Result<reqwest::Response>, error: &mut String) -> O
             } else if status.is_client_error() {
                 *error = format!("HTTP {status}");
                 Outcome::FourXx
-            } else if status.is_server_error() {
+            } else {
+                // 5xx, and the 1xx a final response cannot be (reqwest
+                // consumes interim ones): not a delivery.
                 *error = format!("HTTP {status}");
                 Outcome::FiveXx
-            } else {
-                // 1xx; informational. Treat as 2xx (spec doesn't
-                // enumerate; reqwest already filters most of these).
-                Outcome::TwoXx
             }
         }
         Err(e) => {
@@ -1365,16 +1376,6 @@ mod unit_tests {
         assert_eq!(backoff_for_attempt(100, 4), Duration::from_millis(800));
         // 100 << 19 = 52_428_800, capped at 30_000.
         assert_eq!(backoff_for_attempt(100, 20), Duration::from_millis(30_000));
-    }
-
-    #[test]
-    fn render_key_handles_none_and_lossy_utf8() {
-        assert_eq!(render_key(None), "");
-        assert_eq!(render_key(Some(b"hello")), "hello");
-        // 0xff is not valid UTF-8; lossy substitution should produce
-        // the replacement character rather than panicking.
-        let s = render_key(Some(&[b'a', 0xff, b'b']));
-        assert!(s.starts_with('a') && s.ends_with('b'));
     }
 
     #[test]

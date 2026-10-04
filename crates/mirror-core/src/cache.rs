@@ -378,14 +378,11 @@ impl CacheState {
     /// the offset map.
     pub fn apply_record(&self, mirror_name: &str, record: &Record) {
         let mirrors = self.mirrors.read().expect("cache mirrors poisoned");
-        let Some(slot) = mirrors.get(mirror_name) else {
-            // No registered slot for this mirror; sinks that route
-            // through a `CacheBinding` are wired to one that always
-            // matches. Treat an unknown name as a no-op rather than
-            // panic so a future refactor that decouples destinations
-            // from registration can't crash the consume loop.
-            return;
-        };
+        let slot = mirrors.get(mirror_name).unwrap_or_else(|| {
+            panic!(
+                "apply_record for mirror {mirror_name:?}, which is not registered (a wiring bug)"
+            )
+        });
         let tp = TopicPartition {
             topic: record.topic.clone(),
             partition: record.partition as u32,
@@ -412,17 +409,34 @@ impl CacheState {
     }
 
     fn apply_value(view: &mut IndexMap<String, Entry>, record: &Record) {
-        let key = match record
-            .key
-            .as_ref()
-            .and_then(|k| std::str::from_utf8(k).ok())
-        {
-            Some(k) => k.to_string(),
-            // No key, or non-UTF-8 — by validation the cache only
-            // sees UTF-8 keys, so this branch is unreachable in
-            // production. Skip silently rather than panicking.
-            None => return,
+        // kafka-keyvalue skips a record without a key with a warning;
+        // so does a cache here, and one whose key is not UTF-8 (it
+        // cannot be a /raw/{key} path). Counted, so it is not silent.
+        let reason = match record.key.as_deref().map(std::str::from_utf8) {
+            Some(Ok(k)) => {
+                Self::put_value(view, k.to_string(), record);
+                return;
+            }
+            Some(Err(_)) => "non_utf8_key",
+            None => "null_key",
         };
+        tracing::warn!(
+            topic = %record.topic,
+            partition = record.partition,
+            offset = record.source_offset,
+            reason,
+            "cache: record skipped"
+        );
+        metrics::counter!(
+            "mirror_v3_cache_skipped_records_total",
+            "topic" => record.topic.clone(),
+            "partition" => record.partition.to_string(),
+            "reason" => reason,
+        )
+        .increment(1);
+    }
+
+    fn put_value(view: &mut IndexMap<String, Entry>, key: String, record: &Record) {
         match record.value.as_ref() {
             Some(v) => {
                 // IndexMap::insert keeps the existing position on
@@ -979,6 +993,24 @@ mod tests {
         stop.store(true, Ordering::Relaxed);
         let reads: u64 = readers.into_iter().map(|r| r.join().unwrap()).sum();
         assert!(reads > 0);
+    }
+
+    #[test]
+    fn a_record_without_a_key_is_skipped_but_advances_the_offset() {
+        let s = CacheState::new();
+        s.register_mirror_with_topic("m", 2, None, true, "t", 0);
+        let mut keyless = rec("t", 0, 0, "x", Some(b"v"));
+        keyless.key = None;
+        s.apply_record("m", &keyless);
+        s.apply_record("m", &rec("t", 0, 1, "k", Some(b"v")));
+        assert_eq!(s.snapshot_keys_for("m"), Some(vec!["k".to_string()]));
+        assert!(s.has_caught_up("m"));
+    }
+
+    #[test]
+    #[should_panic(expected = "not registered")]
+    fn applying_to_an_unregistered_mirror_is_a_wiring_bug() {
+        CacheState::new().apply_record("nope", &rec("t", 0, 0, "k", Some(b"v")));
     }
 
     #[test]
