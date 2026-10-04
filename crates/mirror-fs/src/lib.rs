@@ -58,25 +58,8 @@ pub struct FilesystemSinkConfig {
     /// latest value per key. Caller must combine this with
     /// `Format::Parquet` and `keys` ∈ {`Utf8`, `Json`}.
     pub compaction: Option<CompactionMode>,
-    /// Optional shared HTTP-cache state. When `Some`, every record
-    /// the sink receives is applied to the cache view from the
-    /// consume loop (per-record, decoupled from flush cadence). The
-    /// mirror is also bootstrapped against this state at `open()` -
-    /// in compaction:log mode, the latest snapshot's keys are
-    /// pre-loaded; in append mode, the entire on-disk chain is
-    /// replayed (linear in total record count).
-    pub cache: Option<CacheBinding>,
     pub flush: FlushTriggers,
 }
-
-/// Re-export of the canonical cache binding from `mirror-core`. When
-/// set on a `FilesystemSinkConfig`, the sink uses it on `open` to
-/// replay the durable destination state into the shared cache so
-/// HTTP readers see what's already on disk. The per-record `write()`
-/// path no longer touches the cache; that's the tee level's job
-/// ([`mirror_core::TeeSink`]) so a single record never gets applied
-/// twice when the same mirror feeds multiple destinations.
-pub use mirror_core::CacheBinding;
 
 /// Log-compaction variant. Reserved for future strategies; currently
 /// only `Log` (Kafka-style, key-based, last-writer-wins) is defined.
@@ -158,40 +141,6 @@ impl FilesystemSink {
                 (pos, Some(view))
             }
         };
-        // Cache bootstrap: replay durable state into the shared
-        // CacheState so HTTP readers see what's already on disk.
-        // - compaction:log → fold the loaded snapshot view.
-        // - append → replay the whole chain (cost is linear in the
-        //   total record count; documented for large topics).
-        //
-        // `apply_record` enforces per-(topic, partition) offset
-        // monotonicity and silently skips records with
-        // `source_offset <= last_seen`. The compacted snapshot is a
-        // `BTreeMap<key, Record>` whose `.values()` iterate in
-        // lexicographic key order, NOT offset order — without
-        // sorting, the first replayed record's offset would clamp
-        // every subsequent record whose key happens to land
-        // alphabetically later but at a lower offset, leaving the
-        // in-memory view with a key-order-dependent subset of the
-        // snapshot. Sort by `source_offset` ascending before
-        // dispatch so every snapshot record passes the guard.
-        if let Some(binding) = cfg.cache.as_ref() {
-            match &view {
-                Some(v) => {
-                    let mut snapshot_records: Vec<&Record> = v.values().collect();
-                    snapshot_records.sort_by_key(|r| r.source_offset);
-                    for r in snapshot_records {
-                        binding.state.apply_record(&binding.mirror_name, r);
-                    }
-                }
-                None => {
-                    let records = read_all_records(&dir, cfg.format)?;
-                    for r in records.iter() {
-                        binding.state.apply_record(&binding.mirror_name, r);
-                    }
-                }
-            }
-        }
         // NOTE: naive; computes the next future occurrence and
         // accepts that a mirror down at the boundary silently misses
         // it for that day. The richer version (planned alongside

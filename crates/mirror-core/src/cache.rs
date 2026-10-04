@@ -157,11 +157,15 @@ struct MirrorSlot {
     /// `apply_record` whenever an input atom changes. The HTTP
     /// handlers take a read lock here on every probe.
     status: RwLock<MirrorStatus>,
-    /// `key → latest-value` for this mirror only. Iteration order is
-    /// insertion order (the position a key gets the *first* time
-    /// it's seen). Overwrites don't change position. Tombstones
-    /// shift subsequent keys down.
-    view: RwLock<IndexMap<String, Vec<u8>>>,
+    /// `key → latest-value` for this mirror only, for mirrors that
+    /// serve `/cache/v1` (`Some`). Mirrors without `http-access`
+    /// register progress only (`None`): their readiness needs offsets,
+    /// not values, and keeping every value of an archive topic in
+    /// memory is what made every blob mirror an OOM risk.
+    /// Iteration order is insertion order (the position a
+    /// key gets the *first* time it's seen). Overwrites don't change
+    /// position. Tombstones shift subsequent keys down.
+    view: Option<RwLock<IndexMap<String, Vec<u8>>>>,
     /// Last-seen source offset per (topic, partition) within this
     /// mirror. Monotonic.
     offsets: RwLock<HashMap<TopicPartition, u64>>,
@@ -252,6 +256,45 @@ impl CacheState {
         topic: &str,
         partition: u32,
     ) {
+        self.insert_slot(
+            mirror_name,
+            bootstrap_hwm,
+            last_committed_offset,
+            topic,
+            partition,
+            true,
+        );
+        if is_main {
+            *self
+                .main_mirror
+                .write()
+                .expect("cache main_mirror poisoned") = Some(mirror_name.to_string());
+        }
+    }
+
+    /// Register a mirror that serves no `/cache/v1` routes: its slot
+    /// tracks the last applied offset against the bootstrap watermark
+    /// (readiness, the structured `/q/health/ready` body) and holds no
+    /// values. Every mirror without `http-access` registers this way.
+    pub fn register_progress_only(
+        &self,
+        mirror_name: &str,
+        bootstrap_hwm: u64,
+        topic: &str,
+        partition: u32,
+    ) {
+        self.insert_slot(mirror_name, bootstrap_hwm, None, topic, partition, false);
+    }
+
+    fn insert_slot(
+        &self,
+        mirror_name: &str,
+        bootstrap_hwm: u64,
+        last_committed_offset: Option<u64>,
+        topic: &str,
+        partition: u32,
+        keeps_values: bool,
+    ) {
         // Returning-deploy commit wins when present; otherwise the
         // fresh-deploy fallback skips historical backlog up to the
         // broker's high-watermark.
@@ -276,17 +319,10 @@ impl CacheState {
                 broker_end_offset: AtomicU64::new(bootstrap_hwm),
                 source_assigned: AtomicBool::new(true),
                 status: RwLock::new(initial_status),
-                view: RwLock::new(IndexMap::new()),
+                view: keeps_values.then(|| RwLock::new(IndexMap::new())),
                 offsets: RwLock::new(HashMap::new()),
             },
         );
-        drop(m);
-        if is_main {
-            *self
-                .main_mirror
-                .write()
-                .expect("cache main_mirror poisoned") = Some(mirror_name.to_string());
-        }
     }
 
     /// True iff the notify dispatcher should drop a record at
@@ -336,6 +372,19 @@ impl CacheState {
         }
         // Drop the offsets lock before touching the view lock.
         // Order is consistent across all paths to avoid deadlocks.
+        if let Some(view) = slot.view.as_ref() {
+            Self::apply_value(view, record);
+        }
+        // Advance the per-mirror `last_applied_offset` and recompute
+        // the status. Both the per-`TopicPartition` `offsets` map
+        // above and this atom are kept; the atom is what the
+        // readiness predicate reads.
+        slot.last_applied_offset
+            .fetch_max(record.source_offset + 1, Ordering::AcqRel);
+        Self::recompute_status_locked(slot, self.readiness_lag_tolerance);
+    }
+
+    fn apply_value(view: &RwLock<IndexMap<String, Vec<u8>>>, record: &Record) {
         let key = match record
             .key
             .as_ref()
@@ -348,7 +397,7 @@ impl CacheState {
             None => return,
         };
         {
-            let mut view = slot.view.write().expect("mirror view poisoned");
+            let mut view = view.write().expect("mirror view poisoned");
             match record.value.as_ref() {
                 Some(v) => {
                     // IndexMap::insert keeps the existing position on
@@ -366,13 +415,6 @@ impl CacheState {
                 }
             }
         }
-        // Advance the per-mirror `last_applied_offset` and recompute
-        // the status. Both the per-`TopicPartition` `offsets` map
-        // above and this atom are kept; the atom is what the
-        // readiness predicate reads.
-        slot.last_applied_offset
-            .fetch_max(record.source_offset + 1, Ordering::AcqRel);
-        Self::recompute_status_locked(slot, self.readiness_lag_tolerance);
     }
 
     /// Compute the current status of a slot from its atomic
@@ -569,7 +611,7 @@ impl CacheState {
     pub fn get_value_for(&self, mirror_name: &str, key: &str) -> Option<Vec<u8>> {
         let mirrors = self.mirrors.read().expect("cache mirrors poisoned");
         let slot = mirrors.get(mirror_name)?;
-        let view = slot.view.read().expect("mirror view poisoned");
+        let view = slot.view.as_ref()?.read().expect("mirror view poisoned");
         view.get(key).cloned()
     }
 
@@ -578,7 +620,7 @@ impl CacheState {
     pub fn snapshot_keys_for(&self, mirror_name: &str) -> Option<Vec<String>> {
         let mirrors = self.mirrors.read().expect("cache mirrors poisoned");
         let slot = mirrors.get(mirror_name)?;
-        let view = slot.view.read().expect("mirror view poisoned");
+        let view = slot.view.as_ref()?.read().expect("mirror view poisoned");
         Some(view.keys().cloned().collect())
     }
 
@@ -588,7 +630,7 @@ impl CacheState {
     pub fn snapshot_values_for(&self, mirror_name: &str) -> Option<Vec<Vec<u8>>> {
         let mirrors = self.mirrors.read().expect("cache mirrors poisoned");
         let slot = mirrors.get(mirror_name)?;
-        let view = slot.view.read().expect("mirror view poisoned");
+        let view = slot.view.as_ref()?.read().expect("mirror view poisoned");
         Some(view.values().cloned().collect())
     }
 
@@ -825,6 +867,19 @@ mod tests {
         assert_eq!(s.get_value_for("b", "k-b").as_deref(), Some(b"vb".as_ref()));
         assert!(s.get_value_for("missing", "anything").is_none());
         assert!(s.snapshot_keys_for("missing").is_none());
+    }
+
+    #[test]
+    fn progress_only_slot_tracks_readiness_and_holds_no_values() {
+        let s = CacheState::new();
+        s.register_progress_only("archive", 2, "t", 0);
+        assert!(!s.is_mirror_ready("archive"));
+        s.apply_record("archive", &rec("t", 0, 0, "a", Some(b"x")));
+        s.apply_record("archive", &rec("t", 0, 1, "b", Some(b"y")));
+        assert!(s.is_mirror_ready("archive"));
+        assert_eq!(s.get_value_for("archive", "a"), None);
+        assert_eq!(s.snapshot_keys_for("archive"), None);
+        assert_eq!(s.get_offset_for("archive", "t", 0), Some(1));
     }
 
     #[test]

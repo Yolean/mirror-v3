@@ -61,7 +61,6 @@ fn fs_cfg(root: &Path, compaction: Option<CompactionMode>) -> FilesystemSinkConf
         keys: ColumnType::Utf8,
         values: ColumnType::Utf8,
         compaction,
-        cache: None,
         // High thresholds; explicit flush_now is the only thing
         // that rotates a file during these tests so we can drive
         // buffer state precisely from the events list.

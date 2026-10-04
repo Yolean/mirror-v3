@@ -49,7 +49,6 @@ fn cfg(store: Arc<dyn ObjectStore>, compaction: Option<CompactionMode>) -> S3Sin
         keys: ColumnType::Utf8,
         values: ColumnType::Utf8,
         compaction,
-        cache: None,
         flush: FlushTriggers {
             max_time: Duration::from_secs(3600),
             max_bytes: u64::MAX,

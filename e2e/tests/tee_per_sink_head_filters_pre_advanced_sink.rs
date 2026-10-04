@@ -125,7 +125,6 @@ async fn tee_per_sink_head_filters_records_already_durable_on_one_sink() {
         keys: mirror_envelope::ColumnType::Utf8,
         values: mirror_envelope::ColumnType::Utf8,
         compaction: None,
-        cache: None,
         flush: mirror_fs::FlushTriggers {
             max_time: Duration::from_secs(3600),
             max_bytes: u64::MAX,

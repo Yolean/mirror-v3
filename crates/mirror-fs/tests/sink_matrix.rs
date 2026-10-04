@@ -60,7 +60,6 @@ fn cfg(root: &std::path::Path, compaction: Option<CompactionMode>) -> Filesystem
         keys: ColumnType::Utf8,
         values: ColumnType::Utf8,
         compaction,
-        cache: None,
         // Huge thresholds so explicit `flush()` is the only thing
         // that actually rotates a file; matrix rows that *don't*
         // call flush get to control buffer state precisely.

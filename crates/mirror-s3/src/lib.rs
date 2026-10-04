@@ -67,10 +67,6 @@ pub struct S3SinkConfig {
     /// Caller must combine `Some(Log)` with `Format::Parquet` and
     /// `keys` ∈ {`Utf8`, `Json`}.
     pub compaction: Option<CompactionMode>,
-    /// Optional shared HTTP-cache state. See
-    /// `mirror_fs::FilesystemSinkConfig::cache` for semantics; the
-    /// S3 sink behaves identically.
-    pub cache: Option<CacheBinding>,
     pub flush: FlushTriggers,
 }
 
@@ -80,10 +76,6 @@ pub struct S3SinkConfig {
 pub enum CompactionMode {
     Log,
 }
-
-/// Re-export of the canonical cache binding from `mirror-core`. See
-/// `mirror_fs::CacheBinding` for the symmetric FS-side comment.
-pub use mirror_core::CacheBinding;
 
 pub struct S3Sink {
     store: Arc<dyn ObjectStore>,
@@ -134,35 +126,6 @@ impl S3Sink {
                 (pos, Some(view))
             }
         };
-        // Cache bootstrap: same shape as mirror-fs; replay durable
-        // state into the shared CacheState. Compaction = read latest
-        // snapshot; append + cache = scan + replay every object.
-        //
-        // The snapshot `view` is a `BTreeMap<key, Record>` whose
-        // `.values()` iterate in key order, not offset order, so
-        // `CacheState::apply_record`'s monotonic guard would drop
-        // every snapshot record whose key happens to land after a
-        // higher-offset key in the alphabet. Sort by `source_offset`
-        // ascending before dispatch (matches mirror-fs).
-        if let Some(binding) = cfg.cache.as_ref() {
-            match &view {
-                Some(v) => {
-                    let mut snapshot_records: Vec<&Record> = v.values().collect();
-                    snapshot_records.sort_by_key(|r| r.source_offset);
-                    for r in snapshot_records {
-                        binding.state.apply_record(&binding.mirror_name, r);
-                    }
-                }
-                None => {
-                    let records =
-                        read_all_records_via(cfg.store.as_ref(), &partition_prefix, cfg.format)
-                            .await?;
-                    for r in records.iter() {
-                        binding.state.apply_record(&binding.mirror_name, r);
-                    }
-                }
-            }
-        }
         // See mirror-fs::FilesystemSink::open_with_clock for the
         // naive-vs-smart story.
         let next_daily_unix = cfg
@@ -661,50 +624,6 @@ async fn load_view(
         view.insert(key_str, r);
     }
     Ok(view)
-}
-
-/// Read every object under the partition prefix as records, in
-/// offset order. Used to bootstrap the shared cache view on
-/// append + cache mode (where the chain is the full event history,
-/// not a single snapshot).
-async fn read_all_records_via(
-    store: &dyn ObjectStore,
-    prefix: &Path,
-    format: Format,
-) -> Result<Vec<Record>, S3Error> {
-    let expected_ext = format.extension();
-    let mut entries: Vec<(u64, u64, Path)> = Vec::new();
-    let mut stream = store.list(Some(prefix));
-    while let Some(meta) = stream.next().await {
-        let meta = meta.map_err(|e| S3Error::Store(e.to_string()))?;
-        let name = meta
-            .location
-            .filename()
-            .map(|s| s.to_string())
-            .unwrap_or_default();
-        if name.is_empty() || name.contains(".tmp.") {
-            continue;
-        }
-        if let Some((from, to)) = naming::parse_filename(&name, expected_ext) {
-            entries.push((from, to, meta.location.clone()));
-        }
-    }
-    entries.sort_by_key(|(from, _, _)| *from);
-    let mut out = Vec::new();
-    for (_, _, path) in entries {
-        let got = store
-            .get(&path)
-            .await
-            .map_err(|e| S3Error::Store(format!("get {path}: {e}")))?;
-        let bytes = got
-            .bytes()
-            .await
-            .map_err(|e| S3Error::Store(format!("read {path}: {e}")))?;
-        let records = mirror_envelope::decode_batch(format, &bytes)
-            .map_err(|e| S3Error::CorruptChain(format!("decode {path}: {e}")))?;
-        out.extend(records);
-    }
-    Ok(out)
 }
 
 fn report_compaction_keys(n: usize) {

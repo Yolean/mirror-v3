@@ -374,7 +374,6 @@ async fn query_destination_next(mirror: &Mirror, destination: &Destination) -> R
                 keys: params.keys,
                 values: params.values,
                 compaction: compaction_to_fs(mirror.compaction),
-                cache: None,
                 flush: params.flush,
             };
             let mut sink = FilesystemSink::open(cfg).map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -404,7 +403,6 @@ async fn query_destination_next(mirror: &Mirror, destination: &Destination) -> R
                 keys: params.keys,
                 values: params.values,
                 compaction: compaction_to_s3(mirror.compaction),
-                cache: None,
                 flush: mirror_s3::FlushTriggers {
                     max_time: params.flush.max_time,
                     max_bytes: params.flush.max_bytes,
@@ -546,14 +544,18 @@ async fn run(path: PathBuf) -> Result<()> {
                 lag_tolerance = tolerance,
                 "registering mirror with cache readiness gate"
             );
-            state.register_mirror_with_topic(
-                &m.name,
-                hwm,
-                last_committed,
-                is_main,
-                &m.topic,
-                m.partition,
-            );
+            if serves_cache(m) {
+                state.register_mirror_with_topic(
+                    &m.name,
+                    hwm,
+                    last_committed,
+                    is_main,
+                    &m.topic,
+                    m.partition,
+                );
+            } else {
+                state.register_progress_only(&m.name, hwm, &m.topic, m.partition);
+            }
         }
         Some(state)
     };
@@ -603,6 +605,18 @@ async fn run(path: PathBuf) -> Result<()> {
         tracing::error!(mirror = %which, "mirror task errored; exiting process");
     }
     result
+}
+
+/// Whether the mirror serves `/cache/v1` and so holds every key's latest
+/// value in memory. Only these mirrors keep values; the cache is built by
+/// reading the source topic from its low watermark (kkv's bootstrap), never
+/// from a destination, so a cache does not depend on S3 being up and a blob
+/// mirror does not download its archive at startup.
+fn serves_cache(mirror: &Mirror) -> bool {
+    mirror
+        .http_access
+        .as_ref()
+        .is_some_and(HttpAccess::any_enabled)
 }
 
 /// Pick the listen address for the cache HTTP server. Defaults to
@@ -799,8 +813,7 @@ async fn spawn_mirror(
         let inner_name = dest.effective_name(&mirror.name);
         let kind = destination_type(dest);
         dest_descriptions.push(format!("{inner_name}({kind})"));
-        let mut sink: Box<dyn Sink> =
-            open_inner_sink(dest, &mirror, &inner_name, cache.as_ref()).await?;
+        let mut sink: Box<dyn Sink> = open_inner_sink(dest, &mirror, &inner_name).await?;
         let slot = Arc::new(DestAckSlot::new(
             inner_name.clone(),
             dest.affects_readiness(),
@@ -895,7 +908,22 @@ async fn spawn_mirror(
         }
         _ => None,
     };
-    if notifier_opt.is_some() {
+    if serves_cache(&mirror) && !mirror.destinations.is_empty() {
+        // The cache holds the latest value of every key, so it reads the
+        // topic from the low watermark like kkv. The destinations are
+        // past that already: the tee skips their writes below each head,
+        // and the notifier's suppression threshold (the committed offset,
+        // or the bootstrap watermark on a fresh group) keeps the replay
+        // from firing webhooks for records the previous pod notified.
+        let low = fetch_low_watermark_for_mirror(&mirror).await?;
+        tracing::info!(
+            mirror = %name,
+            low_watermark = low,
+            destination_min_head = min_head,
+            "cache mirror: reading the source from its low watermark"
+        );
+        tee.set_resume_floor(low);
+    } else if notifier_opt.is_some() {
         if let Some(committed) = notify_committed {
             if committed < min_head {
                 // Re-read the gap from the source; the tee skips the
@@ -1236,7 +1264,6 @@ async fn open_inner_sink(
     dest: &Destination,
     mirror: &Mirror,
     inner_name: &str,
-    cache_for_bootstrap: Option<&mirror_core::CacheBinding>,
 ) -> Result<Box<dyn mirror_core::Sink>> {
     match dest {
         Destination::Kafka(k) => {
@@ -1257,12 +1284,6 @@ async fn open_inner_sink(
         }
         Destination::Filesystem(fs) => {
             let params = resolve_blob_params(mirror)?;
-            // Cache bootstrap-replay happens at sink-open time in
-            // each blob sink. The tee's `cache` binding is what
-            // matters for the per-record path; passing the binding
-            // to every inner blob sink seeds the cache from durable
-            // state on restart. CacheState is monotonic so multiple
-            // inner sinks bootstrapping the same binding is safe.
             let sink_cfg = FilesystemSinkConfig {
                 root: fs.root.clone(),
                 destination_name: inner_name.to_string(),
@@ -1272,7 +1293,6 @@ async fn open_inner_sink(
                 keys: params.keys,
                 values: params.values,
                 compaction: compaction_to_fs(mirror.compaction),
-                cache: cache_for_bootstrap.cloned(),
                 flush: params.flush,
             };
             let sink = FilesystemSink::open(sink_cfg).with_context(|| {
@@ -1310,7 +1330,6 @@ async fn open_inner_sink(
                 keys: params.keys,
                 values: params.values,
                 compaction: compaction_to_s3(mirror.compaction),
-                cache: cache_for_bootstrap.cloned(),
                 flush: mirror_s3::FlushTriggers {
                     max_time: params.flush.max_time,
                     max_bytes: params.flush.max_bytes,

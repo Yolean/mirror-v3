@@ -107,7 +107,7 @@ pub struct FsMirrorSpec {
     pub keys: mirror_envelope::ColumnType,
     pub values: mirror_envelope::ColumnType,
     pub compaction: Option<mirror_fs::CompactionMode>,
-    pub cache: Option<mirror_fs::CacheBinding>,
+    pub cache: Option<mirror_core::CacheBinding>,
     pub flush: mirror_fs::FlushTriggers,
 }
 
@@ -155,7 +155,6 @@ pub fn spawn_kafka_to_filesystem(spec: FsMirrorSpec) -> Result<MirrorHandle> {
     };
     let source = KafkaSource::open(src_cfg).context("open KafkaSource")?;
     let dest_name = spec.destination_name.clone();
-    let cache_for_bootstrap = spec.cache.clone();
     let cache_for_tee = spec.cache.clone();
     let sink_cfg = FilesystemSinkConfig {
         root: spec.root,
@@ -166,7 +165,6 @@ pub fn spawn_kafka_to_filesystem(spec: FsMirrorSpec) -> Result<MirrorHandle> {
         keys: spec.keys,
         values: spec.values,
         compaction: spec.compaction,
-        cache: cache_for_bootstrap,
         flush: spec.flush,
     };
     let sink = FilesystemSink::open(sink_cfg).context("open FilesystemSink")?;
@@ -245,7 +243,6 @@ pub async fn spawn_kafka_to_tee(spec: TeeMirrorSpec) -> Result<MirrorHandle> {
     };
     let source = KafkaSource::open(src_cfg).context("open KafkaSource")?;
 
-    let cache_for_bootstrap = spec.cache.clone();
     let mut inners: Vec<(String, Box<dyn mirror_core::Sink>)> =
         Vec::with_capacity(spec.destinations.len());
     for inner in spec.destinations {
@@ -260,7 +257,6 @@ pub async fn spawn_kafka_to_tee(spec: TeeMirrorSpec) -> Result<MirrorHandle> {
                     keys: fs.keys,
                     values: fs.values,
                     compaction: fs.compaction,
-                    cache: cache_for_bootstrap.clone(),
                     flush: fs.flush,
                 };
                 let sink = FilesystemSink::open(cfg).context("open FilesystemSink")?;
@@ -277,7 +273,6 @@ pub async fn spawn_kafka_to_tee(spec: TeeMirrorSpec) -> Result<MirrorHandle> {
                     keys: s3.keys,
                     values: s3.values,
                     compaction: s3.compaction,
-                    cache: cache_for_bootstrap.clone(),
                     flush: s3.flush,
                 };
                 let sink = S3Sink::open(cfg).await.context("open S3Sink")?;
@@ -311,7 +306,7 @@ pub struct S3MirrorSpec {
     pub keys: mirror_envelope::ColumnType,
     pub values: mirror_envelope::ColumnType,
     pub compaction: Option<mirror_s3::CompactionMode>,
-    pub cache: Option<mirror_s3::CacheBinding>,
+    pub cache: Option<mirror_core::CacheBinding>,
     pub flush: mirror_s3::FlushTriggers,
 }
 
@@ -328,7 +323,6 @@ pub async fn spawn_kafka_to_s3(spec: S3MirrorSpec) -> Result<MirrorHandle> {
     };
     let source = KafkaSource::open(src_cfg).context("open KafkaSource")?;
     let dest_name = spec.destination_name.clone();
-    let cache_for_bootstrap = spec.cache.clone();
     let cache_for_tee = spec.cache.clone();
     let sink_cfg = S3SinkConfig {
         store: spec.store,
@@ -340,7 +334,6 @@ pub async fn spawn_kafka_to_s3(spec: S3MirrorSpec) -> Result<MirrorHandle> {
         keys: spec.keys,
         values: spec.values,
         compaction: spec.compaction,
-        cache: cache_for_bootstrap,
         flush: spec.flush,
     };
     let sink = S3Sink::open(sink_cfg).await.context("open S3Sink")?;
@@ -395,7 +388,6 @@ pub async fn spawn_kafka_to_fs_with_notify(
             (state, None)
         }
     };
-    let cache_for_bootstrap = spec.cache.clone();
     let sink_cfg = FilesystemSinkConfig {
         root: spec.root,
         destination_name: spec.destination_name,
@@ -405,7 +397,6 @@ pub async fn spawn_kafka_to_fs_with_notify(
         keys: spec.keys,
         values: spec.values,
         compaction: spec.compaction,
-        cache: cache_for_bootstrap,
         flush: spec.flush,
     };
     let sink = FilesystemSink::open(sink_cfg).context("open FilesystemSink")?;

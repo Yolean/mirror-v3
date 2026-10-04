@@ -84,7 +84,7 @@ Also exposed on the same port:
 - `GET /openapi.json` and `GET /openapi.yaml` — auto-generated OpenAPI 3.1 spec; the committed copy is at [`schemas/mirror-v3.cache.openapi.json`](./schemas/mirror-v3.cache.openapi.json) (gated by `cargo run -p xtask -- check-openapi`).
 - `GET /docs` — Scalar UI rendering the spec.
 
-Compaction interaction: `http-access` works with **or without** `compaction: log`. In append mode the on-disk chain is the full event history and is replayed into the in-memory view on startup (cost O(total records)). With `compaction: log` the view is bootstrapped from the latest snapshot in O(distinct keys) — pick this for very large topics. See [`examples/cache-v1.yaml`](./examples/cache-v1.yaml).
+Bootstrap: a cache is built by reading the source topic from its low watermark, as kafka-keyvalue does, never from a destination. A cache does not need S3 to start and is not stalled by a slow destination when it is the only thing its mirror does, and a blob destination's startup reads object names only. On a mirror that has destinations too, the source is read from the low watermark and the destinations skip what they already hold. Put a cache in its own mirror when its availability must not depend on a destination (a failing destination ends its mirror).
 
 ## Observability
 

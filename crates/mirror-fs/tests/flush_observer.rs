@@ -38,7 +38,6 @@ fn cfg(root: &std::path::Path, max_offsets: u64) -> FilesystemSinkConfig {
         keys: mirror_envelope::ColumnType::Utf8,
         values: mirror_envelope::ColumnType::Utf8,
         compaction: None,
-        cache: None,
         flush: FlushTriggers {
             max_time: Duration::from_secs(3600),
             max_bytes: u64::MAX,
