@@ -127,6 +127,21 @@ An S3 destination names two identities by the environment variables holding thei
         credentials:
           write: { access-key-id-env: S3_WRITE_ACCESS_KEY_ID, secret-access-key-env: S3_WRITE_SECRET_ACCESS_KEY }
           read:  { access-key-id-env: S3_READ_ACCESS_KEY_ID,  secret-access-key-env: S3_READ_SECRET_ACCESS_KEY }
+        encryption: none
+```
+
+`encryption` is required on every S3 destination, so clear text is a written decision: `encryption: none`, or Parquet modular encryption with keys in the observability compactor's layout:
+
+```yaml
+        encryption: { keys-dir: /etc/mirror-v3/parquet-keys, key-id: k1 }
+    format: parquet   # required, written out
+```
+
+`keys-dir` is a directory, normally a mounted Secret, with one file per key: the file name is the key id (`[a-z0-9][a-z0-9-]*`, at most 32 characters), the content the standard base64 of 32 random bytes (`openssl rand -base64 32`); dot entries are skipped, anything else invalid stops the mirror (errors name the file, never its content). New blobs are encrypted with `key-id` (footer and every column, AES-GCM, encrypted footer, so no statistics leak) and named `<from>-<to>.k-<key id>.parquet`; a blob is read with the key its name carries. Rotation: add the new key's file, then change `key-id`; keep old keys while blobs need them. A chain may mix plain and encrypted blobs (turning encryption on). DuckDB reads one key's blobs with:
+
+```sql
+PRAGMA add_parquet_key('k1', '<base64 of the key>');
+SELECT * FROM read_parquet('s3://bucket/userstate/0/*.k-k1.parquet', encryption_config = {footer_key: 'k1'});
 ```
 
 More examples: [`examples/`](examples/).

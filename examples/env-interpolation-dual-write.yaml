@@ -35,6 +35,7 @@ mirrors:
         credentials:
           write: { access-key-id-env: S3_WRITE_ACCESS_KEY_ID, secret-access-key-env: S3_WRITE_SECRET_ACCESS_KEY }
           read: { access-key-id-env: S3_READ_ACCESS_KEY_ID, secret-access-key-env: S3_READ_SECRET_ACCESS_KEY }
+        encryption: none
         prefix: ${MIRROR_NAME:-orders}/
       - type: s3
         name: ${MIRROR_NAME:-orders}-eu
@@ -43,6 +44,7 @@ mirrors:
         credentials:
           write: { access-key-id-env: S3_WRITE_ACCESS_KEY_ID, secret-access-key-env: S3_WRITE_SECRET_ACCESS_KEY }
           read: { access-key-id-env: S3_READ_ACCESS_KEY_ID, secret-access-key-env: S3_READ_SECRET_ACCESS_KEY }
+        encryption: none
         prefix: ${MIRROR_NAME:-orders}/
     format: parquet
     compression: zstd-1

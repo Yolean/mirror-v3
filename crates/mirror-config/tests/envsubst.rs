@@ -42,6 +42,7 @@ mirrors:
         credentials:
           write: { access-key-id-env: S3_WRITE_ACCESS_KEY_ID, secret-access-key-env: S3_WRITE_SECRET_ACCESS_KEY }
           read: { access-key-id-env: S3_READ_ACCESS_KEY_ID, secret-access-key-env: S3_READ_SECRET_ACCESS_KEY }
+        encryption: none
         endpoint: ${S3_ENDPOINT:-}
         prefix: archive/
       - type: s3
@@ -51,6 +52,7 @@ mirrors:
         credentials:
           write: { access-key-id-env: S3_WRITE_ACCESS_KEY_ID, secret-access-key-env: S3_WRITE_SECRET_ACCESS_KEY }
           read: { access-key-id-env: S3_READ_ACCESS_KEY_ID, secret-access-key-env: S3_READ_SECRET_ACCESS_KEY }
+        encryption: none
         endpoint: ${S3_ENDPOINT:-}
         prefix: archive/
     format: parquet

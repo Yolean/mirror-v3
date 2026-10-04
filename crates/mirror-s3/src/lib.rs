@@ -25,7 +25,7 @@ use mirror_fs::blob::{self, BlobError, BlobSink, BlobSpec, BlobStore};
 use object_store::path::Path;
 use object_store::{ObjectStore, PutMode, PutOptions, PutPayload};
 
-pub use mirror_fs::blob::{CompactionMode, FlushTriggers, UnixClock};
+pub use mirror_fs::blob::{BlobEncryption, CompactionMode, FlushTriggers, UnixClock};
 
 /// Errors from opening an S3 destination.
 pub type S3Error = BlobError;
@@ -51,6 +51,8 @@ pub struct S3SinkConfig {
     /// with `Format::Parquet` and `keys` ∈ {`Utf8`, `Json`}.
     pub compaction: Option<CompactionMode>,
     pub flush: FlushTriggers,
+    /// Explicit per destination: `None` writes blobs in clear.
+    pub encryption: Option<BlobEncryption>,
 }
 
 /// One partition prefix in an object store, reached with two identities:
@@ -174,6 +176,7 @@ impl S3Sink {
             values: cfg.values,
             compaction: cfg.compaction,
             flush: cfg.flush,
+            encryption: cfg.encryption,
         };
         let store = S3Store::new(cfg.read_store, cfg.write_store, partition_prefix);
         Ok(Self(BlobSink::open_store(store, spec, clock).await?))

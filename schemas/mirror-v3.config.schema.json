@@ -289,6 +289,10 @@
               "description": "The identities the destination uses, named by the environment\nvariables that hold their keys (keys never go in the config).",
               "$ref": "#/$defs/S3Credentials"
             },
+            "encryption": {
+              "description": "Required, so that clear-text blobs are a written decision:\n`none`, or the Parquet key layout of the observability\ncompactor (`keys-dir`, `key-id`).",
+              "$ref": "#/$defs/Encryption"
+            },
             "affects-readiness": {
               "description": "See [`KafkaDestination::affects_readiness`].",
               "type": "boolean",
@@ -304,7 +308,8 @@
             "type",
             "region",
             "bucket",
-            "credentials"
+            "credentials",
+            "encryption"
           ]
         }
       ]
@@ -342,6 +347,41 @@
       "required": [
         "access-key-id-env",
         "secret-access-key-env"
+      ]
+    },
+    "Encryption": {
+      "description": "An S3 destination's encryption: `encryption: none`, or\n`encryption: { keys-dir: /keys, key-id: k1 }`.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/EncryptionNone"
+        },
+        {
+          "$ref": "#/$defs/ParquetKeys"
+        }
+      ]
+    },
+    "EncryptionNone": {
+      "description": "The literal `none`.",
+      "type": "string",
+      "enum": [
+        "none"
+      ]
+    },
+    "ParquetKeys": {
+      "description": "Parquet modular encryption with keys in the observability\ncompactor's layout: `keys-dir` holds one file per key (the file name\nis the key id, the content the base64 of 32 bytes), and new blobs\nare encrypted with `key-id`. A blob is read with the key whose id\nits name carries (`<from>-<to>.k-<id>.parquet`), so a rotation adds\nthe new key's file and then changes `key-id`; old keys stay while\nblobs need them.",
+      "type": "object",
+      "properties": {
+        "keys-dir": {
+          "type": "string"
+        },
+        "key-id": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "keys-dir",
+        "key-id"
       ]
     },
     "DestinationFormat": {

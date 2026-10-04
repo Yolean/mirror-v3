@@ -1,7 +1,8 @@
 use mirror_config::{
     load_from_str, CacheV1Config, ColumnConfig, ColumnType, Compaction, Config, Destination,
-    DestinationFormat, FilesystemDestination, FlushTriggers, HttpAccess, KafkaDestination,
-    KafkaSource, Mirror, S3Credentials, S3Destination, S3Key, TimestampMode,
+    DestinationFormat, Encryption, EncryptionNone, FilesystemDestination, FlushTriggers,
+    HttpAccess, KafkaDestination, KafkaSource, Mirror, S3Credentials, S3Destination, S3Key,
+    TimestampMode,
 };
 use std::path::PathBuf;
 
@@ -157,6 +158,7 @@ mirrors:
         credentials:
           write: { access-key-id-env: S3_WRITE_ACCESS_KEY_ID, secret-access-key-env: S3_WRITE_SECRET_ACCESS_KEY }
           read: { access-key-id-env: S3_READ_ACCESS_KEY_ID, secret-access-key-env: S3_READ_SECRET_ACCESS_KEY }
+        encryption: none
         prefix: archive/
     flush:
       max-time-ms: 60000
@@ -182,6 +184,7 @@ mirrors:
                     secret_access_key_env: "S3_READ_SECRET_ACCESS_KEY".into(),
                 },
             },
+            encryption: Encryption::None(EncryptionNone::None),
             affects_readiness: true,
         })
     );
@@ -236,6 +239,7 @@ mirrors:
         credentials:
           write: { access-key-id-env: S3_WRITE_ACCESS_KEY_ID, secret-access-key-env: S3_WRITE_SECRET_ACCESS_KEY }
           read: { access-key-id-env: S3_READ_ACCESS_KEY_ID, secret-access-key-env: S3_READ_SECRET_ACCESS_KEY }
+        encryption: none
     format: parquet
     flush:
       max-time-ms: 5000
@@ -272,6 +276,7 @@ mirrors:
         credentials:
           write: { access-key-id-env: S3_WRITE_ACCESS_KEY_ID, secret-access-key-env: S3_WRITE_SECRET_ACCESS_KEY }
           read: { access-key-id-env: S3_READ_ACCESS_KEY_ID, secret-access-key-env: S3_READ_SECRET_ACCESS_KEY }
+        encryption: none
         prefix: archive/
     format: parquet
     compression: zstd-1
@@ -292,6 +297,7 @@ mirrors:
         credentials:
           write: { access-key-id-env: S3_WRITE_ACCESS_KEY_ID, secret-access-key-env: S3_WRITE_SECRET_ACCESS_KEY }
           read: { access-key-id-env: S3_READ_ACCESS_KEY_ID, secret-access-key-env: S3_READ_SECRET_ACCESS_KEY }
+        encryption: none
         prefix: archive/
     format: parquet
     compression: zstd-1
@@ -979,4 +985,72 @@ mirrors:
         format!("{err}").contains("both write /data/archive/0"),
         "{err}"
     );
+}
+
+fn s3_mirror_yaml(encryption: &str, format: &str) -> String {
+    format!(
+        r#"
+mirrors:
+  - name: ops
+    source: {{ bootstrap-servers: k:9092 }}
+    topic: ops
+    partition: 0
+    destinations:
+      - type: s3
+        region: example-region
+        bucket: b
+        credentials:
+          write: {{ access-key-id-env: W_ID, secret-access-key-env: W_SECRET }}
+          read: {{ access-key-id-env: R_ID, secret-access-key-env: R_SECRET }}
+{encryption}
+{format}
+    flush: {{ max-time-ms: 1000, max-bytes: 1000, max-offsets: 10 }}
+"#
+    )
+}
+
+#[test]
+fn s3_encryption_must_be_written_out() {
+    let err = load_from_str(&s3_mirror_yaml("", "")).expect_err("encryption is required");
+    assert!(format!("{err}").contains("encryption"), "{err}");
+}
+
+#[test]
+fn s3_encryption_none_and_keys_parse() {
+    let cfg = load_from_str(&s3_mirror_yaml("        encryption: none", "")).unwrap();
+    let Destination::S3(s3) = &cfg.mirrors[0].destinations[0] else {
+        panic!()
+    };
+    assert_eq!(s3.encryption, Encryption::None(EncryptionNone::None));
+    let cfg = load_from_str(&s3_mirror_yaml(
+        "        encryption: { keys-dir: /keys, key-id: k1 }",
+        "    format: parquet",
+    ))
+    .unwrap();
+    let Destination::S3(s3) = &cfg.mirrors[0].destinations[0] else {
+        panic!()
+    };
+    assert_eq!(
+        s3.encryption,
+        Encryption::ParquetKeys(mirror_config::ParquetKeys {
+            keys_dir: "/keys".into(),
+            key_id: "k1".into()
+        })
+    );
+}
+
+#[test]
+fn s3_encryption_needs_explicit_parquet_and_a_key_id() {
+    let err = load_from_str(&s3_mirror_yaml(
+        "        encryption: { keys-dir: /keys, key-id: k1 }",
+        "",
+    ))
+    .expect_err("format must be written out");
+    assert!(format!("{err}").contains("format: parquet"), "{err}");
+    let err = load_from_str(&s3_mirror_yaml(
+        "        encryption: { keys-dir: /keys, key-id: K1 }",
+        "    format: parquet",
+    ))
+    .expect_err("bad key id");
+    assert!(format!("{err}").contains("not a key id"), "{err}");
 }

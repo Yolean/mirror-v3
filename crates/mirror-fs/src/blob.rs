@@ -52,7 +52,7 @@ pub enum CompactionMode {
 }
 
 /// How a blob destination encodes and when it flushes.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct BlobSpec {
     pub format: Format,
     pub compression: ParquetCompression,
@@ -60,6 +60,17 @@ pub struct BlobSpec {
     pub values: ColumnType,
     pub compaction: Option<CompactionMode>,
     pub flush: FlushTriggers,
+    /// `None`: blobs are written in clear. `Some`: Parquet blobs
+    /// encrypted with the key `key_id`, named `<from>-<to>.k-<id>.parquet`.
+    pub encryption: Option<BlobEncryption>,
+}
+
+/// The key new blobs are encrypted with, and every key the directory
+/// holds (a blob is read with the key its name carries).
+#[derive(Debug, Clone)]
+pub struct BlobEncryption {
+    pub key_id: String,
+    pub keyring: Arc<mirror_envelope::Keyring>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -129,16 +140,18 @@ pub fn validate_chain(
     let mut entries: Vec<(u64, u64, &str)> = Vec::new();
     for name in names {
         if let Some(other_ext) = file_extension(name) {
-            if other_ext != expected_ext && naming::parse_filename(name, other_ext).is_some() {
+            if other_ext != expected_ext && naming::parse_blob_name(name, other_ext).is_some() {
                 return Err(BlobError::CorruptChain(format!(
                     "{name}: extension '{other_ext}' does not match configured format \
                      '{expected_ext}'"
                 )));
             }
         }
-        let Some((from, to)) = naming::parse_filename(name, expected_ext) else {
+        let Some(naming::BlobName { from, to, .. }) = naming::parse_blob_name(name, expected_ext)
+        else {
             return Err(BlobError::CorruptChain(format!(
-                "{name} is not a blob name this mirror writes (<from>-<to>.{expected_ext})"
+                "{name} is not a blob name this mirror writes \
+                 (<from>-<to>.{expected_ext}, or <from>-<to>.k-<key id>.{expected_ext})"
             )));
         };
         if to < from {
@@ -199,15 +212,43 @@ fn file_extension(name: &str) -> Option<&str> {
     Some(&name[dot + 1..])
 }
 
-/// Decode a compaction snapshot into the view. Keys must be UTF-8: we
-/// wrote them as such, so anything else is corruption.
-pub fn decode_view(
+/// Decode a blob, with the key its name carries if it has one.
+pub fn decode_blob(
+    name: &str,
     location: &str,
     bytes: &[u8],
     format: Format,
+    encryption: Option<&BlobEncryption>,
+) -> Result<Vec<Record>, BlobError> {
+    let key_id = naming::parse_blob_name(name, format.extension()).and_then(|b| b.key_id);
+    let decoded = match key_id {
+        None => mirror_envelope::decode_batch(format, bytes),
+        Some(id) => {
+            let ring = encryption.map(|e| &e.keyring).ok_or_else(|| {
+                BlobError::Store(format!(
+                    "{location} is encrypted with Parquet key {id}, and this destination has \
+                     `encryption: none`"
+                ))
+            })?;
+            let key = ring
+                .get(&id)
+                .map_err(|e| BlobError::Store(format!("{location}: {e}")))?;
+            mirror_envelope::parquet::decode_batch_encrypted(bytes, key)
+        }
+    };
+    decoded.map_err(|e| BlobError::CorruptChain(format!("decode {location}: {e}")))
+}
+
+/// Decode a compaction snapshot into the view. Keys must be UTF-8: we
+/// wrote them as such, so anything else is corruption.
+pub fn decode_view(
+    name: &str,
+    location: &str,
+    bytes: &[u8],
+    format: Format,
+    encryption: Option<&BlobEncryption>,
 ) -> Result<BTreeMap<String, Record>, BlobError> {
-    let records = mirror_envelope::decode_batch(format, bytes)
-        .map_err(|e| BlobError::CorruptChain(format!("decode {location}: {e}")))?;
+    let records = decode_blob(name, location, bytes, format, encryption)?;
     let mut view = BTreeMap::new();
     for r in records {
         let key_bytes = r.key.as_ref().ok_or_else(|| {
@@ -287,13 +328,27 @@ impl<S: BlobStore> BlobSink<S> {
         snapshot: Option<Vec<u8>>,
         clock: UnixClock,
     ) -> Result<Self, BlobError> {
+        if let Some(enc) = &spec.encryption {
+            if spec.format != Format::Parquet {
+                return Err(BlobError::Store(
+                    "encryption needs `format: parquet`".to_string(),
+                ));
+            }
+            enc.keyring
+                .get(&enc.key_id)
+                .map_err(|e| BlobError::Store(e.to_string()))?;
+        }
         let view = match spec.compaction {
             None => None,
             Some(CompactionMode::Log) => {
                 let view = match (&chain.latest, snapshot) {
-                    (Some(name), Some(bytes)) => {
-                        decode_view(&store.location(name), &bytes, spec.format)?
-                    }
+                    (Some(name), Some(bytes)) => decode_view(
+                        name,
+                        &store.location(name),
+                        &bytes,
+                        spec.format,
+                        spec.encryption.as_ref(),
+                    )?,
                     (None, _) => BTreeMap::new(),
                     (Some(name), None) => {
                         return Err(BlobError::Store(format!(
@@ -426,7 +481,12 @@ impl<S: BlobStore> BlobSink<S> {
             .expect("buffer non-empty by debug_assert above");
         let count = self.buffer.len();
         let buffered_bytes = self.buffer_bytes;
-        let name = naming::batch_filename(from, to, self.spec.format.extension());
+        let name = naming::blob_filename(
+            from,
+            to,
+            self.spec.encryption.as_ref().map(|e| e.key_id.as_str()),
+            self.spec.format.extension(),
+        );
         let location = self.store.location(&name);
 
         // Compaction mode snapshots the view (current per record);
@@ -435,13 +495,24 @@ impl<S: BlobStore> BlobSink<S> {
             (Some(CompactionMode::Log), Some(view)) => view.values().cloned().collect(),
             _ => std::mem::take(&mut self.buffer),
         };
-        let bytes = mirror_envelope::encode_batch(
-            self.spec.format,
-            self.spec.compression,
-            self.spec.keys,
-            self.spec.values,
-            &to_encode,
-        )
+        let bytes = match &self.spec.encryption {
+            None => mirror_envelope::encode_batch(
+                self.spec.format,
+                self.spec.compression,
+                self.spec.keys,
+                self.spec.values,
+                &to_encode,
+            ),
+            Some(enc) => mirror_envelope::parquet::encode_batch_encrypted(
+                &to_encode,
+                self.spec.compression,
+                self.spec.keys,
+                self.spec.values,
+                enc.keyring
+                    .get(&enc.key_id)
+                    .expect("the active key was checked at open"),
+            ),
+        }
         .map_err(|e| SinkError::Transport(format!("encode: {e}")))?;
         let encoded_bytes = bytes.len() as u64;
 

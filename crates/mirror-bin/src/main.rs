@@ -1379,6 +1379,20 @@ fn s3_sink_config(
             max_offsets: params.flush.max_offsets,
             daily_at_utc_seconds: params.flush.daily_at_utc_seconds,
         },
+        encryption: match &s3.encryption {
+            mirror_config::Encryption::None(_) => None,
+            mirror_config::Encryption::ParquetKeys(k) => {
+                let keyring = mirror_envelope::Keyring::load(&k.keys_dir)
+                    .with_context(|| format!("S3 destination bucket {}", s3.bucket))?;
+                keyring
+                    .get(&k.key_id)
+                    .with_context(|| format!("S3 destination bucket {}", s3.bucket))?;
+                Some(mirror_s3::BlobEncryption {
+                    key_id: k.key_id.clone(),
+                    keyring: Arc::new(keyring),
+                })
+            }
+        },
     })
 }
 

@@ -115,9 +115,43 @@ pub struct S3Destination {
     /// The identities the destination uses, named by the environment
     /// variables that hold their keys (keys never go in the config).
     pub credentials: S3Credentials,
+    /// Required, so that clear-text blobs are a written decision:
+    /// `none`, or the Parquet key layout of the observability
+    /// compactor (`keys-dir`, `key-id`).
+    pub encryption: Encryption,
     /// See [`KafkaDestination::affects_readiness`].
     #[serde(default = "default_true")]
     pub affects_readiness: bool,
+}
+
+/// An S3 destination's encryption: `encryption: none`, or
+/// `encryption: { keys-dir: /keys, key-id: k1 }`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(untagged)]
+pub enum Encryption {
+    None(EncryptionNone),
+    ParquetKeys(ParquetKeys),
+}
+
+/// The literal `none`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum EncryptionNone {
+    None,
+}
+
+/// Parquet modular encryption with keys in the observability
+/// compactor's layout: `keys-dir` holds one file per key (the file name
+/// is the key id, the content the base64 of 32 bytes), and new blobs
+/// are encrypted with `key-id`. A blob is read with the key whose id
+/// its name carries (`<from>-<to>.k-<id>.parquet`), so a rotation adds
+/// the new key's file and then changes `key-id`; old keys stay while
+/// blobs need them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct ParquetKeys {
+    pub keys_dir: PathBuf,
+    pub key_id: String,
 }
 
 /// Two identities, as a least-privilege bucket setup has them: `write` may
@@ -1017,6 +1051,29 @@ fn validate_destinations(m: &Mirror) -> Result<(), LoadError> {
             )));
         }
     }
+    for d in &m.destinations {
+        if let Destination::S3(S3Destination {
+            encryption: Encryption::ParquetKeys(k),
+            ..
+        }) = d
+        {
+            if !m
+                .format
+                .is_some_and(|f| matches!(f, DestinationFormat::Parquet))
+            {
+                return Err(LoadError::Validation(format!(
+                    "mirror {:?}: encrypted S3 destinations need `format: parquet` (written out)",
+                    m.name
+                )));
+            }
+            if !is_key_id(&k.key_id) {
+                return Err(LoadError::Validation(format!(
+                    "mirror {:?}: encryption key-id {:?} is not a key id ([a-z0-9][a-z0-9-]{{0,31}})",
+                    m.name, k.key_id
+                )));
+            }
+        }
+    }
     let has_blob = m.destinations.iter().any(|d| d.is_blob());
     let has_kafka = m.destinations.iter().any(|d| !d.is_blob());
 
@@ -1289,6 +1346,16 @@ fn validate_no_destinations(m: &Mirror) -> Result<(), LoadError> {
         }
     }
     Ok(())
+}
+
+/// The observability compactor's key id: `[a-z0-9][a-z0-9-]{0,31}`.
+fn is_key_id(id: &str) -> bool {
+    let b = id.as_bytes();
+    !b.is_empty()
+        && b.len() <= 32
+        && (b[0].is_ascii_lowercase() || b[0].is_ascii_digit())
+        && b.iter()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'-')
 }
 
 fn raw_destination_name(d: &Destination) -> Option<&str> {

@@ -27,7 +27,8 @@ pub mod blob;
 pub mod naming;
 
 pub use blob::{
-    BlobError, BlobSink, BlobSpec, BlobStore, CompactionMode, FlushTriggers, UnixClock,
+    BlobEncryption, BlobError, BlobSink, BlobSpec, BlobStore, CompactionMode, FlushTriggers,
+    UnixClock,
 };
 
 /// Errors from opening or reading a filesystem destination.
@@ -63,6 +64,7 @@ impl FilesystemSinkConfig {
             values: self.values,
             compaction: self.compaction,
             flush: self.flush,
+            encryption: None,
         }
     }
 }
@@ -196,7 +198,7 @@ pub fn read_latest_snapshot(dir: &Path, format: Format) -> Result<Vec<Record>, F
         None => Ok(Vec::new()),
         Some(name) => {
             let bytes = store.get_sync(&name)?;
-            let view = blob::decode_view(&store.location(&name), &bytes, format)?;
+            let view = blob::decode_view(&name, &store.location(&name), &bytes, format, None)?;
             Ok(view.into_values().collect())
         }
     }

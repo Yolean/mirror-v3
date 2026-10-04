@@ -22,6 +22,7 @@ tokio = { workspace = true, features = ["macros", "rt"] }
 metrics = { workspace = true }
 
 [dev-dependencies]
+tempfile = { workspace = true }
 mirror-envelope = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros", "time"] }
 async-trait = { workspace = true }
