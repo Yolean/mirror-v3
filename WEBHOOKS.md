@@ -656,7 +656,7 @@ Per-record DEBUG only; counters cover the operational signal.
 
 ## Validation
 
-- `notify` requires `http-access.cache-v1` on the same mirror.
+- `notify` requires `http-access.cache-v1` and `http-access.cache-v1-main` on the same mirror (consumers re-read from the unprefixed paths).
 - `notify.targets` non-empty.
 - `notify.trigger.debounce.max-records >= 1`, `max-time-ms >= 1`
   (when `trigger.on: source-consume`).
