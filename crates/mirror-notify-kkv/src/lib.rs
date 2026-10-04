@@ -11,14 +11,14 @@
 //!   * Every accepted record is fed to [`KkvV1Notifier::on_record`]
 //!     by the mirror loop. Records accumulate in an in-memory buffer
 //!     (key set with the highest source offset across the batch).
-//!   * The buffer is drained (POSTed and reset) when either
-//!     `debounce.max-records` records have arrived since the last
-//!     drain, or `debounce.max-time-ms` has elapsed since the *first*
-//!     record of the current batch landed.
-//!   * The max-records trigger drains inline (`on_record` awaits the
-//!     dispatch); the max-time-ms trigger drains from a background
-//!     timer task. Errors from the timer-task drain are surfaced on
-//!     the next `on_record` / `shutdown` call.
+//!   * The buffer becomes a batch when either `debounce.max-records`
+//!     records have arrived since the last batch, or
+//!     `debounce.max-time-ms` has elapsed since the *first* record of
+//!     the current batch landed (a timer task, so a batch tail never
+//!     waits for the next record).
+//!   * Batches go to the deliverer task ([`delivery`]), which keeps an
+//!     undelivered key set per target address and retries it until the
+//!     address accepts. `on_record` never waits for HTTP.
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -40,9 +40,10 @@ use tokio::task::JoinHandle;
 use url::Url;
 
 mod buffer;
+pub mod delivery;
 mod resolver;
 
-use buffer::{Buffer, DrainedBatch};
+use buffer::Buffer;
 pub use resolver::{DnsAResolver, SystemDnsResolver};
 
 /// How long a `fan-out: dns-a` resolution is reused before a
@@ -76,6 +77,8 @@ pub enum BuildError {
     NoHost { url: String },
     #[error("failed to build reqwest client: {0}")]
     ClientBuild(String),
+    #[error("mirror {0:?} is not registered in the cache state; register it before building its notifier")]
+    UnregisteredMirror(String),
 }
 
 /// Per-target dispatcher state. One target maps to one `Endpoint`. The
@@ -137,69 +140,45 @@ struct Inner {
     resolver: Arc<dyn DnsAResolver>,
 }
 
-/// Shared notifier state. `buffer` holds the in-progress batch;
-/// `new_data` wakes the timer task when on_record adds to an empty
-/// buffer; `shutting_down` lets shutdown signal the timer to exit
-/// even if it's mid-sleep; `error_state` lets the timer surface a
-/// terminal error to whichever of on_record / shutdown polls next.
+/// Notifier state shared between `on_record` and the debounce timer.
 struct NotifierState {
     buffer: TokioMutex<Buffer>,
+    /// Wakes the timer task when `on_record` adds to an empty buffer.
     new_data: TokioNotify,
     shutting_down: AtomicBool,
-    error_state: Arc<TokioMutex<Option<NotifyError>>>,
-    /// Signalled (`notify_one`) whenever a background task stashes a
-    /// terminal error into `error_state`, so a
-    /// [`TerminalErrorWatch`] can wake without polling. `on_record`
-    /// still surfaces the error on the next call; the watch exists
-    /// for the idle-topic case where no next call ever comes.
-    error_signal: Arc<TokioNotify>,
-    /// Serializes take-dispatch-ack across the inline drain
-    /// (`on_record` max-records path, shutdown) and the background
-    /// timer drain. Without it two batches can be in flight at once
-    /// and a *later* batch's success can ack past an *earlier* batch
-    /// that is still retrying; `AckTracker::note_through` is
-    /// `fetch_max`, so the periodic source commit would then advance
-    /// past undelivered records and a restart would suppress them
-    /// forever. Holding the lock across the whole dispatch also
-    /// gives the documented backpressure: the consume loop blocks on
-    /// the in-flight batch instead of racing it.
-    dispatch_lock: TokioMutex<()>,
-    /// Set once, before any record is dispatched, via
-    /// [`KkvV1Notifier::with_ack_sink`]. Shared between
-    /// `drain_now` (inline path) and the background timer task so
-    /// both paths feed the supervisor's per-mirror ack tracker.
-    ack_sink: OnceLock<Arc<dyn AckSink>>,
+    /// Batches to the deliverer task; `None` once shut down.
+    tx: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<delivery::Batch>>>,
+}
+
+impl NotifierState {
+    /// Hand the buffered records to the deliverer as one batch.
+    async fn flush_buffer(&self) {
+        let batch = self.buffer.lock().await.take();
+        if let Some(batch) = batch {
+            if let Some(tx) = self.tx.lock().expect("notifier tx poisoned").as_ref() {
+                // The deliverer only stops after the sender is dropped
+                // or after a terminal error, which `on_record` surfaces.
+                let _ = tx.send(batch);
+            }
+        }
+    }
 }
 
 /// Notifier implementing the kkv-v1 wire contract. One instance per
 /// mirror (per `(topic, partition)`).
 pub struct KkvV1Notifier {
-    inner: Arc<Inner>,
+    shared: Arc<delivery::Shared>,
     state: Arc<NotifierState>,
     timer_task: Option<JoinHandle<()>>,
+    deliverer: Option<JoinHandle<()>>,
     max_records: u64,
-    /// Per-mirror suppression handle. `on_record` consults
-    /// `cache_state.is_record_suppressed(&mirror_name, offset)` and
-    /// drops records below the mirror's suppression threshold
-    /// (committed offset, or bootstrap high-watermark on a fresh
-    /// deploy). Matches the legacy kkv `KafkaCache` Stage gate which
-    /// suppressed push notifications until `Polling`.
-    cache_state: Arc<CacheState>,
-    mirror_name: String,
 }
 
 impl KkvV1Notifier {
     /// Build a notifier from a validated [`mirror_config::Notify`]
-    /// block. The caller is responsible for the higher-level
-    /// validation (URL well-formedness, target non-empty, etc.);
-    /// `mirror-config` does that in `validate_notify_shared`. The
-    /// checks here are the lighter-weight last-mile ones the runtime
-    /// needs to actually open a `reqwest::Client`.
-    ///
-    /// `notify.trigger.on` is only consulted for the debounce
-    /// window (`source-consume` honours `debounce.max-time-ms`;
-    /// `destination-flush` ignores debounce since it does not run
-    /// via this notifier at all, only via `FlushDispatcher`).
+    /// block (`mirror-config` validates URLs and limits). The mirror
+    /// must be registered in `cache_state`: its suppression threshold
+    /// and catch-up state gate what is sent and when.
     pub fn from_config(
         notify: &mirror_config::Notify,
         topic: String,
@@ -217,11 +196,8 @@ impl KkvV1Notifier {
         )
     }
 
-    /// Same as [`Self::from_config`] but with a caller-supplied DNS
-    /// resolver. Tests use this to inject a stub that returns canned
-    /// `SocketAddr`s, exercising the `fan-out: dns-a` dispatch path
-    /// against multiple axum servers without depending on the system
-    /// resolver or `/etc/hosts`.
+    /// Same as [`Self::from_config`] with a caller-supplied DNS
+    /// resolver (tests).
     pub fn from_config_with_resolver(
         notify: &mirror_config::Notify,
         topic: String,
@@ -230,105 +206,64 @@ impl KkvV1Notifier {
         mirror_name: String,
         resolver: Arc<dyn DnsAResolver>,
     ) -> Result<Self, BuildError> {
-        let inner = Arc::new(build_inner(notify, topic, partition, resolver)?);
-
-        // Debounce config lives on the trigger block. Defaults come
-        // from `NotifyTrigger::default()` (`Some({100, 250})` for
-        // source-consume); validator rejects missing debounce for
-        // source-consume so the `expect` here is unreachable for any
-        // legit config.
-        let debounce = notify
-            .trigger
-            .debounce
-            .unwrap_or(mirror_config::NotifyDebounce {
-                max_records: 1,
-                max_time_ms: u64::MAX,
-            });
-        let max_records = debounce.max_records;
-        let max_time = Duration::from_millis(debounce.max_time_ms);
+        assert_eq!(notify.api, NotifyApi::KkvV1, "only kkv-v1 supported today");
+        if cache_state.status_for(&mirror_name).is_none() {
+            return Err(BuildError::UnregisteredMirror(mirror_name));
+        }
+        let endpoints = build_endpoints(notify)?;
+        let debounce = notify.trigger.debounce.ok_or_else(|| {
+            BuildError::ClientBuild("notify.trigger.debounce is required for source-consume".into())
+        })?;
+        let shared = Arc::new(delivery::Shared {
+            topic,
+            partition,
+            outcomes: notify.outcomes,
+            retry: notify.retry,
+            resolver,
+            cache_state,
+            mirror_name,
+            ack_sink: OnceLock::new(),
+            error_state: Arc::new(TokioMutex::new(None)),
+            error_signal: Arc::new(TokioNotify::new()),
+        });
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let state = Arc::new(NotifierState {
             buffer: TokioMutex::new(Buffer::default()),
             new_data: TokioNotify::new(),
             shutting_down: AtomicBool::new(false),
-            error_state: Arc::new(TokioMutex::new(None)),
-            error_signal: Arc::new(TokioNotify::new()),
-            dispatch_lock: TokioMutex::new(()),
-            ack_sink: OnceLock::new(),
+            tx: std::sync::Mutex::new(Some(tx)),
         });
-
-        // Always spawn the timer task. For `max_records: 1` it just
-        // never fires (every drain is inline from on_record), and the
-        // sleeping task costs ~nothing.
-        let timer_task = tokio::spawn(timer_loop(Arc::clone(&inner), Arc::clone(&state), max_time));
-
+        let deliverer =
+            tokio::spawn(delivery::Deliverer::new(Arc::clone(&shared), endpoints).run(rx));
+        let timer_task = tokio::spawn(timer_loop(
+            Arc::clone(&state),
+            Duration::from_millis(debounce.max_time_ms),
+        ));
         Ok(Self {
-            inner,
+            shared,
             state,
             timer_task: Some(timer_task),
-            max_records,
-            cache_state,
-            mirror_name,
+            deliverer: Some(deliverer),
+            max_records: debounce.max_records,
         })
     }
 
-    /// Install an [`AckSink`]. The notifier calls
-    /// `ack.note_through(high_offset + 1)` after every successful
-    /// batch drain, where `high_offset` is the largest source offset
-    /// in the just-delivered batch. Idempotent if called twice;
-    /// `OnceLock::set` returns `Err` on the second call which we
-    /// drop intentionally (the first install wins).
-    ///
-    /// Builder shape so callers don't have to add yet another
-    /// constructor argument; supervisors install the ack sink
-    /// immediately after `from_config` and before handing the
-    /// notifier to the run loop.
+    /// Install the [`AckSink`] that learns how far every target address
+    /// has been delivered (`note_through(offset)`: everything below is
+    /// delivered). The first install wins; call before the first record.
     pub fn with_ack_sink(self, ack: Arc<dyn AckSink>) -> Self {
-        let _ = self.state.ack_sink.set(ack);
+        let _ = self.shared.ack_sink.set(ack);
         self
     }
 
-    /// Handle for the supervisor to observe a terminal dispatch
-    /// error without owning the notifier. `on_record` surfaces
-    /// timer-task errors on the next record, but an idle topic never
-    /// produces that next record; racing the run loop against this
-    /// watch closes that gap.
+    /// Handle for the supervisor to observe a terminal delivery error
+    /// (a `final: fail` outcome) without owning the notifier: an idle
+    /// topic never calls `on_record` again to surface it.
     pub fn terminal_error_watch(&self) -> TerminalErrorWatch {
         TerminalErrorWatch {
-            error_state: Arc::clone(&self.state.error_state),
-            signal: Arc::clone(&self.state.error_signal),
+            error_state: Arc::clone(&self.shared.error_state),
+            signal: Arc::clone(&self.shared.error_signal),
         }
-    }
-
-    /// Drain the current buffer (if any) and dispatch it. Used from
-    /// both the on_record max-records path and shutdown.
-    async fn drain_now(&self) -> Result<(), NotifyError> {
-        let _dispatch = self.state.dispatch_lock.lock().await;
-        // The timer task may have failed terminally while we waited
-        // for the lock. Dispatching (and acking) a later batch after
-        // an earlier one is known-undelivered would let the source
-        // commit advance past the failed batch; surface the error
-        // instead and leave the buffer for the post-restart replay.
-        if let Some(err) = self.state.error_state.lock().await.take() {
-            return Err(err);
-        }
-        let batch = {
-            let mut buf = self.state.buffer.lock().await;
-            buf.take(self.inner.partition)
-        };
-        let Some(batch) = batch else {
-            return Ok(());
-        };
-        let high = batch.high_offset();
-        self.inner.dispatch_drained(batch).await?;
-        // Successful dispatch through every endpoint => the batch is
-        // delivered. Tell the supervisor's ack tracker so the
-        // periodic source-commit task can advance the broker-side
-        // committed offset. Still under the dispatch lock, so acks
-        // arrive in batch order.
-        if let Some(ack) = self.state.ack_sink.get() {
-            ack.note_through(high + 1);
-        }
-        Ok(())
     }
 }
 
@@ -341,24 +276,6 @@ impl Inner {
     /// they dispatch.
     fn labels(&self) -> (String, String) {
         (self.topic.clone(), self.partition.to_string())
-    }
-
-    async fn dispatch_drained(&self, batch: DrainedBatch) -> Result<(), NotifyError> {
-        let high_offset = batch.high_offset();
-        let payload = KkvV1Payload::new(&self.topic, batch.offsets, batch.updates);
-        let batch_keys = payload.updates.len();
-        let start = std::time::Instant::now();
-        self.dispatch_batch(&payload).await?;
-        tracing::info!(
-            topic = %self.topic,
-            partition = self.partition,
-            batch_keys,
-            high_offset,
-            targets = self.endpoints.len(),
-            elapsed_ms = start.elapsed().as_millis() as u64,
-            "notify sent"
-        );
-        Ok(())
     }
 
     /// POST a single batch payload to every configured endpoint
@@ -776,31 +693,20 @@ impl DnsAState {
 #[async_trait]
 impl Notifier for KkvV1Notifier {
     async fn on_record(&mut self, record: &Record) -> Result<(), NotifyError> {
-        // First: surface any terminal error the timer task accumulated
-        // since the last call. Take() so it surfaces exactly once;
-        // the run loop aborts the mirror on the first Err.
-        if let Some(err) = self.state.error_state.lock().await.take() {
+        // Surface a terminal delivery error (`final: fail`) once.
+        if let Some(err) = self.shared.error_state.lock().await.take() {
             return Err(err);
         }
+        let (topic_l, partition_l) = self.shared_labels();
 
-        // Suppress records below this mirror's
-        // `suppression_threshold` (set at register time as
-        // `max(last_committed_offset, bootstrap_hwm if no commit)`).
-        // Two regimes:
-        //   * Returning deploy (group has a committed value `C`):
-        //     threshold = C. Records below C were already delivered
-        //     by the previous pod; records in `[C, bootstrap_hwm)`
-        //     are the between-pods gap and DO fire.
-        //   * Fresh deploy (no committed value): threshold =
-        //     bootstrap_hwm. Records during the first-replay window
-        //     don't fan webhook out to consumers.
-        // The suppressed counter is the operator's visibility into
-        // how many records were skipped.
+        // Records below the suppression threshold were notified by the
+        // previous pod (committed offset), or predate this deploy
+        // (bootstrap watermark on a fresh group).
         if self
+            .shared
             .cache_state
-            .is_record_suppressed(&self.mirror_name, record.source_offset)
+            .is_record_suppressed(&self.shared.mirror_name, record.source_offset)
         {
-            let (topic_l, partition_l) = self.inner.labels();
             metrics::counter!(
                 "mirror_v3_notify_suppressed_records_total",
                 "topic" => topic_l,
@@ -810,14 +716,7 @@ impl Notifier for KkvV1Notifier {
             return Ok(());
         }
 
-        // Keys may be missing or non-UTF-8. Legacy kkv emits whatever
-        // string repr the consumer expects; mirror-v3 chooses
-        // lossy-UTF-8 on bytes and `""` on missing key. Real
-        // deployments use UTF-8 keys; this keeps the surface working
-        // on edge cases instead of crashing.
         let key_str = render_key(record.key.as_deref());
-
-        let (topic_l, partition_l) = self.inner.labels();
         metrics::counter!(
             "mirror_v3_notify_records_total",
             "topic" => topic_l.clone(),
@@ -825,16 +724,16 @@ impl Notifier for KkvV1Notifier {
         )
         .increment(1);
 
-        let drain_now;
+        let full;
         let buffer_depth;
         {
             let mut buf = self.state.buffer.lock().await;
             let was_empty = buf.is_empty();
             buf.append(key_str, record.source_offset);
-            drain_now = buf.seen_records() >= self.max_records;
+            full = buf.seen_records() >= self.max_records;
             buffer_depth = buf.seen_records();
-            // Wake the timer when the buffer transitions empty →
-            // non-empty so the max-time-ms clock starts running.
+            // Start the max-time-ms clock when the buffer goes from
+            // empty to non-empty.
             if was_empty {
                 self.state.new_data.notify_one();
             }
@@ -845,61 +744,47 @@ impl Notifier for KkvV1Notifier {
             "partition" => partition_l,
         )
         .set(buffer_depth as f64);
-
-        if drain_now {
-            // Inline drain: caller (the consume loop) blocks on the
-            // POST + retry cycle. This is the natural backpressure
-            // mechanism from the spec's failure-modes table.
-            self.drain_now().await
-        } else {
-            Ok(())
+        if full {
+            self.state.flush_buffer().await;
         }
+        Ok(())
     }
 
     async fn shutdown(&mut self) -> Result<(), NotifyError> {
-        // Signal the timer task to exit even if it's mid-sleep, then
-        // drain any pending batch synchronously so we can surface the
-        // result to the supervisor before returning.
         self.state.shutting_down.store(true, Ordering::SeqCst);
         self.state.new_data.notify_one();
-
-        let drain_result = self.drain_now().await;
-
         if let Some(t) = self.timer_task.take() {
-            // Abort before await; the task may currently be in a
-            // `sleep` we can't easily interrupt otherwise. The task
-            // does no externally-visible work past the shutting_down
-            // check, so aborting is safe.
             t.abort();
             let _ = t.await;
         }
-
-        // Prefer the just-now drain error over any older one the
-        // timer task might have stashed.
-        drain_result?;
-        if let Some(err) = self.state.error_state.lock().await.take() {
+        self.state.flush_buffer().await;
+        // Closing the channel tells the deliverer to finish what is
+        // pending (within its shutdown budget) and stop.
+        self.state.tx.lock().expect("notifier tx poisoned").take();
+        if let Some(d) = self.deliverer.take() {
+            let _ = d.await;
+        }
+        if let Some(err) = self.shared.error_state.lock().await.take() {
             return Err(err);
         }
         Ok(())
     }
 }
 
-/// Background drain loop. Waits for `state.new_data` to signal that
-/// the buffer transitioned empty → non-empty, then sleeps for the
-/// remaining time before the buffer's `first_at + max_time` deadline
-/// and drains. The on_record path may have drained inline in the
-/// meantime; in that case the take() returns None and we go back to
-/// waiting.
-async fn timer_loop(inner: Arc<Inner>, state: Arc<NotifierState>, max_time: Duration) {
+impl KkvV1Notifier {
+    fn shared_labels(&self) -> (String, String) {
+        (self.shared.topic.clone(), self.shared.partition.to_string())
+    }
+}
+
+/// Debounce timer: once the buffer goes non-empty, sleep until its
+/// first record is `max_time` old and hand the batch to the deliverer.
+async fn timer_loop(state: Arc<NotifierState>, max_time: Duration) {
     loop {
         state.new_data.notified().await;
         if state.shutting_down.load(Ordering::SeqCst) {
             return;
         }
-        // Compute the actual remaining time relative to the buffer's
-        // first_at; between notify_one() and our wake-up, on_record
-        // could have drained inline (first_at = None) or there could
-        // simply be no data left.
         let remaining = {
             let buf = state.buffer.lock().await;
             match buf.first_at() {
@@ -911,33 +796,7 @@ async fn timer_loop(inner: Arc<Inner>, state: Arc<NotifierState>, max_time: Dura
         if state.shutting_down.load(Ordering::SeqCst) {
             return;
         }
-        // Serialize with the inline drain path; see the
-        // `dispatch_lock` field docs. Taken before the buffer take so
-        // batches dispatch, and therefore ack, in source-offset
-        // order.
-        let _dispatch = state.dispatch_lock.lock().await;
-        let batch = {
-            let mut buf = state.buffer.lock().await;
-            buf.take(inner.partition)
-        };
-        if let Some(batch) = batch {
-            let high = batch.high_offset();
-            if let Err(e) = inner.dispatch_drained(batch).await {
-                // Stash for the next on_record / shutdown to surface;
-                // exit so the buffer doesn't grow further behind a
-                // broken receiver. The signal wakes any
-                // TerminalErrorWatch, which covers the idle-topic
-                // case where no next on_record ever comes.
-                *state.error_state.lock().await = Some(e);
-                state.error_signal.notify_one();
-                return;
-            }
-            // Same ack semantics as `drain_now`: successful POST
-            // through every endpoint => the batch is delivered.
-            if let Some(ack) = state.ack_sink.get() {
-                ack.note_through(high + 1);
-            }
-        }
+        state.flush_buffer().await;
     }
 }
 
@@ -952,6 +811,19 @@ fn build_inner(
     resolver: Arc<dyn DnsAResolver>,
 ) -> Result<Inner, BuildError> {
     assert_eq!(notify.api, NotifyApi::KkvV1, "only kkv-v1 supported today");
+    Ok(Inner {
+        endpoints: build_endpoints(notify)?,
+        outcomes: notify.outcomes,
+        retry: notify.retry,
+        topic,
+        partition,
+        resolver,
+    })
+}
+
+/// One [`Endpoint`] per `notify.targets[]` entry, sharing one HTTP
+/// client with the configured per-request timeout.
+fn build_endpoints(notify: &mirror_config::Notify) -> Result<Vec<Endpoint>, BuildError> {
     if notify.targets.is_empty() {
         return Err(BuildError::NoTargets);
     }
@@ -961,18 +833,11 @@ fn build_inner(
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| BuildError::ClientBuild(e.to_string()))?;
-    let mut endpoints = Vec::with_capacity(notify.targets.len());
-    for t in &notify.targets {
-        endpoints.push(build_endpoint(t, client.clone())?);
-    }
-    Ok(Inner {
-        endpoints,
-        outcomes: notify.outcomes,
-        retry: notify.retry,
-        topic,
-        partition,
-        resolver,
-    })
+    notify
+        .targets
+        .iter()
+        .map(|t| build_endpoint(t, client.clone()))
+        .collect()
 }
 
 /// Webhook dispatcher for the `trigger.on: destination-flush` mode.

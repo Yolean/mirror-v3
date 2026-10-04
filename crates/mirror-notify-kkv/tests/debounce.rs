@@ -10,7 +10,9 @@ mod common;
 
 use std::time::Duration;
 
-use common::{notify_pointing_at, notify_pointing_at_debounced, ready_cache, Reply, TestServer};
+use common::{
+    notify_pointing_at, notify_pointing_at_debounced, ready_cache, wait_until, Reply, TestServer,
+};
 use mirror_config::{NotifyDebounce, NotifyOutcomes, NotifyRetry};
 use mirror_core::{Notifier, Record, TimestampType};
 use mirror_notify_kkv::KkvV1Notifier;
@@ -28,6 +30,8 @@ fn rec(offset: u64, key: &str) -> Record {
         headers: vec![],
     }
 }
+
+const WAIT: Duration = Duration::from_secs(5);
 
 fn retry(attempts: u32) -> NotifyRetry {
     NotifyRetry {
@@ -62,11 +66,10 @@ async fn drains_when_max_records_reached() {
         "no drain yet; only 2 of 3 records buffered"
     );
     n.on_record(&rec(12, "c")).await.unwrap();
-    assert_eq!(
-        server.request_count(),
-        1,
-        "third record must drain the batch inline"
-    );
+    wait_until("the third record's batch", WAIT, || {
+        server.request_count() == 1
+    })
+    .await;
 
     let body: Value = serde_json::from_slice(&server.captured().await[0].body).unwrap();
     assert_eq!(
@@ -140,6 +143,7 @@ async fn key_dedup_keeps_one_entry_with_max_offset() {
     n.on_record(&rec(20, "hot")).await.unwrap();
     n.on_record(&rec(21, "hot")).await.unwrap();
     n.on_record(&rec(22, "hot")).await.unwrap();
+    wait_until("one POST", WAIT, || server.request_count() == 1).await;
 
     let body: Value = serde_json::from_slice(&server.captured().await[0].body).unwrap();
     assert_eq!(
@@ -201,7 +205,7 @@ async fn shutdown_with_empty_buffer_is_a_noop() {
 #[tokio::test]
 async fn timer_drain_failure_surfaces_on_next_on_record() {
     // Server returns 503 forever; outcome 5xx default is {retry: true,
-    // final: fail}. The timer-task drain hits this, stashes the
+    // final: fail}. Delivery of the timer's batch exhausts, stashes the
     // NotifyError, and the next on_record returns it.
     let server = TestServer::start(Reply::Status(503), vec![]).await;
     let cfg = notify_pointing_at_debounced(
@@ -218,16 +222,43 @@ async fn timer_drain_failure_surfaces_on_next_on_record() {
         KkvV1Notifier::from_config(&cfg, "t".into(), 0, ready_cache("m"), "m".into()).unwrap();
 
     n.on_record(&rec(1, "a")).await.unwrap();
-    // Wait long enough for the timer to fire, exhaust retries
-    // (2 attempts × 1ms backoff), and stash the error.
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    wait_until("two attempts", WAIT, || server.request_count() == 2).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
 
     let err = n
         .on_record(&rec(2, "b"))
         .await
-        .expect_err("subsequent on_record must surface the timer-task error");
+        .expect_err("subsequent on_record must surface the delivery error");
     let s = format!("{err}");
     assert!(s.contains("exhausted"), "got: {s}");
+}
+
+/// kkv sent only the first record of a poll and
+/// held the rest until the next record arrived, hours on a quiet topic.
+/// Here a burst's tail is a batch of its own once max-time-ms passes,
+/// with no further record.
+#[tokio::test]
+async fn burst_tail_is_sent_without_a_further_record() {
+    let server = TestServer::start(Reply::Status(200), vec![]).await;
+    let cfg = notify_pointing_at_debounced(
+        server.addr,
+        NotifyOutcomes::default(),
+        retry(1),
+        1000,
+        NotifyDebounce {
+            max_records: 2,
+            max_time_ms: 50,
+        },
+    );
+    let mut n =
+        KkvV1Notifier::from_config(&cfg, "t".into(), 0, ready_cache("m"), "m".into()).unwrap();
+    for (o, k) in [(1, "k1"), (2, "k2"), (3, "k3"), (4, "k4"), (5, "k5")] {
+        n.on_record(&rec(o, k)).await.unwrap();
+    }
+    wait_until("three POSTs", WAIT, || server.request_count() == 3).await;
+    let last: Value = serde_json::from_slice(&server.captured().await[2].body).unwrap();
+    assert_eq!(last["updates"], serde_json::json!({"k5": null}));
+    assert_eq!(last["offsets"], serde_json::json!({"0": 5}));
 }
 
 #[tokio::test]
@@ -251,20 +282,15 @@ async fn buffer_continues_to_accept_after_inline_drain() {
     // First batch
     n.on_record(&rec(10, "a")).await.unwrap();
     n.on_record(&rec(11, "b")).await.unwrap();
-    assert_eq!(
-        server.request_count(),
-        1,
-        "first batch must drain at max-records"
-    );
+    wait_until("first batch at max-records", WAIT, || {
+        server.request_count() == 1
+    })
+    .await;
 
     // Second batch
     n.on_record(&rec(12, "c")).await.unwrap();
     n.on_record(&rec(13, "d")).await.unwrap();
-    assert_eq!(
-        server.request_count(),
-        2,
-        "second batch must drain independently"
-    );
+    wait_until("second batch", WAIT, || server.request_count() == 2).await;
 
     let captured = server.captured().await;
     let body0: Value = serde_json::from_slice(&captured[0].body).unwrap();

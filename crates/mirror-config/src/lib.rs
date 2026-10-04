@@ -523,7 +523,10 @@ pub struct NotifyOutcome {
 pub enum FinalAction {
     /// Treat the batch as delivered, advance.
     Accept,
-    /// Log WARN, drop the batch, advance.
+    /// Source-consume: keep the batch for the target address and
+    /// retry it until the address accepts it or leaves discovery;
+    /// never fails the mirror. Destination-flush: log WARN, drop the
+    /// batch, advance.
     Skip,
     /// Mirror task errors out; orchestrator restarts; mirror
     /// replays from durable state on restart.

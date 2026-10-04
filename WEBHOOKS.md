@@ -259,11 +259,42 @@ comes first. Setting `max-records: 1` yields per-record POSTs;
 the higher the value, the better at coalescing bursts (e.g. a
 restart catchup) at the cost of a small invalidation delay.
 
-`debounce` interacts with `notify.timeout-ms` and `retry`: an
-in-flight batch blocks the next batch from being sent on the same
-target, which provides natural backpressure if the receiver is
-slow. (The source consume loop itself doesn't pause; new records
-land in the next batch's buffer.)
+Delivery runs on its own task and never pauses the consume loop
+(see "Delivery" below): a batch is merged into every target
+address's undelivered key set, one POST per address is in flight at
+a time, and keys that arrive meanwhile ride in that address's next
+POST.
+
+### Delivery (`source-consume`)
+
+kafka-keyvalue pushed from 2 to 6 replicas, so a push one replica
+lost was usually healed by a sibling's. A single mirror-v3 replica
+must deliver reliably itself:
+
+- Each address of a target (each A record under `fan-out: dns-a`,
+  the URL under `none`) keeps its own undelivered key set with the
+  highest offset among them. A failed POST keeps the set, merged with
+  newer batches, for the next attempt (backoff from
+  `retry.backoff-ms`, doubling, at most 30 s).
+- Any status other than 2xx is a failure.
+- `dns-a` re-resolves at most once a second while there is work. An
+  address in a resolution joins delivery at once, so a consumer gets
+  every batch from its first resolution on; with
+  `publishNotReadyAddresses: true` on the target Service that is
+  before it turns Ready, and its POSTs are retried until its server
+  listens. An address missing from resolutions for 30 s leaves
+  delivery with its undelivered keys (the pod is gone; its
+  replacement reads the cache when it starts). A failed resolution
+  keeps the known addresses; an empty one means no target.
+- Bodies are cut below 64 KiB (the Node client's body parser rejects
+  bodies over 100 kB).
+- Nothing is sent until the mirror has caught up to the source's
+  high watermark at startup: a notified consumer re-reads the key at
+  once, and the cache answers 503 until then.
+- The committed offset (`note_through`, the restart's re-delivery
+  point) is the lowest offset not yet delivered to some address.
+- On graceful shutdown pending keys get up to 10 s; the rest are
+  re-delivered after the restart.
 
 ### `trigger.on: destination-flush`
 
@@ -364,7 +395,7 @@ or after retry exhaustion (if `retry: true`). Possible values:
 | action   | meaning                                                                |
 |----------|------------------------------------------------------------------------|
 | `accept` | Count the batch as successfully delivered, advance.                    |
-| `skip`   | Log a WARN, drop the batch silently, advance. No further action.       |
+| `skip`   | Keep the batch for this address and retry it (merged with newer ones) until the address accepts it or leaves discovery. Never fails the mirror. (Destination-flush: log a WARN, drop the batch, advance.) |
 | `fail`   | Mirror task errors out; orchestrator restarts; mirror replays the batch from durable state. |
 
 The matrix is intentionally orthogonal; every combination of
@@ -373,10 +404,10 @@ The matrix is intentionally orthogonal; every combination of
 | `retry` | `final`  | behaviour                                                          | typical use                                |
 |---------|----------|--------------------------------------------------------------------|--------------------------------------------|
 | false   | accept   | one attempt, treat as success regardless                           | `2xx` (always)                              |
-| false   | skip     | one attempt, log + drop                                            | `4xx: skip` when targets briefly return 410 during rolling restart |
+| false   | skip     | keep for the address, retry with backoff until accepted            | `4xx: skip` when targets briefly return 410 during rolling restart |
 | false   | fail     | one attempt, immediate fatal                                       | `3xx`/`4xx` defaults                        |
 | true    | accept   | retry per policy, treat as success on exhaustion                    | best-effort heartbeats (rare)               |
-| true    | skip     | retry per policy, log + drop on exhaustion                          | non-critical notify channel                 |
+| true    | skip     | as above (the budget only spaces the attempts)                      | targets that must not fail the mirror       |
 | true    | fail     | retry per policy, fatal on exhaustion                               | `5xx` / `timeout` / `connrefused` defaults |
 
 ### Defaults
@@ -408,11 +439,12 @@ Rationale:
 ### Operator-facing knobs the matrix unlocks
 
 - **"Targets routinely 404 during rolling restart, don't crash on
-  that"** → `4xx: { retry: false, final: skip }`. Downstream cache
-  staleness is recovered next time the consumer reads cache-v1 with
-  the `x-kkv-last-seen-offsets` header.
+  that"** → `4xx: { retry: false, final: skip }`. The batch waits for
+  the address; a consumer is not refreshed by a later cache read
+  (nothing tells it to re-read), so a dropped push would leave it
+  stale until the key changes again.
 - **"Receiver is flaky, never fail the mirror on it"** →
-  `5xx: { retry: true, final: skip }`. Pure best-effort notify.
+  `5xx: { retry: true, final: skip }`.
 - **"Fail fast on slow receivers instead of waiting through retry"**
   → `timeout: { retry: false, final: fail }`.
 - **"Stop tolerating 5xx after this many attempts"** → tune
@@ -430,9 +462,9 @@ Rationale:
   layered ahead of the class buckets is the natural extension. Out
   of scope for MVP; the six-outcome surface already covers every
   current kkv use case.
-- `skip` advances the source-offset position (the batch is
-  considered delivered for ordering purposes) but logs at WARN so
-  operators can grep for dropped batches.
+- Under `source-consume`, `skip` holds the committed offset until the
+  address accepts or leaves discovery; each failed attempt logs a
+  WARN. Under `destination-flush` it drops the batch.
 
 ## Notify-only mirrors (zero destinations)
 
@@ -608,7 +640,7 @@ field reflects the highest offset, so the consumer's
 
 | Failure                                | mirror-v3 behaviour                                                         |
 |----------------------------------------|-----------------------------------------------------------------------------|
-| Target host fails DNS resolution       | per `outcomes.connrefused` (default `{retry: true, final: fail}`)          |
+| Target host fails DNS resolution       | source-consume: keep the known addresses, re-resolve next round; destination-flush: per `outcomes.connrefused`. An empty resolution means no target. |
 | Target TCP refused                     | per `outcomes.connrefused`                                                  |
 | Target slow (no response within timeout-ms) | per `outcomes.timeout` (default `{retry: true, final: fail}`)           |
 | Target returns 2xx                     | per `outcomes.2xx` (default `{retry: false, final: accept}`)                |
@@ -616,8 +648,8 @@ field reflects the highest offset, so the consumer's
 | Target returns 4xx                     | per `outcomes.4xx` (default `{retry: false, final: fail}`)                  |
 | Target returns 5xx                     | per `outcomes.5xx` (default `{retry: true, final: fail}`)                   |
 | `retry: true` exhausts `max-attempts`  | apply that outcome's `final` action                                          |
-| One address in a dns-a fan-out fails   | applies per-address; whole batch fails as soon as one address's outcome resolves to `fail` |
-| Buffer growth from slow targets        | backpressure: pause the source consume loop until current batch drains; surface as a metric |
+| One address in a dns-a fan-out fails   | applies per-address: that address keeps its keys (`skip`) or fails the mirror (`fail`); the others are not held up |
+| Slow or dead targets                   | the consume loop never waits; undelivered keys per address are merged (bounded by the topic's key count): `mirror_v3_notify_undelivered_keys` |
 
 Restart correctness is unaffected: notify is best-effort *and*
 ordered. If the process crashes mid-batch, the records weren't
@@ -632,7 +664,9 @@ Adds, alongside the existing `mirror_v3_destination_*` counters:
 | Metric                                          | Type    | Labels                                  | Meaning                                       |
 |-------------------------------------------------|---------|------------------------------------------|-----------------------------------------------|
 | `mirror_v3_notify_records_total`                | counter | `topic`, `partition`                     | Records appended to a notify batch            |
-| `mirror_v3_notify_batches_total`                | counter | `topic`, `partition`, `result=ok\|skip\|fail` | Batches sent                             |
+| `mirror_v3_notify_batches_total`                | counter | `topic`, `partition`, `result=ok\|retry\|fail` (destination-flush: `ok\|skip\|fail`) | POSTs by result         |
+| `mirror_v3_notify_undelivered_keys`             | gauge   | `topic`, `partition`                     | Keys waiting for some address (source-consume) |
+| `mirror_v3_notify_target_addresses`             | gauge   | `topic`, `partition`                     | Addresses in delivery (source-consume)         |
 | `mirror_v3_notify_post_duration_seconds`        | histogram | `topic`, `partition`, `target_host`    | Per-target HTTP latency                       |
 | `mirror_v3_notify_inflight_retry`               | gauge   | `topic`, `partition`, `target_host`      | Current retry attempt (1-based, 0 when idle)  |
 | `mirror_v3_notify_buffer_records`               | gauge   | `topic`, `partition`                     | Current buffer depth                          |

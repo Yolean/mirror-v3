@@ -549,6 +549,16 @@ impl CacheState {
             })
     }
 
+    /// Whether the mirror has applied every record that was in its
+    /// source partition when the process started. Sticky: the last
+    /// applied offset only grows. `false` for an unknown mirror.
+    pub fn has_caught_up(&self, mirror_name: &str) -> bool {
+        let mirrors = self.mirrors.read().expect("cache mirrors poisoned");
+        mirrors.get(mirror_name).is_some_and(|slot| {
+            slot.last_applied_offset.load(Ordering::Acquire) >= slot.bootstrap_hwm
+        })
+    }
+
     /// Per-mirror readiness gate. Returns `true` iff `mirror_name`
     /// is registered AND its current status is
     /// [`MirrorStatus::Ready`]. Non-sticky: a mirror that drops out
