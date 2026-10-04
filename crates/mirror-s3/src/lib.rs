@@ -142,15 +142,6 @@ impl BlobStore for S3Store {
         }
         Ok(names)
     }
-
-    async fn exists(&self, name: &str) -> Result<bool, BlobError> {
-        let path = self.path(name);
-        match self.store.head(&path).await {
-            Ok(_) => Ok(true),
-            Err(object_store::Error::NotFound { .. }) => Ok(false),
-            Err(e) => Err(BlobError::Store(format!("head {path}: {e}"))),
-        }
-    }
 }
 
 /// The S3 destination.

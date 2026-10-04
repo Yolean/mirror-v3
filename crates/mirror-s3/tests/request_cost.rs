@@ -89,7 +89,7 @@ async fn idle_polls_list_nothing_between_drift_checks() {
 }
 
 #[tokio::test]
-async fn drift_check_costs_one_head_and_one_empty_list() {
+async fn drift_check_costs_one_list_of_one_entry_and_no_head() {
     let (store, dyn_store) = archive_of(200).await;
     let mut sink = S3Sink::open(cfg(dyn_store, 1))
         .await
@@ -97,12 +97,16 @@ async fn drift_check_costs_one_head_and_one_empty_list() {
         .with_drift_check_interval(Duration::ZERO);
     store.reset();
     assert_eq!(sink.next_expected_offset().await.unwrap(), 200);
-    assert_eq!(store.get(&store.counts.heads), 1);
+    assert_eq!(
+        store.get(&store.counts.heads),
+        0,
+        "the reading identity may only list"
+    );
     assert_eq!(store.get(&store.counts.lists), 1);
     assert_eq!(
         store.get(&store.counts.listed),
-        0,
-        "lists only after the last object"
+        1,
+        "lists only after the second-to-last object"
     );
 }
 

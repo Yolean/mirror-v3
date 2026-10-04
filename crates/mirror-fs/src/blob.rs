@@ -87,8 +87,6 @@ pub trait BlobStore: Send + Sync {
     /// Names sorting after `after` (all names when `None`). S3 serves
     /// this as one ListObjectsV2 with start-after.
     async fn list_after(&self, after: Option<&str>) -> Result<Vec<String>, BlobError>;
-    /// Whether the object `name` exists.
-    async fn exists(&self, name: &str) -> Result<bool, BlobError>;
     /// Where `name` lives, for logs and errors.
     fn location(&self, name: &str) -> String;
 }
@@ -100,17 +98,19 @@ pub struct Chain {
     pub durable: u64,
     /// Compaction mode: the newest snapshot, which holds the view.
     pub latest: Option<String>,
-    /// The object with the highest `to`: the end of the chain.
-    pub last: Option<String>,
+    /// The last two objects of the chain (highest `to` last).
+    pub tail: Vec<String>,
 }
 
 /// How often an idle blob mirror checks its destination for objects it
 /// did not write. This process is the destination's only writer, so its
 /// position is kept in memory; the check is the guard against a second
-/// writer or a manual change, and costs one HEAD and one LIST that
-/// starts after the last object (the previous check
-/// listed the whole prefix every 2 s, 23M LISTs a day for a year-old
-/// archive, and a sustained readdir on versitygw).
+/// writer or a manual change, and costs one LIST that starts after the
+/// second-to-last object (the previous check listed
+/// the whole prefix every 2 s, 23M LISTs a day for a year-old archive,
+/// and a sustained readdir on versitygw). LIST only: a least-privilege
+/// reading identity may list keys and read no object, so a HEAD is
+/// not available.
 pub const DRIFT_CHECK_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Validate a listing. Append mode requires a contiguous chain of
@@ -155,7 +155,7 @@ pub fn validate_chain(
             Ok(Chain {
                 durable: expected_next,
                 latest: None,
-                last: entries.last().map(|(_, _, n)| n.to_string()),
+                tail: tail_of(&entries),
             })
         }
         Some(CompactionMode::Log) => {
@@ -171,14 +171,21 @@ pub fn validate_chain(
                 }
                 prev_to = Some(*to);
             }
-            let last = entries.last().map(|(_, _, n)| n.to_string());
             Ok(Chain {
                 durable: prev_to.map(|t| t + 1).unwrap_or(0),
-                latest: last.clone(),
-                last,
+                latest: entries.last().map(|(_, _, n)| n.to_string()),
+                tail: tail_of(&entries),
             })
         }
     }
+}
+
+fn tail_of(entries: &[(u64, u64, &str)]) -> Vec<String> {
+    let skip = entries.len().saturating_sub(2);
+    entries[skip..]
+        .iter()
+        .map(|(_, _, n)| n.to_string())
+        .collect()
 }
 
 fn file_extension(name: &str) -> Option<&str> {
@@ -258,8 +265,8 @@ pub struct BlobSink<S> {
     next_daily_unix: Option<u64>,
     clock: UnixClock,
     flush_observer: Option<Arc<dyn FlushObserver>>,
-    /// The last object this process wrote or found at open.
-    last_name: Option<String>,
+    /// The last two objects of the chain, as written or found at open.
+    tail: Vec<String>,
     last_drift_check: Instant,
     drift_check_interval: Duration,
 }
@@ -311,7 +318,7 @@ impl<S: BlobStore> BlobSink<S> {
             next_daily_unix,
             clock,
             flush_observer: None,
-            last_name: chain.last,
+            tail: chain.tail,
             last_drift_check: Instant::now(),
             drift_check_interval: DRIFT_CHECK_INTERVAL,
         })
@@ -444,7 +451,10 @@ impl<S: BlobStore> BlobSink<S> {
         }
 
         self.durable_position = to + 1;
-        self.last_name = Some(name);
+        self.tail.push(name);
+        if self.tail.len() > 2 {
+            self.tail.remove(0);
+        }
         self.buffer.clear();
         self.buffer_bytes = 0;
         self.buffer_started = None;
@@ -500,26 +510,33 @@ impl<S: BlobStore> BlobSink<S> {
         Ok(())
     }
 
-    /// The destination must hold exactly what this process wrote: the
-    /// last object is still there, and nothing sorts after it.
+    /// The destination must hold exactly what this process wrote: what
+    /// sorts after the second-to-last object of the chain is the last
+    /// object and nothing else.
     async fn check_drift(&mut self) -> Result<(), SinkError> {
-        let transport = |e: BlobError| SinkError::Transport(e.to_string());
-        if let Some(last) = self.last_name.as_deref() {
-            if !self.store.exists(last).await.map_err(transport)? {
+        let (after, expected) = match self.tail.as_slice() {
+            [] => (None, None),
+            [last] => (None, Some(last.as_str())),
+            [before, last] => (Some(before.as_str()), Some(last.as_str())),
+            _ => unreachable!("the tail holds at most two names"),
+        };
+        let listed = self
+            .store
+            .list_after(after)
+            .await
+            .map_err(|e| SinkError::Transport(e.to_string()))?;
+        if let Some(last) = expected {
+            if !listed.iter().any(|n| n == last) {
                 return Err(SinkError::Transport(format!(
                     "destination drift: {} is gone; it is the end of this mirror's chain",
                     self.store.location(last)
                 )));
             }
         }
-        let after = self
-            .store
-            .list_after(self.last_name.as_deref())
-            .await
-            .map_err(transport)?;
         let ext = self.spec.format.extension();
-        if let Some(foreign) = after
+        if let Some(foreign) = listed
             .iter()
+            .filter(|n| Some(n.as_str()) != expected)
             .find(|n| naming::parse_filename(n, ext).is_some())
         {
             return Err(SinkError::Transport(format!(

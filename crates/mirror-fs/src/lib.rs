@@ -156,15 +156,6 @@ impl BlobStore for FsStore {
         Ok(names)
     }
 
-    async fn exists(&self, name: &str) -> Result<bool, BlobError> {
-        let path = self.dir.join(name);
-        match tokio::fs::metadata(&path).await {
-            Ok(_) => Ok(true),
-            Err(e) if e.kind() == ErrorKind::NotFound => Ok(false),
-            Err(e) => Err(io_error(&path, e)),
-        }
-    }
-
     fn location(&self, name: &str) -> String {
         self.dir.join(name).display().to_string()
     }
