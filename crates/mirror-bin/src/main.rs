@@ -130,9 +130,13 @@ fn init_tracing() {
     // stdout stays available for structured output (e.g. `status
     // --format json`) and standard `1>` / `2>` redirects do the
     // expected thing.
+    // Colours only on a terminal: in a pod the escape codes end up in
+    // the log store.
+    use std::io::IsTerminal;
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(true)
+        .with_ansi(std::io::stderr().is_terminal())
         .with_writer(std::io::stderr)
         .try_init();
 }

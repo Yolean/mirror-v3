@@ -43,6 +43,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 
 FROM gcr.io/distroless/cc-debian12:latest@sha256:a90cf0f046efb32466b38b0972fef3a95e7c580e392e79ff1b7ac08c15fed0bc
 COPY --from=builder /usr/local/bin/mirror-v3 /usr/local/bin/mirror-v3
-USER nonroot:nonroot
+# distroless's nonroot, numeric so that runAsNonRoot can verify it
+USER 65532:65532
 ENTRYPOINT ["/usr/local/bin/mirror-v3"]
 CMD ["--help"]
