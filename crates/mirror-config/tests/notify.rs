@@ -24,7 +24,7 @@ mirrors:
         root: /var/mirror
     format: parquet
     compression: zstd-1
-    http-access: { cache-v1: {} }
+    http-access: { cache-v1: {}, cache-v1-main: {} }
     flush:
       max-time-ms: 60000
       max-bytes: 67108864
@@ -119,7 +119,7 @@ mirrors:
     destinations:
       - type: filesystem
         root: /var/mirror
-    http-access: { cache-v1: {} }
+    http-access: { cache-v1: {}, cache-v1-main: {} }
     flush:
       max-time-ms: 60000
       max-bytes: 67108864
@@ -180,7 +180,7 @@ mirrors:
     destinations:
       - type: filesystem
         root: /var/mirror
-    http-access: { cache-v1: {} }
+    http-access: { cache-v1: {}, cache-v1-main: {} }
     flush:
       max-time-ms: 60000
       max-bytes: 67108864
@@ -208,7 +208,7 @@ mirrors:
     destinations:
       - type: filesystem
         root: /var/mirror
-    http-access: { cache-v1: {} }
+    http-access: { cache-v1: {}, cache-v1-main: {} }
     flush:
       max-time-ms: 60000
       max-bytes: 67108864
@@ -237,7 +237,7 @@ mirrors:
     destinations:
       - type: filesystem
         root: /var/mirror
-    http-access: { cache-v1: {} }
+    http-access: { cache-v1: {}, cache-v1-main: {} }
     flush:
       max-time-ms: 60000
       max-bytes: 67108864
@@ -266,7 +266,7 @@ mirrors:
     destinations:
       - type: filesystem
         root: /var/mirror
-    http-access: { cache-v1: {} }
+    http-access: { cache-v1: {}, cache-v1-main: {} }
     flush:
       max-time-ms: 60000
       max-bytes: 67108864
@@ -298,7 +298,7 @@ mirrors:
     destinations:
       - type: filesystem
         root: /var/mirror
-    http-access: { cache-v1: {} }
+    http-access: { cache-v1: {}, cache-v1-main: {} }
     flush:
       max-time-ms: 60000
       max-bytes: 67108864
@@ -330,7 +330,7 @@ mirrors:
     destinations:
       - type: filesystem
         root: /var/mirror
-    http-access: { cache-v1: {} }
+    http-access: { cache-v1: {}, cache-v1-main: {} }
     flush:
       max-time-ms: 60000
       max-bytes: 67108864
@@ -360,7 +360,7 @@ mirrors:
     destinations:
       - type: filesystem
         root: /var/mirror
-    http-access: { cache-v1: {} }
+    http-access: { cache-v1: {}, cache-v1-main: {} }
     flush:
       max-time-ms: 60000
       max-bytes: 67108864
@@ -459,7 +459,7 @@ mirrors:
     topic: events
     partition: 0
     destinations: []
-    http-access: { cache-v1: {} }
+    http-access: { cache-v1: {}, cache-v1-main: {} }
     notify:
       api: kkv-v1
       targets:
@@ -608,4 +608,30 @@ fn destination_flush_with_filesystem_destination_is_accepted() {
         cfg.mirrors[0].notify.as_ref().unwrap().trigger.on,
         TriggerOn::DestinationFlush
     );
+}
+
+#[test]
+fn notify_requires_cache_v1_main() {
+    let yaml = r#"
+mirrors:
+  - name: events
+    source: { bootstrap-servers: k:9092 }
+    topic: events
+    partition: 0
+    destinations:
+      - type: filesystem
+        root: /var/mirror
+    flush:
+      max-time-ms: 60000
+      max-bytes: 67108864
+      max-offsets: 10000
+    http-access: { cache-v1: {} }
+    notify:
+      api: kkv-v1
+      targets:
+        - url: http://events-cache:8080
+"#;
+    let err = load_from_str(yaml).expect_err("notify without cache-v1-main must be rejected");
+    let msg = format!("{err}");
+    assert!(msg.contains("cache-v1-main"), "got: {msg}");
 }

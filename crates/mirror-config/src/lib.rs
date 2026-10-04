@@ -1068,11 +1068,20 @@ fn validate_mirror(m: &Mirror) -> Result<(), LoadError> {
     // notify body says "go re-read via /cache/v1/raw/<key>". That's
     // only meaningful when the per-mirror `cache-v1` API is enabled.
     if let Some(notify) = m.notify.as_ref() {
-        let has_cache_v1 = m.http_access.as_ref().is_some_and(|h| h.cache_v1.is_some());
-        if !has_cache_v1 {
+        // kkv-v1 consumers (the Node client, gateway's Go client)
+        // re-read every notified key from the unprefixed
+        // /cache/v1/raw/{key}, which only `cache-v1-main` mounts; with
+        // per-mirror routes alone every refetch is a 404 and every
+        // update is dropped.
+        let has_main = m
+            .http_access
+            .as_ref()
+            .is_some_and(|h| h.cache_v1.is_some() && h.cache_v1_main.is_some());
+        if !has_main {
             return Err(LoadError::Validation(format!(
-                "mirror {:?}: `notify` requires `http-access.cache-v1` on the same \
-                 mirror (the notify body tells consumers to re-read via /cache/v1)",
+                "mirror {:?}: `notify` requires `http-access: {{ cache-v1: {{}}, cache-v1-main: {{}} }}` \
+                 on the same mirror: kkv-v1 consumers re-read notified keys from the unprefixed \
+                 /cache/v1/raw/{{key}}, which only cache-v1-main serves",
                 m.name
             )));
         }
