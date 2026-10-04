@@ -151,23 +151,31 @@ pub struct KafkaSource {
     last_stored_offset: Arc<AtomicU64>,
 }
 
+/// Consumer settings for the source. Offsets are committed through
+/// [`KafkaCommitHandle`] only (`store_offsets` needs the auto-store
+/// path off). `auto.offset.reset=error`: the loop always seeks to an
+/// explicit position (the destination's next offset, or the low
+/// watermark), and if that position is gone (retention deleted it
+/// while the mirror was down or lagging) the source fails instead of
+/// jumping to the earliest offset. Blob destinations accept offset
+/// holes (compaction, transaction markers), so a silent jump would
+/// otherwise look like a hole and lose the records in between
+/// unnoticed. The legacy Java worker used `earliest`; it also failed
+/// whenever the destination did not match, which a hole-tolerant
+/// destination no longer does.
+fn consumer_config(bootstrap_servers: &str, group_id: &str) -> ClientConfig {
+    let mut cfg = ClientConfig::new();
+    cfg.set("bootstrap.servers", bootstrap_servers)
+        .set("group.id", group_id)
+        .set("enable.auto.commit", "false")
+        .set("enable.auto.offset.store", "false")
+        .set("auto.offset.reset", "error");
+    cfg
+}
+
 impl KafkaSource {
     pub fn open(cfg: KafkaSourceConfig) -> Result<Self, KafkaError> {
-        let consumer: StreamConsumer = ClientConfig::new()
-            .set("bootstrap.servers", &cfg.bootstrap_servers)
-            .set("group.id", &cfg.group_id)
-            .set("enable.auto.commit", "false")
-            // Required by `store_offsets`: rdkafka rejects manual
-            // offset staging when its auto-store path is also live.
-            // We always commit through `KafkaCommitHandle`, so the
-            // auto-store path is never the right choice here.
-            .set("enable.auto.offset.store", "false")
-            .set("auto.offset.reset", "earliest")
-            // Note: the Java worker used `max.poll.records=1` for
-            // single-record progression; that property is Java-client
-            // only, not librdkafka. The loop in mirror-core already
-            // takes one record at a time via `recv()` so we don't
-            // need a fetcher-side cap to preserve the invariant.
+        let consumer: StreamConsumer = consumer_config(&cfg.bootstrap_servers, &cfg.group_id)
             .create()
             .map_err(|e| KafkaError::Init(e.to_string()))?;
         Ok(Self {
@@ -669,6 +677,15 @@ pub enum KafkaError {
 #[cfg(test)]
 mod tests {
     use rdkafka::config::ClientConfig;
+
+    #[test]
+    fn source_fails_on_a_lost_position_instead_of_jumping() {
+        let native = super::consumer_config("localhost:9092", "g")
+            .create_native_config()
+            .expect("native config");
+        assert_eq!(native.get("auto.offset.reset").unwrap(), "error");
+        assert_eq!(native.get("enable.auto.commit").unwrap(), "false");
+    }
 
     #[test]
     fn producer_never_retries_beneath_the_gate() {
