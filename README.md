@@ -146,6 +146,19 @@ cargo build --release
 cargo test --workspace
 ```
 
+### Development on Ubuntu
+
+The toolchain comes from rustup in the user's home, as `rust-toolchain.toml` pins it: install
+rustup from <https://rustup.rs> (no system package). rdkafka builds librdkafka from source with
+CMake (`cmake-build`), which needs a C and C++ toolchain, and librdkafka 2.12 compiles in libcurl
+for OIDC whatever its options say. On Ubuntu 24.04, the build and test packages are the
+[`Dockerfile`](Dockerfile)'s builder set, plus zlib for gzip-compressed topics:
+
+```sh
+sudo apt-get install -y cmake make g++ pkg-config \
+  libcurl4-openssl-dev libssl-dev libsasl2-dev libzstd-dev liblz4-dev zlib1g-dev
+```
+
 A container image is built via the multi-stage [`Dockerfile`](Dockerfile) (builder = `rust:1-bookworm`, runtime = `gcr.io/distroless/cc-debian12`):
 
 ```sh
