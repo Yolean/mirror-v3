@@ -53,8 +53,8 @@ futures = "0.3"
 bytes = "1"
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.17", default-features = false, features = ["http-listener"] }
-arrow = "55"
-parquet = { version = "55", default-features = false, features = ["arrow", "zstd", "snap", "lz4"] }
+arrow = "60"
+parquet = { version = "60", default-features = false, features = ["arrow", "zstd", "snap", "lz4"] }
 axum = "0.8"
 tower = "0.5"
 tower-http = { version = "0.6", features = ["trace"] }
