@@ -44,7 +44,6 @@ fn minimal_notify_block_parses_with_all_defaults() {
     assert_eq!(notify.api, NotifyApi::KkvV1);
     assert_eq!(notify.targets.len(), 1);
     assert_eq!(notify.targets[0].url, "http://events-cache:8080");
-    assert_eq!(notify.targets[0].path, None);
     assert_eq!(notify.targets[0].fan_out, mirror_config::FanOut::None);
 
     // Spec-default trigger + debounce.
@@ -128,12 +127,10 @@ mirrors:
       api: kkv-v1
       targets:
         - url: http://my-headless-service:8080
-          path: /custom/path
           fan-out: dns-a
 "#;
     let cfg = load_from_str(yaml).expect("must parse");
     let t = &cfg.mirrors[0].notify.as_ref().unwrap().targets[0];
-    assert_eq!(t.path.as_deref(), Some("/custom/path"));
     assert_eq!(t.fan_out, mirror_config::FanOut::DnsA);
 }
 

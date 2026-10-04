@@ -718,16 +718,8 @@ where
     source.seek(expected).await?;
     let mut expected = expected;
     let mut last_heartbeat_offset = expected;
-    // Initial /metrics state for this mirror:
-    //   - `_offset_verified` carries the destination's startup
-    //     position so an idle mirror is visible to Prometheus.
-    //   - `_offset_inflight_retry` is the current attempt index
-    //     (1-based) for the in-flight write, gauge, resets to 0 on
-    //     success. > 0 = the destination is having problems. Today
-    //     we don't add a retry layer at the sink boundary so the
-    //     visible value is always 0; the slot is reserved so
-    //     dashboards can be pre-built. A future retry layer should
-    //     `set(n)` before each attempt and `set(0)` on success.
+    // `_offset_verified` carries the destination's startup position so
+    // an idle mirror is visible to Prometheus.
     let (topic, partition) = current_labels();
     metrics::gauge!(
         "mirror_v3_destination_offset_verified",
@@ -735,12 +727,6 @@ where
         "partition" => partition.clone(),
     )
     .set(expected as f64);
-    metrics::gauge!(
-        "mirror_v3_destination_offset_inflight_retry",
-        "topic" => topic.clone(),
-        "partition" => partition.clone(),
-    )
-    .set(0.0);
 
     tokio::pin!(shutdown);
     let mut heartbeat = if heartbeat_interval.is_zero() {
@@ -834,15 +820,6 @@ where
                         expected = expected
                             .checked_add(1)
                             .expect("source offset overflowed u64");
-                        // Successful write -> reset the retry gauge
-                        // back to 0 (idempotent when no retry layer
-                        // is wired up yet, but it's the contract).
-                        metrics::gauge!(
-                            "mirror_v3_destination_offset_inflight_retry",
-                            "topic" => topic.clone(),
-                            "partition" => partition.clone(),
-                        )
-                        .set(0.0);
                         metrics::counter!(
                             "mirror_v3_destination_records_total",
                             "topic" => topic.clone(),

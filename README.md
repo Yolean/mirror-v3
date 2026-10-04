@@ -39,7 +39,7 @@ Every metric carries `topic="<source-topic>"` and `partition="<n>"` labels so th
 | Metric | Type | Description |
 |---|---|---|
 | `mirror_v3_destination_offset_verified` | gauge | Next source offset the destination would accept; everything below this is durable. Set on startup and advanced by the sink the moment it confirms a commit — `acks=all` produce-delivery for Kafka, `rename(2)` success for Filesystem, `PutObject` success for S3. **This is the load-bearing metric for "how much is safe right now".** |
-| `mirror_v3_destination_offset_inflight_retry` | gauge | Retry count (zero-based) for the destination write that's in flight. `0` covers both "no write in progress" and "first attempt, no retry yet" — a normal flow stays at `0`. `1` means one retry has happened (currently on the second attempt), `>= 2` means more retries are stacking. Resets to `0` on each successful write. **A non-zero, climbing value is the "destination is having problems" signal**; alert on it. Today this is always `0` in scrapes because mirror-v3 has no retry layer at the sink boundary — any sink error crashes the process. The slot is wired so dashboards can be built ahead of the retry implementation. |
+| `mirror_v3_mirror_restarts_total` | counter | Failures of a mirror without cache or notify, each followed by opening it again in the process after a backoff (S3 down, a full disk). A climbing value is the "destination is having problems" signal. |
 | `mirror_v3_destination_records_total` | counter | Records that crossed the gate, since process start. |
 | `mirror_v3_destination_last_flush_timestamp_seconds` | gauge | Unix timestamp (seconds) of the most recent flush. PromQL `time() - mirror_v3_destination_last_flush_timestamp_seconds` gives "seconds since last flush". Filesystem / S3 only. |
 | `mirror_v3_destination_bytes_total` | counter | Cumulative bytes written to the destination by Filesystem / S3 sinks. |
@@ -48,8 +48,8 @@ Every metric carries `topic="<source-topic>"` and `partition="<n>"` labels so th
 Useful PromQL:
 
 ```
-# Destination is currently struggling — any non-zero value is a retry happening
-mirror_v3_destination_offset_inflight_retry > 0
+# A destination keeps failing (its mirror is being reopened in the process)
+increase(mirror_v3_mirror_restarts_total[10m]) > 0
 
 # Seconds since last flush — alert if > flush.max-time-ms / 1000 × 2
 time() - mirror_v3_destination_last_flush_timestamp_seconds

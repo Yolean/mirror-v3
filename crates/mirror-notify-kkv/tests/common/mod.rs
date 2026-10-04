@@ -193,7 +193,6 @@ pub fn notify_pointing_at(
         api: NotifyApi::KkvV1,
         targets: vec![NotifyTarget {
             url: format!("http://{addr}"),
-            path: None,
             fan_out: FanOut::None,
         }],
         trigger: NotifyTrigger {

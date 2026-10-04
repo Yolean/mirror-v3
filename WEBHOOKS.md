@@ -133,9 +133,9 @@ Field-level notes:
   (e.g. `notify.api: nats-v1`, or a kkv-v2 with auth) can be added
   without re-shaping the block. Same pattern as
   `http-access.api`.
-- **`notify.targets[].url`** is a full URL. The path component
-  defaults to `/kafka-keyvalue/v1/updates` for `api: kkv-v1` if
-  unset; explicit override is allowed for non-kkv clients.
+- **`notify.targets[].url`** is a full URL. A URL without a path
+  gets `/kafka-keyvalue/v1/updates` for `api: kkv-v1`; another path
+  goes in the URL.
 - **`notify.targets[].fan-out`** decides how the URL's host is
   resolved:
   - `none` (default): standard DNS, single connection. Adequate for
@@ -177,8 +177,8 @@ unmodified.
 **Request.**
 
 - Method: `POST`
-- Path: `/kafka-keyvalue/v1/updates` (default; override via
-  `notify.targets[].path`)
+- Path: `/kafka-keyvalue/v1/updates` (unless the target URL has a
+  path)
 - Content-Type: `application/json`
 - Headers:
   - `x-kkv-topic: <source-topic>`

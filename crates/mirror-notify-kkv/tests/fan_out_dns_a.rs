@@ -90,7 +90,6 @@ fn notify_dns_a(keep_failures: bool) -> Notify {
         api: NotifyApi::KkvV1,
         targets: vec![NotifyTarget {
             url: "http://stub-host.invalid".into(),
-            path: None,
             fan_out: FanOut::DnsA,
         }],
         trigger: NotifyTrigger {

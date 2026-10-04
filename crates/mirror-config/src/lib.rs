@@ -343,15 +343,10 @@ pub enum NotifyApi {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct NotifyTarget {
-    /// Full URL of the target. Path defaults to
-    /// `/kafka-keyvalue/v1/updates` under `api: kkv-v1` if `path`
-    /// is unset; explicit override is allowed for non-kkv clients.
+    /// Full URL of the target. A URL without a path (or `/`) gets
+    /// kkv-v1's `/kafka-keyvalue/v1/updates`, the path every
+    /// `@yolean/kafka-keyvalue` consumer mounts.
     pub url: String,
-    /// Override the URL's path segment. Defaults to the
-    /// api-variant-defined path (`/kafka-keyvalue/v1/updates`
-    /// for kkv-v1).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub path: Option<String>,
     /// How the URL's host is resolved. `none` (default) sends one
     /// POST to a single keep-alive connection; `dns-a` resolves
     /// the host to its full A/AAAA record set and POSTs to every

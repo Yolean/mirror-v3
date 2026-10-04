@@ -110,21 +110,6 @@ async fn a_record_without_a_key_is_not_notified() {
 }
 
 #[tokio::test]
-async fn respects_explicit_target_path_override() {
-    let server = TestServer::start(Reply::Status(200), vec![]).await;
-    let mut cfg = notify_pointing_at(server.addr, NotifyOutcomes::default(), fast_retry(), 1000);
-    cfg.targets[0].path = Some("/custom/route".into());
-
-    let mut notifier =
-        KkvV1Notifier::from_config(&cfg, "t".into(), 0, ready_cache("m"), "m".into()).unwrap();
-    notifier.on_record(&rec(1, "k", "v")).await.unwrap();
-    wait_until("one POST", WAIT, || server.request_count() == 1).await;
-
-    let captured = server.captured().await;
-    assert_eq!(captured[0].path, "/custom/route");
-}
-
-#[tokio::test]
 async fn timeout_classification_uses_timeout_outcome() {
     // Server replies after 200ms; client timeout is 50ms; outcomes
     // table maps `timeout` to `retry: false, final: fail` so the

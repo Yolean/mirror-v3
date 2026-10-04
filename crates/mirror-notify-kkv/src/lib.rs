@@ -1167,21 +1167,9 @@ fn build_endpoint(target: &NotifyTarget, client: Client) -> Result<Endpoint, Bui
             url: target.url.clone(),
         });
     }
-    // Apply the api-default path when the operator left it implicit.
-    // An explicit `path:` override wins; a URL whose path is `/` (the
-    // default url crate emits for hostname-only inputs) is treated as
-    // "no path specified".
-    let explicit_path = target.path.as_deref();
-    let url_has_path = !matches!(url.path(), "" | "/");
-    let path_to_set: Option<&str> = explicit_path.or({
-        if url_has_path {
-            None
-        } else {
-            Some(KKV_V1_DEFAULT_PATH)
-        }
-    });
-    if let Some(p) = path_to_set {
-        url.set_path(p);
+    // kkv-v1's path when the URL names none.
+    if matches!(url.path(), "" | "/") {
+        url.set_path(KKV_V1_DEFAULT_PATH);
     }
     let target_host = url.host_str().unwrap_or("").to_string();
     let fan_out = match target.fan_out {
@@ -1382,7 +1370,6 @@ mod unit_tests {
     fn build_endpoint_applies_default_kkv_path_when_url_is_host_only() {
         let target = NotifyTarget {
             url: "http://kkv-target.example".into(),
-            path: None,
             fan_out: mirror_config::FanOut::None,
         };
         let ep = build_endpoint(&target, Client::new()).unwrap();
@@ -1390,21 +1377,9 @@ mod unit_tests {
     }
 
     #[test]
-    fn build_endpoint_respects_explicit_path_override() {
-        let target = NotifyTarget {
-            url: "http://kkv-target.example".into(),
-            path: Some("/custom/route".into()),
-            fan_out: mirror_config::FanOut::None,
-        };
-        let ep = build_endpoint(&target, Client::new()).unwrap();
-        assert_eq!(ep.url.path(), "/custom/route");
-    }
-
-    #[test]
     fn build_endpoint_respects_path_in_url_when_no_override() {
         let target = NotifyTarget {
             url: "http://kkv-target.example/already/has/path".into(),
-            path: None,
             fan_out: mirror_config::FanOut::None,
         };
         let ep = build_endpoint(&target, Client::new()).unwrap();
@@ -1415,7 +1390,6 @@ mod unit_tests {
     fn build_endpoint_rejects_non_http_scheme() {
         let target = NotifyTarget {
             url: "file:///etc/passwd".into(),
-            path: None,
             fan_out: mirror_config::FanOut::None,
         };
         let err = build_endpoint(&target, Client::new()).unwrap_err();

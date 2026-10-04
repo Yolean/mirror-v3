@@ -633,15 +633,8 @@
       "type": "object",
       "properties": {
         "url": {
-          "description": "Full URL of the target. Path defaults to\n`/kafka-keyvalue/v1/updates` under `api: kkv-v1` if `path`\nis unset; explicit override is allowed for non-kkv clients.",
+          "description": "Full URL of the target. A URL without a path (or `/`) gets\nkkv-v1's `/kafka-keyvalue/v1/updates`, the path every\n`@yolean/kafka-keyvalue` consumer mounts.",
           "type": "string"
-        },
-        "path": {
-          "description": "Override the URL's path segment. Defaults to the\napi-variant-defined path (`/kafka-keyvalue/v1/updates`\nfor kkv-v1).",
-          "type": [
-            "string",
-            "null"
-          ]
         },
         "fan-out": {
           "description": "How the URL's host is resolved. `none` (default) sends one\nPOST to a single keep-alive connection; `dns-a` resolves\nthe host to its full A/AAAA record set and POSTs to every\nreturned address concurrently - the K8s-headless-Service\nfan-out path without a Kubernetes API dependency.",
