@@ -82,7 +82,7 @@ pub fn spawn_readiness_poller(
                     match hwm_result {
                         Ok(Ok(hwm)) => {
                             spec.cache
-                                .set_broker_end_offset(&spec.mirror_name, hwm.max(0) as u64);
+                                .set_broker_end_offset(&spec.mirror_name, hwm);
                             // Lag is a metric, not an HTTP status (readiness
                             // is sticky once caught up).
                             if let Some(s) = spec

@@ -168,16 +168,17 @@ impl Sink for TeeSink {
         // run per record.
         for inner in self.inners.iter_mut() {
             let head = inner.sink.next_expected_offset().await?;
-            // Per-sink heads only ever advance. If an inner sink
-            // reports a lower value than what we last saw, treat it
-            // as a transient inconsistency (e.g. a partial flush
-            // observed by `scan_validate` mid-rename) and keep the
-            // in-memory head. Truly out-of-band rollbacks at the
-            // destination would surface as the inner sink's own
-            // `UnexpectedPosition` error on next write.
-            if head > inner.head {
-                inner.head = head;
+            // Per-sink heads only ever advance. A lower value means the
+            // destination lost what it had accepted: an error, not a
+            // transient (the blob sinks keep their position in memory
+            // and check the destination themselves).
+            if head < inner.head {
+                return Err(SinkError::Transport(format!(
+                    "inner sink {}: destination went back from next offset {} to {head}",
+                    inner.name, inner.head
+                )));
             }
+            inner.head = head;
         }
         let inner_min = self
             .inners

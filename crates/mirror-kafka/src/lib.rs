@@ -36,7 +36,7 @@ pub fn fetch_high_watermark(
     topic: &str,
     partition: i32,
     timeout: Duration,
-) -> Result<i64, KafkaError> {
+) -> Result<u64, KafkaError> {
     let (_low, high) = fetch_watermarks(bootstrap, topic, partition, timeout)?;
     Ok(high)
 }
@@ -50,7 +50,7 @@ pub fn fetch_low_watermark(
     topic: &str,
     partition: i32,
     timeout: Duration,
-) -> Result<i64, KafkaError> {
+) -> Result<u64, KafkaError> {
     let (low, _high) = fetch_watermarks(bootstrap, topic, partition, timeout)?;
     Ok(low)
 }
@@ -99,16 +99,30 @@ fn fetch_watermarks(
     topic: &str,
     partition: i32,
     timeout: Duration,
-) -> Result<(i64, i64), KafkaError> {
+) -> Result<(u64, u64), KafkaError> {
     let consumer: BaseConsumer = ClientConfig::new()
         .set("bootstrap.servers", bootstrap)
         .set("group.id", "mirror-v3-status-noop")
         .set("enable.auto.commit", "false")
         .create()
         .map_err(|e| KafkaError::Init(e.to_string()))?;
-    consumer
+    let (low, high) = consumer
         .fetch_watermarks(topic, partition, Timeout::After(timeout))
-        .map_err(|e| KafkaError::Init(format!("fetch_watermarks: {e}")))
+        .map_err(|e| KafkaError::Init(format!("fetch_watermarks: {e}")))?;
+    Ok((
+        watermark(low, topic, partition)?,
+        watermark(high, topic, partition)?,
+    ))
+}
+
+/// librdkafka reports an unknown watermark as -1; that is an error, not
+/// offset 0 (which `.max(0)` used to make of it).
+fn watermark(w: i64, topic: &str, partition: i32) -> Result<u64, KafkaError> {
+    u64::try_from(w).map_err(|_| {
+        KafkaError::Init(format!(
+            "the broker reported watermark {w} for {topic}/{partition} (unknown)"
+        ))
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -366,7 +380,7 @@ impl Source for KafkaSource {
         .await
         .map_err(|e| SourceError::Transport(format!("low_watermark join: {e}")))?
         .map_err(|e| SourceError::Transport(format!("fetch_low_watermark: {e}")))?;
-        Ok(low.max(0) as u64)
+        Ok(low)
     }
 
     async fn high_watermark(&mut self) -> Result<u64, SourceError> {
@@ -379,12 +393,7 @@ impl Source for KafkaSource {
         .await
         .map_err(|e| SourceError::Transport(format!("high_watermark join: {e}")))?
         .map_err(|e| SourceError::Transport(format!("fetch_high_watermark: {e}")))?;
-        u64::try_from(high).map_err(|_| {
-            SourceError::Transport(format!(
-                "fetch_high_watermark returned {high} for {}/{partition}",
-                self.topic
-            ))
-        })
+        Ok(high)
     }
 
     async fn commit_through(&mut self, through: u64) -> Result<(), SourceError> {
@@ -582,7 +591,12 @@ impl KafkaSink {
         .await
         .map_err(|e| SinkError::Transport(format!("join: {e}")))?
         .map_err(|e| SinkError::Transport(e.to_string()))?;
-        Ok(high.max(0) as u64)
+        u64::try_from(high).map_err(|_| {
+            SinkError::Transport(format!(
+                "the destination broker reported high watermark {high} for {}/{} (unknown)",
+                self.topic, self.partition
+            ))
+        })
     }
 }
 

@@ -272,16 +272,18 @@ fn resolve_blob_params(mirror: &Mirror) -> Result<BlobMirrorParams> {
 #[derive(Debug, serde::Serialize)]
 struct StatusRow {
     name: String,
-    source_high: Option<i64>,
+    source_high: Option<u64>,
     dest_next: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
 }
 
 impl StatusRow {
+    /// Source high watermark minus destination next offset; negative
+    /// when the destination is ahead (a recreated topic).
     fn lag(&self) -> Option<i64> {
         match (self.source_high, self.dest_next) {
-            (Some(h), Some(n)) => Some(h.saturating_sub(n as i64).max(0)),
+            (Some(h), Some(n)) => Some(h as i64 - n as i64),
             _ => None,
         }
     }
@@ -725,7 +727,7 @@ async fn fetch_hwm_for_mirror(mirror: &Mirror) -> Result<u64> {
     .await
     .with_context(|| format!("mirror {mirror_name}: hwm task join"))?
     .with_context(|| format!("mirror {mirror_name}: fetch high watermark"))?;
-    Ok(hwm.max(0) as u64)
+    Ok(hwm)
 }
 
 /// Read the broker's `__consumer_offsets` for this mirror's group
@@ -779,7 +781,7 @@ async fn fetch_low_watermark_for_mirror(mirror: &Mirror) -> Result<u64> {
     .await
     .with_context(|| format!("mirror {mirror_name}: low watermark task join"))?
     .with_context(|| format!("mirror {mirror_name}: fetch low watermark"))?;
-    Ok(low.max(0) as u64)
+    Ok(low)
 }
 
 async fn shutdown_signal(mut rx: tokio::sync::watch::Receiver<bool>) {
