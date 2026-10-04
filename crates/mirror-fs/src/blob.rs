@@ -115,8 +115,11 @@ pub const DRIFT_CHECK_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Validate a listing. Append mode requires a contiguous chain of
 /// `<from>-<to>` names from 0; compaction mode allows gaps (snapshots
-/// may be removed out of band) and forbids overlaps. An object with
-/// another format's extension is an error: no mixed-format directories.
+/// may be removed out of band) and forbids overlaps. Every object must
+/// be one of this mirror's blobs: an object with another format's
+/// extension, or a name that does not parse, is an error (skipping it
+/// would hide a misconfiguration, or make the resume position too low
+/// if it was a blob under a name this version does not read).
 pub fn validate_chain(
     names: &[String],
     format: Format,
@@ -133,12 +136,15 @@ pub fn validate_chain(
                 )));
             }
         }
-        if let Some((from, to)) = naming::parse_filename(name, expected_ext) {
-            if to < from {
-                return Err(BlobError::CorruptChain(format!("{name}: to < from")));
-            }
-            entries.push((from, to, name.as_str()));
+        let Some((from, to)) = naming::parse_filename(name, expected_ext) else {
+            return Err(BlobError::CorruptChain(format!(
+                "{name} is not a blob name this mirror writes (<from>-<to>.{expected_ext})"
+            )));
+        };
+        if to < from {
+            return Err(BlobError::CorruptChain(format!("{name}: to < from")));
         }
+        entries.push((from, to, name.as_str()));
     }
     match compaction {
         None => {
@@ -533,12 +539,7 @@ impl<S: BlobStore> BlobSink<S> {
                 )));
             }
         }
-        let ext = self.spec.format.extension();
-        if let Some(foreign) = listed
-            .iter()
-            .filter(|n| Some(n.as_str()) != expected)
-            .find(|n| naming::parse_filename(n, ext).is_some())
-        {
+        if let Some(foreign) = listed.iter().find(|n| Some(n.as_str()) != expected) {
             return Err(SinkError::Transport(format!(
                 "destination drift: {} was not written by this process (a second writer, \
                  or a manual change); this mirror's chain ends before it, at next offset {}",
@@ -691,6 +692,20 @@ mod tests {
         .unwrap();
         assert_eq!(c.durable, 20);
         assert_eq!(c.latest, Some(n(10, 19)));
+    }
+
+    #[test]
+    fn a_name_that_is_not_a_blob_is_an_error() {
+        let err = validate_chain(
+            &names(&["00000000000000000000-00000000000000000004.ndjson", "README"]),
+            Format::Ndjson,
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("README is not a blob name"),
+            "{err}"
+        );
     }
 
     #[test]
