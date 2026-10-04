@@ -538,6 +538,12 @@ impl<S: BlobStore> BlobSink<S> {
 impl<S: BlobStore> Sink for BlobSink<S> {
     async fn next_expected_offset(&mut self) -> Result<u64, SinkError> {
         self.tick_daily().await?;
+        // The loop calls this on every empty poll, so `max-time` holds
+        // while the source is idle too, within one poll timeout: a burst
+        // at 17:00 on a Friday is not left in memory until Monday.
+        if self.should_flush() == Some(FlushTrigger::MaxTime) {
+            self.flush_locked(FlushTrigger::MaxTime).await?;
+        }
         if self.last_drift_check.elapsed() >= self.drift_check_interval {
             self.check_drift().await?;
         }

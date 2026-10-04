@@ -295,3 +295,27 @@ async fn compaction_rejects_null_key_at_write() {
     let err = sink.write(r).await.expect_err("null key must be rejected");
     assert!(format!("{err}").contains("null"), "got: {err}");
 }
+
+/// `max-time` was only evaluated in `write`, so a
+/// burst followed by silence stayed in memory until the next record.
+/// The loop's idle path (`next_expected_offset` on an empty poll) now
+/// flushes it.
+#[tokio::test]
+async fn max_time_flushes_while_idle() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let mut c = cfg(Arc::clone(&store), 100);
+    c.flush.max_time = Duration::from_millis(20);
+    let mut sink = S3Sink::open(c).await.unwrap();
+    sink.write(rec(0)).await.unwrap();
+    sink.write(rec(1)).await.unwrap();
+    assert_eq!(sink.next_expected_offset().await.unwrap(), 2);
+    assert!(list_names(store.as_ref(), &Path::from("archive/ops/0"))
+        .await
+        .is_empty());
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    assert_eq!(sink.next_expected_offset().await.unwrap(), 2);
+    assert_eq!(
+        list_names(store.as_ref(), &Path::from("archive/ops/0")).await,
+        vec!["00000000000000000000-00000000000000000001.ndjson".to_string()]
+    );
+}
