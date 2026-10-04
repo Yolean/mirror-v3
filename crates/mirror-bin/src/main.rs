@@ -591,20 +591,52 @@ async fn run(path: PathBuf) -> Result<()> {
     let mut handles = Vec::with_capacity(enabled_mirrors.len());
     for mirror in &enabled_mirrors {
         let binding = mirror_cache_binding(mirror, cache_state.as_ref());
-        let handle = spawn_mirror((*mirror).clone(), shutdown_rx.clone(), binding).await?;
+        let handle = if restarts_in_process(mirror) {
+            tokio::spawn(supervise_in_process(
+                (*mirror).clone(),
+                shutdown_rx.clone(),
+                binding,
+            ))
+        } else {
+            spawn_mirror((*mirror).clone(), shutdown_rx.clone(), binding).await?
+        };
         handles.push((mirror.name.clone(), handle));
     }
 
-    // Wait for the first task to terminate. Any termination collapses
-    // the whole process. Successful (graceful) termination is Ok(())
-    // so the process exits zero on shutdown.
-    let (which, result) = wait_first(handles).await;
-    if result.is_ok() {
-        tracing::info!(mirror = %which, "mirror task terminated gracefully");
-    } else {
-        tracing::error!(mirror = %which, "mirror task errored; exiting process");
+    // The first error ends the process. A mirror that ends without
+    // error has seen the shutdown signal, so every other mirror is
+    // stopping too: wait for all of them, so each one's final flush and
+    // commit completes before the runtime is dropped
+    // (returning on the first graceful exit cancelled the others'
+    // in-flight PUTs and final commits).
+    let result = wait_mirrors(handles).await;
+    if let Err(e) = &result {
+        tracing::error!(error = %format!("{e:#}"), "mirror task errored; exiting process");
     }
     result
+}
+
+/// Wait for every mirror task; return the first error as soon as it
+/// happens, or `Ok` once all have ended without one.
+async fn wait_mirrors(handles: Vec<(String, tokio::task::JoinHandle<Result<()>>)>) -> Result<()> {
+    let mut pending: futures::stream::FuturesUnordered<_> = handles
+        .into_iter()
+        .map(|(name, handle)| async move {
+            let r = match handle.await {
+                Ok(inner) => inner,
+                Err(join) => Err(anyhow::anyhow!("task join: {join}")),
+            };
+            (name, r)
+        })
+        .collect();
+    use futures::StreamExt;
+    while let Some((name, result)) = pending.next().await {
+        match result {
+            Ok(()) => tracing::info!(mirror = %name, "mirror task terminated gracefully"),
+            Err(e) => return Err(e.context(format!("mirror {name}"))),
+        }
+    }
+    Ok(())
 }
 
 /// Whether the mirror serves `/cache/v1` and so holds every key's latest
@@ -617,6 +649,71 @@ fn serves_cache(mirror: &Mirror) -> bool {
         .http_access
         .as_ref()
         .is_some_and(HttpAccess::any_enabled)
+}
+
+/// Whether a failed mirror is restarted inside the process instead of
+/// ending it. A mirror with neither a cache nor notify holds no state but
+/// its destinations, and opening it again re-derives its position from
+/// them, exactly as a process restart would. Restarting it alone keeps a
+/// destination outage (S3 down, a full disk) from taking the process,
+/// and with it the caches and notifications other mirrors serve, down
+/// with it. A cache or notify mirror ends the process: its in-memory
+/// state belongs to the process and is rebuilt by the orchestrator's
+/// restart.
+fn restarts_in_process(mirror: &Mirror) -> bool {
+    !serves_cache(mirror) && mirror.notify.is_none()
+}
+
+const RESTART_BACKOFF_MIN: std::time::Duration = std::time::Duration::from_secs(1);
+const RESTART_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Run a mirror and, while the process is not shutting down, open and run
+/// it again after each failure, with a backoff from 1 s doubling to 60 s
+/// (reset after a run that lasted longer than the cap). Every failure is
+/// logged as an error and counted in `mirror_v3_mirror_restarts_total`.
+async fn supervise_in_process(
+    mirror: Mirror,
+    shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    cache: Option<mirror_core::CacheBinding>,
+) -> Result<()> {
+    let mut backoff = RESTART_BACKOFF_MIN;
+    loop {
+        let started = std::time::Instant::now();
+        let result = match spawn_mirror(mirror.clone(), shutdown_rx.clone(), cache.clone()).await {
+            Ok(handle) => match handle.await {
+                Ok(r) => r,
+                Err(join) => Err(anyhow::anyhow!("task join: {join}")),
+            },
+            Err(e) => Err(e),
+        };
+        let err = match result {
+            Ok(()) => return Ok(()),
+            Err(e) => e,
+        };
+        if *shutdown_rx.borrow() {
+            return Err(err);
+        }
+        if started.elapsed() > RESTART_BACKOFF_MAX {
+            backoff = RESTART_BACKOFF_MIN;
+        }
+        tracing::error!(
+            mirror = %mirror.name,
+            error = %format!("{err:#}"),
+            retry_in_s = backoff.as_secs(),
+            "mirror failed; it holds no state but its destinations, so it is opened again in this process"
+        );
+        metrics::counter!(
+            "mirror_v3_mirror_restarts_total",
+            "topic" => mirror.topic.clone(),
+            "partition" => mirror.partition.to_string(),
+        )
+        .increment(1);
+        tokio::select! {
+            _ = tokio::time::sleep(backoff) => {}
+            _ = shutdown_signal(shutdown_rx.clone()) => return Ok(()),
+        }
+        backoff = (backoff * 2).min(RESTART_BACKOFF_MAX);
+    }
 }
 
 /// Pick the listen address for the cache HTTP server. Defaults to
@@ -997,7 +1094,7 @@ async fn spawn_mirror(
     // it via the Kafka commit handle, and flushes to the broker.
     // The handle clones an `Arc<StreamConsumer>` internally so this
     // task runs independently of the source-owning run loop.
-    let _commit_task = spawn_periodic_commit_task(
+    let commit_task = spawn_periodic_commit_task(
         commit_handle,
         Arc::clone(&ack_tracker),
         commit_interval_from_env(),
@@ -1009,8 +1106,9 @@ async fn spawn_mirror(
     // exists (i.e. the mirror has `http_access` or `notify`). The
     // poller refreshes the broker end offset for the lag-based
     // readiness predicate and detects source-assignment loss.
+    let mut poller = None;
     if let Some(binding) = cache.as_ref() {
-        let _poller = spawn_readiness_poller(
+        poller = Some(spawn_readiness_poller(
             PollSpec {
                 mirror_name: name.clone(),
                 bootstrap_servers: mirror.source.bootstrap_servers.clone(),
@@ -1021,7 +1119,7 @@ async fn spawn_mirror(
             },
             readiness_poll_interval_from_env(),
             shutdown_rx.clone(),
-        );
+        ));
     } else {
         // No cache slot => no readiness gate to drive. Drop the
         // extra handle.
@@ -1106,6 +1204,13 @@ async fn spawn_mirror(
             // regardless of why the loop stopped, and committing
             // them shrinks the duplicate-webhook replay on restart.
             final_commit(commit_handle_final, &ack_tracker_final, &name).await;
+            // The commit task and the poller hold this run's consumer;
+            // they end with the run, also when the process goes on (a
+            // mirror restarted in process opens a new consumer).
+            commit_task.abort();
+            if let Some(p) = poller {
+                p.abort();
+            }
             match (result, flush_drain) {
                 (Ok(()), Ok(())) => Ok(()),
                 (Err(e), _) => Err(anyhow::anyhow!("mirror {name}: {e}")),
@@ -1351,55 +1456,84 @@ async fn open_inner_sink(
     }
 }
 
-async fn wait_first(
-    handles: Vec<(String, tokio::task::JoinHandle<Result<()>>)>,
-) -> (String, Result<()>) {
-    if handles.is_empty() {
-        return (
-            "(none)".into(),
-            Err(anyhow::anyhow!("no mirrors configured")),
-        );
-    }
-    let mut futures = Vec::with_capacity(handles.len());
-    for (name, handle) in handles {
-        futures.push(Box::pin(async move {
-            let r = handle.await;
-            (
-                name,
-                match r {
-                    Ok(inner) => inner,
-                    Err(join) => Err(anyhow::anyhow!("task join: {join}")),
-                },
-            )
-        }));
-    }
-    let ((name, result), _idx, _rest) = futures_select_all(futures).await;
-    (name, result)
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-/// Tiny stand-in for `futures::future::select_all` to avoid pulling
-/// the `futures` crate just for one combinator.
-async fn futures_select_all<T, F>(
-    mut futures: Vec<std::pin::Pin<Box<F>>>,
-) -> (T, usize, Vec<std::pin::Pin<Box<F>>>)
-where
-    F: std::future::Future<Output = T> + ?Sized,
-{
-    use std::future::poll_fn;
-    use std::task::Poll;
-    poll_fn(move |cx| {
-        for (i, fut) in futures.iter_mut().enumerate() {
-            if let Poll::Ready(v) = fut.as_mut().poll(cx) {
-                let rest: Vec<_> = futures
-                    .drain(..)
-                    .enumerate()
-                    .filter(|(j, _)| *j != i)
-                    .map(|(_, f)| f)
-                    .collect();
-                return Poll::Ready((v, i, rest));
-            }
-        }
-        Poll::Pending
-    })
-    .await
+    fn task(
+        delay_ms: u64,
+        result: Result<()>,
+        done: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) -> tokio::task::JoinHandle<Result<()>> {
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            done.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            result
+        })
+    }
+
+    #[tokio::test]
+    async fn graceful_exit_waits_for_every_mirror() {
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let handles = vec![
+            ("fast".to_string(), task(1, Ok(()), done.clone())),
+            ("slow".to_string(), task(80, Ok(()), done.clone())),
+        ];
+        wait_mirrors(handles).await.unwrap();
+        assert_eq!(done.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn first_error_ends_the_wait() {
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let handles = vec![
+            (
+                "broken".to_string(),
+                task(1, Err(anyhow::anyhow!("boom")), done.clone()),
+            ),
+            ("slow".to_string(), task(5_000, Ok(()), done.clone())),
+        ];
+        let started = std::time::Instant::now();
+        let err = wait_mirrors(handles).await.unwrap_err();
+        assert!(
+            format!("{err:#}").contains("mirror broken: boom"),
+            "{err:#}"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    }
+
+    fn mirror(yaml: &str) -> Mirror {
+        mirror_config::load_from_str(yaml)
+            .unwrap()
+            .mirrors
+            .remove(0)
+    }
+
+    #[test]
+    fn only_mirrors_without_cache_or_notify_restart_in_process() {
+        let blob = mirror(
+            r#"
+mirrors:
+  - name: ops
+    source: { bootstrap-servers: k:9092 }
+    topic: ops
+    partition: 0
+    destinations: [{ type: filesystem, root: /tmp/x }]
+    flush: { max-time-ms: 1000, max-bytes: 1000, max-offsets: 10 }
+"#,
+        );
+        assert!(restarts_in_process(&blob));
+        let cache = mirror(
+            r#"
+mirrors:
+  - name: userstate
+    source: { bootstrap-servers: k:9092 }
+    topic: userstate
+    partition: 0
+    destinations: []
+    http-access: { cache-v1: {}, cache-v1-main: {} }
+"#,
+        );
+        assert!(!restarts_in_process(&cache));
+    }
 }

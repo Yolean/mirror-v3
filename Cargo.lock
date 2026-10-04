@@ -1771,6 +1771,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "clap",
+ "futures",
  "metrics",
  "metrics-exporter-prometheus",
  "mirror-cache",
