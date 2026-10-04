@@ -206,6 +206,9 @@ impl ColumnType {
 }
 
 /// A Kafka-shaped record stream pinned to one (topic, partition).
+// async_trait marks the boxed future of each default method #[must_use];
+// clippy 1.99 flags that as double_must_use in the expansion.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait Source: Send {
     /// Position the source so the next `poll_one` returns the record
@@ -279,6 +282,9 @@ pub trait Source: Send {
 
 /// A destination for exactly-once mirroring. The sink owns the truth
 /// about "where we are" - the loop trusts `next_expected_offset`.
+// async_trait marks the boxed future of each default method #[must_use];
+// clippy 1.99 flags that as double_must_use in the expansion.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait Sink: Send {
     /// The source offset the destination will accept next. Must be
@@ -454,6 +460,9 @@ pub trait AckSink: Send + Sync {
 /// Implementations live outside `mirror-core` so this crate stays
 /// HTTP-free. The default impl (no-op) is used by every mirror that
 /// doesn't opt into a `notify:` block in config.
+// async_trait marks the boxed future of each default method #[must_use];
+// clippy 1.99 flags that as double_must_use in the expansion.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait Notifier: Send {
     /// Observe a record that was just successfully written to the

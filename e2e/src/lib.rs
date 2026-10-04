@@ -23,6 +23,7 @@ pub mod webhook_receiver;
 use async_trait::async_trait;
 
 /// A way to bring a test environment online.
+#[allow(clippy::double_must_use)] // async_trait expansion, see mirror-core Source
 #[async_trait]
 pub trait Provisioner: Sized + Send {
     type Stack: ProvisionedStack;
@@ -32,6 +33,7 @@ pub trait Provisioner: Sized + Send {
 /// A running test environment. Endpoints come out of here; faults go
 /// in. Cleanup is `Drop`-based by convention so even panicking tests
 /// release containers.
+#[allow(clippy::double_must_use)] // async_trait expansion, see mirror-core Source
 #[async_trait]
 pub trait ProvisionedStack: Send + Sync {
     /// Source Kafka bootstrap, always present.
