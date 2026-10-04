@@ -316,6 +316,11 @@ impl Sink for TeeSink {
         self.inners.iter().all(|i| i.sink.allows_compacted_source())
     }
 
+    fn allows_offset_holes(&self) -> bool {
+        // A hole the loop accepts reaches every inner sink behind it.
+        self.inners.iter().all(|i| i.sink.allows_offset_holes())
+    }
+
     async fn align_to_source_low_watermark(&mut self, low_watermark: u64) -> Result<(), SinkError> {
         // The run loop calls this only when `allows_compacted_source`
         // returned true, so every inner sink is compaction-capable
@@ -617,6 +622,9 @@ mod tests {
             Ok(())
         }
         fn allows_compacted_source(&self) -> bool {
+            self.allow_compacted
+        }
+        fn allows_offset_holes(&self) -> bool {
             self.allow_compacted
         }
         async fn align_to_source_low_watermark(

@@ -112,12 +112,21 @@ async fn restart_recomputes_position_from_listing() {
 }
 
 #[tokio::test]
-async fn rejects_out_of_order_write() {
+async fn keeps_offset_holes_and_rejects_going_back() {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let mut sink = S3Sink::open(cfg(Arc::clone(&store), 100)).await.unwrap();
     sink.write(rec(0)).await.unwrap();
-    let err = sink.write(rec(2)).await.expect_err("gap must error");
+    sink.write(rec(2)).await.unwrap();
+    let err = sink.write(rec(1)).await.expect_err("backwards must error");
     assert!(format!("{err}").contains("expected"), "got {err}");
+    sink.flush_now().await.unwrap();
+    assert_eq!(
+        list_names(store.as_ref(), &Path::from("archive/ops/0")).await,
+        vec!["00000000000000000000-00000000000000000002.ndjson".to_string()]
+    );
+    drop(sink);
+    let mut reopened = S3Sink::open(cfg(Arc::clone(&store), 100)).await.unwrap();
+    assert_eq!(reopened.next_expected_offset().await.unwrap(), 3);
 }
 
 #[tokio::test]

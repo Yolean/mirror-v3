@@ -83,16 +83,31 @@ async fn write_buffers_then_flushes_on_count_trigger() {
 }
 
 #[tokio::test]
-async fn rejects_out_of_order_write() {
+async fn keeps_offset_holes_and_rejects_going_back() {
+    // Offsets 1-4 are a hole in the source (compacted away, or a
+    // transaction marker): the file covers positions 0-5 and holds
+    // the two records with their true offsets.
     let tmp = tempfile::tempdir().unwrap();
     let mut sink = FilesystemSink::open(cfg(tmp.path(), 100)).unwrap();
     sink.write(rec(0)).await.unwrap();
-    let err = sink.write(rec(5)).await.expect_err("gap must error");
-    let msg = format!("{err}");
-    assert!(
-        msg.contains("destination advanced") || msg.contains("expected"),
-        "got {msg}"
+    sink.write(rec(5)).await.unwrap();
+    let err = sink.write(rec(3)).await.expect_err("backwards must error");
+    assert!(format!("{err}").contains("expected"), "got {err}");
+    sink.flush_now().await.unwrap();
+    assert_eq!(
+        files_in(tmp.path()),
+        vec!["00000000000000000000-00000000000000000005.ndjson".to_string()]
     );
+    let records = mirror_fs::read_all_records(
+        &mirror_fs::naming::partition_dir(tmp.path(), "ops", 0),
+        Format::Ndjson,
+    )
+    .unwrap();
+    let offsets: Vec<u64> = records.iter().map(|r| r.source_offset).collect();
+    assert_eq!(offsets, vec![0, 5]);
+    drop(sink);
+    let mut reopened = FilesystemSink::open(cfg(tmp.path(), 100)).unwrap();
+    assert_eq!(reopened.next_expected_offset().await.unwrap(), 6);
 }
 
 #[tokio::test]

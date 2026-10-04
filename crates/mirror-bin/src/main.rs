@@ -1254,6 +1254,10 @@ impl Sink for NotifyOnlySink {
         true
     }
 
+    fn allows_offset_holes(&self) -> bool {
+        true
+    }
+
     async fn align_to_source_low_watermark(&mut self, low_watermark: u64) -> Result<(), SinkError> {
         self.position = low_watermark;
         Ok(())

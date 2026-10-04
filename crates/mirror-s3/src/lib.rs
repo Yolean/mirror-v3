@@ -174,6 +174,10 @@ impl Sink for S3Sink {
         self.0.allows_compacted_source()
     }
 
+    fn allows_offset_holes(&self) -> bool {
+        self.0.allows_offset_holes()
+    }
+
     async fn align_to_source_low_watermark(&mut self, low_watermark: u64) -> Result<(), SinkError> {
         self.0.align_to_source_low_watermark(low_watermark).await
     }

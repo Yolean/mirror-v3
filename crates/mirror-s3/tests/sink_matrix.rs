@@ -230,16 +230,19 @@ fn matrix_cases() -> Vec<Case> {
             action: Action::Write(0),
             expected: Outcome::Ok,
         },
+        // append × empty × write above expected → OK: a source offset hole
         Case {
-            name: "append/empty/write_above_expected/rejects",
+            name: "append/empty/write_above_expected/hole_ok",
+
             mode: Mode::Append,
+
             preload: &[],
+
             buffer_state: BufferState::Empty,
+
             action: Action::Write(5),
-            expected: Outcome::UnexpectedPosition {
-                expected: 0,
-                actual: 5,
-            },
+
+            expected: Outcome::Ok,
         },
         Case {
             name: "append/empty_after_flush/write_below_durable/rejects",
@@ -260,16 +263,19 @@ fn matrix_cases() -> Vec<Case> {
             action: Action::Write(3),
             expected: Outcome::Ok,
         },
+        // append × non-empty × write above expected → OK: a source offset hole
         Case {
-            name: "append/non_empty/write_above_expected/rejects",
+            name: "append/non_empty/write_above_expected/hole_ok",
+
             mode: Mode::Append,
+
             preload: &[0, 1, 2],
+
             buffer_state: BufferState::NonEmpty,
+
             action: Action::Write(7),
-            expected: Outcome::UnexpectedPosition {
-                expected: 3,
-                actual: 7,
-            },
+
+            expected: Outcome::Ok,
         },
         Case {
             name: "append/non_empty/write_below_buffered_head/rejects",
@@ -369,6 +375,18 @@ fn matrix_cases() -> Vec<Case> {
         // ============================================================
         //  FLUSH
         // ============================================================
+        // append × non-empty with a hole × flush → the name covers the hole
+        Case {
+            name: "append/non_empty_with_hole/flush/name_covers_hole",
+            mode: Mode::Append,
+            preload: &[0, 1, 5],
+            buffer_state: BufferState::NonEmpty,
+            action: Action::Flush {
+                expected_from: 0,
+                expected_to: 5,
+            },
+            expected: Outcome::Ok,
+        },
         Case {
             name: "append/non_empty/flush/contiguous_object_name",
             mode: Mode::Append,

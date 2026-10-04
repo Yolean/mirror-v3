@@ -317,6 +317,21 @@ pub trait Sink: Send {
         false
     }
 
+    /// Whether the sink accepts a record whose offset is above the next
+    /// expected one: a hole in the source's offsets. Kafka leaves holes
+    /// where compaction removed records and at transaction markers, and
+    /// librdkafka delivers in order, so a hole is not a lost record (the
+    /// source fails on an out-of-range position instead of skipping to
+    /// the earliest offset). Blob destinations name objects by consumer
+    /// position (`from` = previous `to` + 1, `to` = last record in the
+    /// object) and record each record's true offset, so they keep the
+    /// chain contiguous across holes: true. A Kafka destination cannot
+    /// reproduce a hole (its next offset is always high watermark + 1),
+    /// so it keeps the default false and a hole ends the mirror.
+    fn allows_offset_holes(&self) -> bool {
+        false
+    }
+
     /// Called by the run loop to advance this sink's internal
     /// "next expected offset" to a higher value. The sink must update
     /// state so that:
@@ -532,17 +547,15 @@ pub enum MirrorError {
     /// destination chain that has somehow advanced past the broker.
     #[error("source delivered offset {got}, expected at least {expected} (went backwards)")]
     SourceWentBackwards { expected: u64, got: u64 },
-    /// Source delivered an offset *above* `expected`. Hard error in
-    /// append mode (would leave a gap in the destination chain).
-    /// Recoverable under `compaction: log`: the run loop aligns the
-    /// sink to the delivered offset and continues - the broker's
-    /// `LogStartOffset` reports 0 for a `cleanup.policy=compact`
-    /// topic even when the earliest deliverable record is much later
-    /// (compaction deduplicates by key but does not advance the
-    /// segment start), so the bootstrap pre-align can only be a hint
-    /// and the first-delivery offset is the authoritative starting
-    /// point.
-    #[error("source delivered offset {got}, expected {expected} (gap above expected)")]
+    /// Source delivered an offset *above* `expected` (a hole: records
+    /// compacted away, or a transaction marker) and the sink cannot
+    /// reproduce holes ([`Sink::allows_offset_holes`] is false: a Kafka
+    /// destination).
+    #[error(
+        "source delivered offset {got}, expected {expected}: the source has an offset hole \
+         (compaction or a transaction marker), and a Kafka destination cannot reproduce one; \
+         mirror such a topic to a blob destination"
+    )]
     SourceGapAboveExpected { expected: u64, got: u64 },
     /// Sink's view of next-expected-offset diverged from what we
     /// believed while we were idle. Indicates an out-of-band write or
@@ -760,37 +773,20 @@ where
                             });
                         }
                         if record.source_offset > expected {
-                            if sink.allows_compacted_source() {
-                                // `cleanup.policy=compact` leaves
-                                // `LogStartOffset` at 0 even when the
-                                // earliest deliverable record is much
-                                // later; the bootstrap pre-align (which
-                                // uses `low_watermark`) misses this
-                                // case and gaps also surface mid-stream
-                                // every time the broker dropped a
-                                // superseded record. The sink's `write`
-                                // accepts forward gaps under
-                                // `compaction:log` so we only bump the
-                                // local `expected` tracker here. The
-                                // bootstrap-time `align_to_source_low_watermark`
-                                // is still called (with an empty
-                                // buffer) so the first snapshot file's
-                                // `from` reflects the broker's low
-                                // watermark when that path applies.
+                            if sink.allows_offset_holes() {
+                                // A hole in the source's offsets:
+                                // compaction removed records, or a
+                                // transaction marker sits there. The
+                                // sink records true offsets and keeps
+                                // its chain contiguous, so only the
+                                // local tracker moves.
                                 //
-                                // Not logged per-record: a compacted
-                                // topic can have a gap on every
-                                // delivered record (one per surviving
-                                // key after upstream dedup), so any
-                                // log level here scales with millions
-                                // of lines per restart. Observability
-                                // for gap rate is the dedicated
-                                // counter below - plot a rate or
-                                // alert on a threshold rather than
-                                // reading logs. The startup `loop
-                                // start … compaction="log"` INFO
-                                // line is the one-shot "expect gaps
-                                // here" signal.
+                                // Not logged per record: a compacted
+                                // topic can have a hole before every
+                                // delivered record, so a log line here
+                                // scales with millions of lines per
+                                // restart. The counter below is the
+                                // signal.
                                 let (topic_l, partition_l) = current_labels();
                                 metrics::counter!(
                                     "mirror_v3_source_offset_gap_records_total",

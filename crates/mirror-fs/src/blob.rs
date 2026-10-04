@@ -335,18 +335,14 @@ impl<S: BlobStore> BlobSink<S> {
         self.flush_locked(FlushTrigger::Explicit).await
     }
 
-    /// The lowest source offset the next `write` accepts. Append mode:
-    /// `durable_position + buffer.len()` (contiguous). Compaction mode:
-    /// the last buffered offset + 1, as the buffer may have gaps.
+    /// The lowest source offset the next `write` accepts: the last
+    /// buffered offset + 1, or the durable position. The buffer may have
+    /// holes (see [`Sink::allows_offset_holes`]).
     fn buffered_head(&self) -> u64 {
-        match self.spec.compaction {
-            Some(CompactionMode::Log) => self
-                .buffer
-                .last()
-                .map(|r| r.source_offset + 1)
-                .unwrap_or(self.durable_position),
-            None => self.durable_position + self.buffer.len() as u64,
-        }
+        self.buffer
+            .last()
+            .map(|r| r.source_offset + 1)
+            .unwrap_or(self.durable_position)
     }
 
     fn should_flush(&self) -> Option<FlushTrigger> {
@@ -372,18 +368,15 @@ impl<S: BlobStore> BlobSink<S> {
     async fn flush_locked(&mut self, trigger: FlushTrigger) -> Result<(), SinkError> {
         debug_assert!(!self.buffer.is_empty());
         let flush_started = Instant::now();
+        // An object covers consumer positions `from..=to`: from the
+        // previous object's `to` + 1 through the last record buffered,
+        // holes included, so the chain of names stays contiguous.
         let from = self.durable_position;
-        let to = match self.spec.compaction {
-            // The buffer may have gaps (the broker compacted them
-            // away); the snapshot covers everything through the last
-            // offset seen.
-            Some(CompactionMode::Log) => self
-                .buffer
-                .last()
-                .map(|r| r.source_offset)
-                .expect("buffer non-empty by debug_assert above"),
-            None => self.durable_position + self.buffer.len() as u64 - 1,
-        };
+        let to = self
+            .buffer
+            .last()
+            .map(|r| r.source_offset)
+            .expect("buffer non-empty by debug_assert above");
         let count = self.buffer.len();
         let buffered_bytes = self.buffer_bytes;
         let name = naming::batch_filename(from, to, self.spec.format.extension());
@@ -510,14 +503,6 @@ impl<S: BlobStore> Sink for BlobSink<S> {
                 actual: record.source_offset,
             });
         }
-        // Append mode rejects forward gaps; compaction mode accepts
-        // them (the broker compacted the offsets in between away).
-        if self.spec.compaction.is_none() && record.source_offset != expected {
-            return Err(SinkError::UnexpectedPosition {
-                expected,
-                actual: record.source_offset,
-            });
-        }
         // Compaction dedups by key: a non-null UTF-8 key is required.
         if matches!(self.spec.compaction, Some(CompactionMode::Log)) {
             match &record.key {
@@ -568,6 +553,10 @@ impl<S: BlobStore> Sink for BlobSink<S> {
 
     fn allows_compacted_source(&self) -> bool {
         matches!(self.spec.compaction, Some(CompactionMode::Log))
+    }
+
+    fn allows_offset_holes(&self) -> bool {
+        true
     }
 
     async fn align_to_source_low_watermark(&mut self, low_watermark: u64) -> Result<(), SinkError> {

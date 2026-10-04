@@ -126,25 +126,27 @@ fn append_mode_writes_records_in_order_to_real_disk() {
 }
 
 #[test]
-fn append_mode_real_sink_rejects_source_gap() {
-    // Source skips from 0 to 5; append mode must reject the gap
-    // via SourceGapAboveExpected from the run loop. Disk should
-    // contain only the first record (or none, depending on whether
-    // the buffer flushed before the error fired; we don't assert).
-    let (result, _td) = drive_real_fs(
+fn append_mode_real_sink_keeps_source_holes() {
+    // Source skips from 0 to 5 (a compaction hole or a transaction
+    // marker): the loop and the append-mode sink accept it, and the
+    // file covers positions 0-5 with the two records.
+    let (result, tempdir) = drive_real_fs(
         None,
         vec![
             MockSourceEvent::Record(rec(0)),
             MockSourceEvent::Record(rec(5)),
+            MockSourceEvent::Hang,
         ],
-        Duration::from_secs(1),
+        Duration::from_millis(100),
     );
-    match result {
-        Err(MirrorError::SourceGapAboveExpected { expected, got }) => {
-            assert_eq!((expected, got), (1, 5));
-        }
-        other => panic!("expected SourceGapAboveExpected, got {other:?}"),
-    }
+    assert!(matches!(result, Ok(())), "got {result:?}");
+    let dir = naming::partition_dir(tempdir.path(), "ops", 0);
+    let records = read_all_records(&dir, Format::Ndjson).expect("read disk");
+    assert_eq!(
+        records.iter().map(|r| r.source_offset).collect::<Vec<_>>(),
+        vec![0, 5]
+    );
+    assert!(dir.join(naming::batch_filename(0, 5, "ndjson")).exists());
 }
 
 #[test]

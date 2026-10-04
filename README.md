@@ -174,6 +174,7 @@ docker run --rm -v "$PWD/examples:/cfg" mirror-v3:dev validate --config /cfg/kaf
 - **VersityGW specifically:** `If-None-Match: *` is silently ignored (v1.4.1, POSIX backend, verified in e2e), so the deployment guarantee is the *only* atomicity layer for the cross-process race. AWS S3 honors `If-None-Match: *` and gives API-level atomicity on top of the deployment guarantee.
 - **Any unrecoverable error in any mirror exits the entire process.** Restart correctness is the recovery mechanism; supervision belongs to the orchestrator.
 - **For blob destinations, a `(from, to)` filename/key is the durable "offset"** — atomic rename (FS) or single-shot `PutObject` (S3) makes it visible. The destination listing is the source of truth on startup.
+- **Offset holes.** Kafka leaves holes in a partition's offsets where compaction removed records and at transaction markers. A blob object covers consumer positions: `from` is the previous object's `to` + 1 and `to` is the last record it holds, so the chain of names stays contiguous across holes and each record carries its true offset. A Kafka destination cannot reproduce a hole (its next offset is always its high watermark), so a hole in its source ends the mirror with an error saying so: mirror such topics to blobs. A position the broker no longer has (retention deleted records the mirror never read) is an error, never a jump to the earliest offset.
 
 ## Readiness
 

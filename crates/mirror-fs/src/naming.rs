@@ -1,8 +1,9 @@
 //! File naming convention for blob destinations.
 //!
 //! Each flush produces one file named `<from>-<to>.<ext>`, where
-//! `from` is the source offset of the first record in the batch and
-//! `to` is the source offset of the last record. Both are
+//! `from` is the previous file's `to` + 1 (0 for the first) and `to`
+//! is the source offset of the last record in the batch: the file
+//! covers those consumer positions, offset holes included. Both are
 //! zero-padded so lexicographic ordering matches numeric ordering up
 //! to ~9 × 10^18 records per partition (more than Kafka allows).
 //!
