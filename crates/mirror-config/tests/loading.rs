@@ -645,8 +645,10 @@ mirrors:
     );
 }
 
+/// The cache is built from the source, so a mirror whose only
+/// destination is Kafka may serve one too.
 #[test]
-fn http_access_forbidden_for_kafka_only_mirrors() {
+fn http_access_allowed_on_kafka_only_mirrors() {
     let yaml = r#"
 mirrors:
   - name: operations
@@ -659,12 +661,8 @@ mirrors:
     http-access:
       cache-v1: {}
 "#;
-    let err = load_from_str(yaml).expect_err("http-access on kafka-only mirror must be rejected");
-    let msg = format!("{err}");
-    assert!(
-        msg.contains("http-access") && msg.contains("filesystem/s3"),
-        "got: {msg}"
-    );
+    let cfg = load_from_str(yaml).expect("http-access with a kafka destination");
+    assert!(cfg.mirrors[0].http_access.is_some());
 }
 
 #[test]

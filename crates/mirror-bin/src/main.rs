@@ -790,9 +790,9 @@ async fn spawn_mirror(
     // Build one inner Sink per destination, then wrap them in a tee.
     // The single-destination case routes through a length-1 tee too -
     // this keeps the cache binding's per-record fanout on a single
-    // code path. A *notify-only* mirror (no destinations + a notify
-    // block, validated upstream) wraps a single in-memory
-    // [`NotifyOnlySink`] in the tee so the rest of the run loop -
+    // code path. A mirror without destinations (a cache, a notify
+    // feed, or both; validated upstream) wraps a single in-memory
+    // [`NoDestinationSink`] in the tee so the rest of the run loop -
     // bootstrap, low-watermark alignment, idle-drift checks - keeps
     // its existing shape.
     let mut inners: Vec<(String, Box<dyn Sink>)> = Vec::with_capacity(
@@ -847,17 +847,16 @@ async fn spawn_mirror(
         inners.push((inner_name, sink));
     }
     if inners.is_empty() {
-        // Notify-only mirror: spec says "On every startup the source
-        // seeks to the broker's low watermark". `NotifyOnlySink`
-        // declares `allows_compacted_source = true` so the run loop's
-        // bootstrap branch aligns the (in-memory) head to
-        // `low_watermark`. The notifier sees every record from there
-        // forward.
+        // No destinations: the source is read from the broker's low
+        // watermark on every startup. `NoDestinationSink` declares
+        // `allows_compacted_source = true` so the run loop's bootstrap
+        // branch aligns its (in-memory) head to `low_watermark`; the
+        // cache and the notifier see every record from there.
         inners.push((
-            "notify-only".to_string(),
-            Box::new(NotifyOnlySink::default()) as Box<dyn Sink>,
+            "none".to_string(),
+            Box::new(NoDestinationSink::default()) as Box<dyn Sink>,
         ));
-        dest_descriptions.push("notify-only".to_string());
+        dest_descriptions.push("none".to_string());
     }
     let mut tee = mirror_core::TeeSink::open(inners, cache.clone())
         .await
@@ -1223,15 +1222,15 @@ fn build_flush_dispatcher(
 /// only its own "next expected offset" and accepts any record at or
 /// above it. `allows_compacted_source = true` so the run loop's
 /// bootstrap branch can align the head to the broker's low
-/// watermark - matching the spec's "seeks to low watermark on every
-/// startup" behaviour for notify-only mirrors.
+/// watermark - the "seeks to low watermark on every startup" behaviour
+/// of mirrors without destinations (caches, notify feeds).
 #[derive(Debug, Default)]
-struct NotifyOnlySink {
+struct NoDestinationSink {
     position: u64,
 }
 
 #[async_trait::async_trait]
-impl Sink for NotifyOnlySink {
+impl Sink for NoDestinationSink {
     async fn next_expected_offset(&mut self) -> Result<u64, SinkError> {
         Ok(self.position)
     }

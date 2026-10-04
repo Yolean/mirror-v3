@@ -445,17 +445,19 @@ mirrors:
     let err = load_from_str(yaml).expect_err("must reject");
     let msg = format!("{err}");
     assert!(
-        msg.contains("notify-only") && msg.contains("source-consume"),
+        msg.contains("without destinations") && msg.contains("source-consume"),
         "got: {msg}"
     );
 }
 
+/// A cache mirror needs no destination: it is built from the source's
+/// low watermark, like kafka-keyvalue. With notify this is kkv's shape.
 #[test]
-fn notify_only_with_http_access_rejected() {
+fn no_destinations_with_cache_and_notify_accepted() {
     let yaml = r#"
 mirrors:
-  - name: invalidator
-    source: { bootstrap-servers: kafka:9092 }
+  - name: userstate
+    source: { bootstrap-servers: kafka:9092, group-id: mirror-v3-userstate }
     topic: events
     partition: 0
     destinations: []
@@ -465,12 +467,22 @@ mirrors:
       targets:
         - url: http://cache-target:8080
 "#;
+    let cfg = load_from_str(yaml).expect("cache + notify without destinations");
+    assert!(cfg.mirrors[0].destinations.is_empty());
+}
+
+#[test]
+fn no_destinations_and_nothing_else_rejected() {
+    let yaml = r#"
+mirrors:
+  - name: idle
+    source: { bootstrap-servers: kafka:9092 }
+    topic: events
+    partition: 0
+    destinations: []
+"#;
     let err = load_from_str(yaml).expect_err("must reject");
-    let msg = format!("{err}");
-    assert!(
-        msg.contains("notify-only") && msg.contains("http-access"),
-        "got: {msg}"
-    );
+    assert!(format!("{err}").contains("at least one entry"), "{err}");
 }
 
 #[test]
@@ -491,7 +503,7 @@ mirrors:
     let err = load_from_str(yaml).expect_err("must reject");
     let msg = format!("{err}");
     assert!(
-        msg.contains("notify-only") && msg.contains("format"),
+        msg.contains("without destinations") && msg.contains("format"),
         "got: {msg}"
     );
 }
@@ -517,7 +529,7 @@ mirrors:
     let err = load_from_str(yaml).expect_err("must reject");
     let msg = format!("{err}");
     assert!(
-        msg.contains("notify-only") && msg.contains("flush"),
+        msg.contains("without destinations") && msg.contains("flush"),
         "got: {msg}"
     );
 }
@@ -537,10 +549,7 @@ mirrors:
 "#;
     let err = load_from_str(yaml).expect_err("must reject");
     let msg = format!("{err}");
-    assert!(
-        msg.contains("notify-only") && msg.contains("targets"),
-        "got: {msg}"
-    );
+    assert!(msg.contains("notify.targets"), "got: {msg}");
 }
 
 // ============================================================

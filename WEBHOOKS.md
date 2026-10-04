@@ -503,9 +503,10 @@ When `destinations` is empty:
   are forbidden; they all parameterise destinations that don't
   exist. (`keys`/`values` may stay as a future opt-in for key/value
   validation on the source; out of scope for MVP.)
-- `http-access` is forbidden for now. (Caches no longer bootstrap
-  from destination state but from the source's low watermark, so
-  this restriction is about to go; see README "Bootstrap".)
+- `http-access` is allowed: a cache is built from the source's low
+  watermark (README "Bootstrap"), so notify + `http-access` without
+  destinations is kafka-keyvalue's shape. With `http-access`, notify
+  requires `cache-v1-main` as on any other mirror.
 
 When `destinations` is non-empty AND `notify` is set: no change
 from the rules already specified; both `trigger.on` values are

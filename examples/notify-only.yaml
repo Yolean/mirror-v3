@@ -12,11 +12,14 @@
 # add a small filesystem destination for resume-from-offset.
 #
 # Validator rules in mirror-config (see WEBHOOKS.md § Validation):
-#   * destinations may be empty IFF notify is set with ≥1 target;
+#   * destinations may be empty IFF notify or http-access is set;
 #   * trigger.on MUST be source-consume (destination-flush has no
 #     destinations to ack);
-#   * format / compression / compaction / flush / http-access are all
+#   * format / compression / keys / values / compaction / flush are
 #     forbidden; they parameterise destinations that don't exist.
+#   * add `http-access: { cache-v1: {}, cache-v1-main: {} }` and this is
+#     kafka-keyvalue's shape: a cache built from the topic plus the
+#     onupdate webhooks.
 
 mirrors:
   - name: events-invalidator

@@ -930,22 +930,14 @@ fn validate_mirror(m: &Mirror) -> Result<(), LoadError> {
     // skipped (everything destination-shaped) or applied with
     // tighter restrictions (e.g. http-access forbidden).
     if m.destinations.is_empty() {
-        let Some(notify) = m.notify.as_ref() else {
-            return Err(LoadError::Validation(format!(
-                "mirror {:?}: `destinations` must contain at least one entry, \
-                 unless `notify` is set (notify-only mirrors are allowed)",
-                m.name
-            )));
-        };
-        if notify.targets.is_empty() {
-            return Err(LoadError::Validation(format!(
-                "mirror {:?}: notify-only mirror requires `notify.targets` to be non-empty",
-                m.name
-            )));
-        }
-        return validate_notify_only(m, notify);
+        validate_no_destinations(m)?;
+    } else {
+        validate_destinations(m)?;
     }
+    validate_http_and_notify(m)
+}
 
+fn validate_destinations(m: &Mirror) -> Result<(), LoadError> {
     // Per-destination identifiers: explicit `name` is required when a
     // mirror has more than one destination (otherwise the default
     // `mirror.name` would collide). With exactly one destination,
@@ -980,10 +972,6 @@ fn validate_mirror(m: &Mirror) -> Result<(), LoadError> {
             ("compression", m.compression.is_some()),
             ("compaction", m.compaction.is_some()),
             ("flush", m.flush.is_some()),
-            (
-                "http-access",
-                m.http_access.as_ref().is_some_and(HttpAccess::any_enabled),
-            ),
         ] {
             if present {
                 return Err(LoadError::Validation(format!(
@@ -1028,17 +1016,23 @@ fn validate_mirror(m: &Mirror) -> Result<(), LoadError> {
                 )));
             }
         }
-        if m.http_access.as_ref().is_some_and(HttpAccess::any_enabled)
-            && matches!(keys.kind, ColumnType::Bytes)
-        {
-            return Err(LoadError::Validation(format!(
-                "mirror {:?}: `http-access` requires `keys.type` ∈ {{utf8, json, json-parseable}}; \
-                 /cache/v1 routes keys through URL path segments",
-                m.name
-            )));
-        }
     }
+    if m.http_access.as_ref().is_some_and(HttpAccess::any_enabled)
+        && m.keys.is_some_and(|k| matches!(k.kind, ColumnType::Bytes))
+    {
+        return Err(LoadError::Validation(format!(
+            "mirror {:?}: `http-access` requires `keys.type` ∈ {{utf8, json, json-parseable}}; \
+             /cache/v1 routes keys through URL path segments",
+            m.name
+        )));
+    }
+    Ok(())
+}
 
+/// `http-access` and `notify`, whatever the destinations. A cache is
+/// built from the source (its low watermark), so it needs no
+/// destination.
+fn validate_http_and_notify(m: &Mirror) -> Result<(), LoadError> {
     if let Some(http) = m.http_access.as_ref() {
         // `cache-v1-main` mounts the unprefixed /cache/v1/... routes
         // onto this mirror's per-mirror view; it has no value without
@@ -1068,6 +1062,11 @@ fn validate_mirror(m: &Mirror) -> Result<(), LoadError> {
     // notify body says "go re-read via /cache/v1/raw/<key>". That's
     // only meaningful when the per-mirror `cache-v1` API is enabled.
     if let Some(notify) = m.notify.as_ref() {
+        let has_http = m.http_access.as_ref().is_some_and(HttpAccess::any_enabled);
+        if m.destinations.is_empty() && !has_http {
+            // The notify-only shape (WEBHOOKS.md): no store at all.
+            return validate_notify_shared(m, notify);
+        }
         // kkv-v1 consumers (the Node client, gateway's Go client)
         // re-read every notified key from the unprefixed
         // /cache/v1/raw/{key}, which only `cache-v1-main` mounts; with
@@ -1195,11 +1194,18 @@ fn validate_notify_shared(m: &Mirror, notify: &Notify) -> Result<(), LoadError> 
     Ok(())
 }
 
-/// Extra restrictions on top of [`validate_notify_shared`] when the
-/// mirror has no destinations: notify is the only side-effect, so
-/// destination-shaped fields are all forbidden, http-access is
-/// forbidden, and trigger.on must be source-consume.
-fn validate_notify_only(m: &Mirror, notify: &Notify) -> Result<(), LoadError> {
+/// A mirror without destinations is a cache (`http-access`), a notify
+/// feed (`notify`), or both. Destination-shaped fields have nothing to
+/// apply to, and `destination-flush` has no destination to wait for.
+fn validate_no_destinations(m: &Mirror) -> Result<(), LoadError> {
+    let has_http = m.http_access.as_ref().is_some_and(HttpAccess::any_enabled);
+    if m.notify.is_none() && !has_http {
+        return Err(LoadError::Validation(format!(
+            "mirror {:?}: `destinations` must contain at least one entry, unless the mirror \
+             serves a cache (`http-access`) or notifies (`notify`)",
+            m.name
+        )));
+    }
     for (field, present) in [
         ("format", m.format.is_some()),
         ("compression", m.compression.is_some()),
@@ -1208,27 +1214,25 @@ fn validate_notify_only(m: &Mirror, notify: &Notify) -> Result<(), LoadError> {
         ("compaction", m.compaction.is_some()),
         ("flush", m.flush.is_some()),
         ("timestamp-mode", m.timestamp_mode.is_some()),
-        (
-            "http-access",
-            m.http_access.as_ref().is_some_and(HttpAccess::any_enabled),
-        ),
     ] {
         if present {
             return Err(LoadError::Validation(format!(
-                "mirror {:?}: notify-only mirrors (no destinations) cannot set `{field}`; \
+                "mirror {:?}: a mirror without destinations cannot set `{field}`; \
                  there is nothing for it to apply to",
                 m.name
             )));
         }
     }
-    if matches!(notify.trigger.on, TriggerOn::DestinationFlush) {
-        return Err(LoadError::Validation(format!(
-            "mirror {:?}: notify-only mirrors must use `trigger.on: source-consume` \
-             (no destinations to flush)",
-            m.name
-        )));
+    if let Some(notify) = m.notify.as_ref() {
+        if matches!(notify.trigger.on, TriggerOn::DestinationFlush) {
+            return Err(LoadError::Validation(format!(
+                "mirror {:?}: a mirror without destinations must use `trigger.on: source-consume` \
+                 (no destinations to flush)",
+                m.name
+            )));
+        }
     }
-    validate_notify_shared(m, notify)
+    Ok(())
 }
 
 fn raw_destination_name(d: &Destination) -> Option<&str> {
