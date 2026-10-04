@@ -484,6 +484,27 @@ impl KafkaSinkConfig {
     }
 }
 
+/// Producer settings for the Kafka destination. The high-watermark gate
+/// before each produce is the only retry: a produce that fails, or whose
+/// ack is lost, ends the mirror, and the restart re-reads the
+/// destination's high watermark, so a record that did land is not
+/// produced again and one that did not is produced once. librdkafka's own
+/// retries sit beneath the gate and cannot see it: a lost ack plus a
+/// retry writes the record twice, and the restart then skips the next
+/// source record. So `message.send.max.retries=0`.
+/// `acks=all`, idempotence off and one request in flight are the legacy
+/// Java worker's settings (MirrorProducer.java): the deployment that this
+/// replaces chose them, and the gate makes ordering explicit.
+fn producer_config(bootstrap_servers: &str) -> ClientConfig {
+    let mut cfg = ClientConfig::new();
+    cfg.set("bootstrap.servers", bootstrap_servers)
+        .set("acks", "all")
+        .set("enable.idempotence", "false")
+        .set("max.in.flight.requests.per.connection", "1")
+        .set("message.send.max.retries", "0");
+    cfg
+}
+
 pub struct KafkaSink {
     producer: FutureProducer,
     watermark_consumer: Arc<BaseConsumer>,
@@ -502,13 +523,7 @@ pub struct KafkaSink {
 
 impl KafkaSink {
     pub fn open(cfg: KafkaSinkConfig) -> Result<Self, KafkaError> {
-        let producer: FutureProducer = ClientConfig::new()
-            .set("bootstrap.servers", &cfg.bootstrap_servers)
-            .set("acks", "all")
-            // The gate is what enforces ordering; idempotence not needed
-            // and incompatible with the offset-equality assertion.
-            .set("enable.idempotence", "false")
-            .set("max.in.flight.requests.per.connection", "1")
+        let producer: FutureProducer = producer_config(&cfg.bootstrap_servers)
             .create()
             .map_err(|e| KafkaError::Init(e.to_string()))?;
         let watermark_consumer: BaseConsumer = ClientConfig::new()
@@ -654,6 +669,18 @@ pub enum KafkaError {
 #[cfg(test)]
 mod tests {
     use rdkafka::config::ClientConfig;
+
+    #[test]
+    fn producer_never_retries_beneath_the_gate() {
+        let native = super::producer_config("localhost:9092")
+            .create_native_config()
+            .expect("native config");
+        let get = |k: &str| native.get(k).expect(k);
+        assert_eq!(get("message.send.max.retries"), "0");
+        assert_eq!(get("enable.idempotence"), "false");
+        assert_eq!(get("acks"), "-1", "acks=all");
+        assert_eq!(get("max.in.flight.requests.per.connection"), "1");
+    }
 
     /// Producers on the topics we mirror compress batches with gzip or
     /// zstd (Java and Quarkus defaults). A librdkafka built without
