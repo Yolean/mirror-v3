@@ -32,7 +32,7 @@ All logs go to **stderr** (heartbeat, flush lines, errors). `stdout` is reserved
 
 ### `/metrics` (Prometheus)
 
-`mirror-v3 run` starts an HTTP server on `0.0.0.0:9090` that serves Prometheus-format metrics at `/metrics`. Override the port with `MIRROR_V3_METRICS_PORT=<port>`; set to `0` to disable the endpoint entirely. A bind failure (port in use) is logged at warn level and is non-fatal — the mirror keeps running, just unmonitored.
+`mirror-v3 run` starts an HTTP server on `0.0.0.0:9090` that serves Prometheus-format metrics at `/metrics`. Override the port with `MIRROR_V3_METRICS_PORT=<port>`. A bind failure (port in use) is a startup error. Every `MIRROR_V3_*` variable is read once at startup; unset means its default, and a value that does not parse is a startup error naming it.
 
 Every metric carries `topic="<source-topic>"` and `partition="<n>"` labels so they join cleanly with broker-side exporters (`kafka_exporter`, `kafka-lag-exporter`). The mirror's `name` is logged but is **not** a metric label — it's operator-chosen metadata, not a data-stream dimension.
 

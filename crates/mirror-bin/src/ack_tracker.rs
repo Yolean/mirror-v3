@@ -30,8 +30,6 @@ use mirror_core::{AckSink, FlushObserver, WriteObserver};
 use mirror_kafka::KafkaCommitHandle;
 use tokio::sync::watch;
 
-const DEFAULT_COMMIT_INTERVAL: Duration = Duration::from_secs(5);
-
 /// How long an unchanged offset may go without a re-commit. The
 /// consumer uses `assign()` (no group membership), so the broker
 /// sees the group as permanently empty and expires its offset after
@@ -42,24 +40,6 @@ const DEFAULT_COMMIT_INTERVAL: Duration = Duration::from_secs(5);
 /// retention clock; hourly is cheap (one broker round-trip) and two
 /// orders of magnitude inside the default retention window.
 const COMMIT_REFRESH_INTERVAL: Duration = Duration::from_secs(3600);
-
-/// Read the commit interval from `MIRROR_V3_OFFSET_COMMIT_INTERVAL_MS`,
-/// falling back to [`DEFAULT_COMMIT_INTERVAL`]. A value of `0`
-/// disables the periodic task (the supervisor then never advances
-/// the broker-side committed offset and the mirror behaves as it did
-/// before this work).
-pub fn commit_interval_from_env() -> Duration {
-    match std::env::var("MIRROR_V3_OFFSET_COMMIT_INTERVAL_MS")
-        .ok()
-        .as_deref()
-    {
-        Some(s) => match s.parse::<u64>() {
-            Ok(ms) => Duration::from_millis(ms),
-            Err(_) => DEFAULT_COMMIT_INTERVAL,
-        },
-        None => DEFAULT_COMMIT_INTERVAL,
-    }
-}
 
 /// One destination's ack slot. Held by both the supervisor (in the
 /// [`AckTracker`]) and by the shim observer installed on the

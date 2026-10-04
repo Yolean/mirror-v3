@@ -7,22 +7,19 @@ use clap::{Parser, Subcommand};
 use mirror_config::{Destination, HttpAccess, Mirror};
 
 mod ack_tracker;
+mod knobs;
 mod readiness_poller;
 use ack_tracker::{
-    commit_interval_from_env, final_commit, spawn_periodic_commit_task, AckTracker, DestAckSlot,
-    FlushAckShim, WriteAckShim,
+    final_commit, spawn_periodic_commit_task, AckTracker, DestAckSlot, FlushAckShim, WriteAckShim,
 };
+use knobs::Knobs;
 use mirror_core::{
-    heartbeat_interval_from_env, run_mirror_with_notifier, MetricLabels, NoOpNotifier, Record,
-    Sink, SinkError, MIRROR_LABELS,
+    run_mirror_with_notifier, MetricLabels, NoOpNotifier, Record, Sink, SinkError, MIRROR_LABELS,
 };
 use mirror_fs::{FilesystemSink, FilesystemSinkConfig};
 use mirror_kafka::{KafkaSink, KafkaSinkConfig, KafkaSource, KafkaSourceConfig};
 use mirror_s3::{S3Sink, S3SinkConfig};
-use readiness_poller::{
-    readiness_lag_tolerance_from_env, readiness_poll_interval_from_env, spawn_readiness_poller,
-    PollSpec,
-};
+use readiness_poller::{spawn_readiness_poller, PollSpec};
 use tracing::Instrument;
 use tracing_subscriber::EnvFilter;
 
@@ -422,6 +419,7 @@ fn print_status_table(rows: &[StatusRow]) {
 async fn run(path: PathBuf) -> Result<()> {
     let cfg = mirror_config::load_from_path(&path)
         .with_context(|| format!("loading {}", path.display()))?;
+    let knobs = Knobs::from_env()?;
 
     // Drop disabled mirrors before anything else so the cache state,
     // readiness gate and spawn loop only see what we'll actually run.
@@ -451,13 +449,10 @@ async fn run(path: PathBuf) -> Result<()> {
         destinations = total_destinations,
         "starting mirror-v3"
     );
-    install_metrics_exporter();
+    install_metrics_exporter(knobs.metrics_port)?;
 
-    // One shutdown channel, cloned per mirror. Listening for Ctrl-C
-    // here means SIGINT triggers graceful flush; in containers,
-    // SIGTERM will arrive on the same path because tokio's
-    // ctrl_c handler is the platform's INT handler - for full SIGTERM
-    // support a unix-signals branch can be added next.
+    // One shutdown channel, cloned per mirror. SIGINT and SIGTERM
+    // trigger a graceful flush.
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let signal_tx = shutdown_tx.clone();
     tokio::spawn(async move {
@@ -469,15 +464,15 @@ async fn run(path: PathBuf) -> Result<()> {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{signal, SignalKind};
-        if let Ok(mut sigterm) = signal(SignalKind::terminate()) {
-            let term_tx = shutdown_tx.clone();
-            tokio::spawn(async move {
-                if sigterm.recv().await.is_some() {
-                    tracing::info!("received SIGTERM; requesting graceful shutdown");
-                    let _ = term_tx.send(true);
-                }
-            });
-        }
+        let mut sigterm =
+            signal(SignalKind::terminate()).context("installing the SIGTERM handler")?;
+        let term_tx = shutdown_tx.clone();
+        tokio::spawn(async move {
+            if sigterm.recv().await.is_some() {
+                tracing::info!("received SIGTERM; requesting graceful shutdown");
+                let _ = term_tx.send(true);
+            }
+        });
     }
 
     // Every *enabled* mirror gets a `CacheState` slot, regardless of
@@ -496,7 +491,7 @@ async fn run(path: PathBuf) -> Result<()> {
     let cache_state = if enabled_mirrors.is_empty() {
         None
     } else {
-        let tolerance = readiness_lag_tolerance_from_env();
+        let tolerance = knobs.readiness_lag;
         let state = std::sync::Arc::new(
             mirror_core::CacheState::new().with_readiness_lag_tolerance(tolerance),
         );
@@ -540,38 +535,40 @@ async fn run(path: PathBuf) -> Result<()> {
     let wants_http_routes = enabled_mirrors
         .iter()
         .any(|m| m.http_access.as_ref().is_some_and(HttpAccess::any_enabled));
+    let mut handles = Vec::with_capacity(enabled_mirrors.len() + 1);
     if let (Some(state), true) = (cache_state.as_ref(), wants_http_routes) {
-        let addr = cache_listen_addr();
+        let addr = std::net::SocketAddr::from(([0, 0, 0, 0], knobs.cache_port));
         let state = std::sync::Arc::clone(state);
         let cache_shutdown_rx = shutdown_rx.clone();
         let cache_shutdown_tx = shutdown_tx.clone();
-        tokio::spawn(async move {
-            let signal = shutdown_signal(cache_shutdown_rx);
-            match mirror_cache::serve(addr, state, signal).await {
-                Ok(_code) => {
-                    // Admin shutdown signalled. Propagate to the
-                    // mirror loops so the whole process exits.
-                    let _ = cache_shutdown_tx.send(true);
-                }
-                Err(e) => {
-                    tracing::error!(error = %e, "cache HTTP server failed");
-                    let _ = cache_shutdown_tx.send(true);
-                }
-            }
-        });
+        // The server is waited for like a mirror: its failure (a port
+        // in use) ends the process non-zero, where it used to request a
+        // graceful shutdown and exit 0.
+        handles.push((
+            "cache-http".to_string(),
+            tokio::spawn(async move {
+                let signal = shutdown_signal(cache_shutdown_rx);
+                let result = mirror_cache::serve(addr, state, signal).await;
+                // Admin shutdown, or our own: stop the mirrors too.
+                let _ = cache_shutdown_tx.send(true);
+                result
+                    .map(|_code| ())
+                    .map_err(|e| anyhow::anyhow!("cache HTTP server: {e}"))
+            }),
+        ));
     }
 
-    let mut handles = Vec::with_capacity(enabled_mirrors.len());
     for mirror in &enabled_mirrors {
         let binding = mirror_cache_binding(mirror, cache_state.as_ref());
         let handle = if restarts_in_process(mirror) {
             tokio::spawn(supervise_in_process(
                 (*mirror).clone(),
+                knobs.clone(),
                 shutdown_rx.clone(),
                 binding,
             ))
         } else {
-            spawn_mirror((*mirror).clone(), shutdown_rx.clone(), binding).await?
+            spawn_mirror((*mirror).clone(), &knobs, shutdown_rx.clone(), binding).await?
         };
         handles.push((mirror.name.clone(), handle));
     }
@@ -646,19 +643,21 @@ const RESTART_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(
 /// logged as an error and counted in `mirror_v3_mirror_restarts_total`.
 async fn supervise_in_process(
     mirror: Mirror,
+    knobs: Knobs,
     shutdown_rx: tokio::sync::watch::Receiver<bool>,
     cache: Option<mirror_core::CacheBinding>,
 ) -> Result<()> {
     let mut backoff = RESTART_BACKOFF_MIN;
     loop {
         let started = std::time::Instant::now();
-        let result = match spawn_mirror(mirror.clone(), shutdown_rx.clone(), cache.clone()).await {
-            Ok(handle) => match handle.await {
-                Ok(r) => r,
-                Err(join) => Err(anyhow::anyhow!("task join: {join}")),
-            },
-            Err(e) => Err(e),
-        };
+        let result =
+            match spawn_mirror(mirror.clone(), &knobs, shutdown_rx.clone(), cache.clone()).await {
+                Ok(handle) => match handle.await {
+                    Ok(r) => r,
+                    Err(join) => Err(anyhow::anyhow!("task join: {join}")),
+                },
+                Err(e) => Err(e),
+            };
         let err = match result {
             Ok(()) => return Ok(()),
             Err(e) => e,
@@ -687,16 +686,6 @@ async fn supervise_in_process(
         }
         backoff = (backoff * 2).min(RESTART_BACKOFF_MAX);
     }
-}
-
-/// Pick the listen address for the cache HTTP server. Defaults to
-/// 0.0.0.0:8080, overridable via `MIRROR_V3_CACHE_PORT`.
-fn cache_listen_addr() -> std::net::SocketAddr {
-    let port = std::env::var("MIRROR_V3_CACHE_PORT")
-        .ok()
-        .and_then(|s| s.parse::<u16>().ok())
-        .unwrap_or(8080);
-    std::net::SocketAddr::from(([0, 0, 0, 0], port))
 }
 
 /// Materialise a `CacheBinding` for the given mirror. Every enabled
@@ -800,32 +789,21 @@ async fn shutdown_signal(mut rx: tokio::sync::watch::Receiver<bool>) {
     let _ = rx.changed().await;
 }
 
-/// Install the Prometheus exporter on `0.0.0.0:<port>`. Port defaults
-/// to 9090; override with `MIRROR_V3_METRICS_PORT` (set to `0` to
-/// disable). A failure to bind logs at warn level and is non-fatal -
-/// the operator's observability story degrades, but the mirror keeps
-/// running.
-fn install_metrics_exporter() {
-    let port = std::env::var("MIRROR_V3_METRICS_PORT")
-        .ok()
-        .and_then(|s| s.parse::<u16>().ok())
-        .unwrap_or(9090);
-    if port == 0 {
-        tracing::info!("metrics exporter disabled (MIRROR_V3_METRICS_PORT=0)");
-        return;
-    }
+/// Install the Prometheus exporter on `0.0.0.0:<port>`. A failure is a
+/// startup error: an unmonitored mirror is not running as configured.
+fn install_metrics_exporter(port: u16) -> Result<()> {
     let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
-    match metrics_exporter_prometheus::PrometheusBuilder::new()
+    metrics_exporter_prometheus::PrometheusBuilder::new()
         .with_http_listener(addr)
         .install()
-    {
-        Ok(()) => tracing::info!(%addr, "metrics exporter listening on /metrics"),
-        Err(e) => tracing::warn!(error = %e, %addr, "metrics exporter failed; continuing"),
-    }
+        .with_context(|| format!("installing the metrics exporter on {addr}"))?;
+    tracing::info!(%addr, "metrics exporter listening on /metrics");
+    Ok(())
 }
 
 async fn spawn_mirror(
     mirror: Mirror,
+    knobs: &Knobs,
     shutdown_rx: tokio::sync::watch::Receiver<bool>,
     cache: Option<mirror_core::CacheBinding>,
 ) -> Result<tokio::task::JoinHandle<Result<()>>> {
@@ -1070,7 +1048,7 @@ async fn spawn_mirror(
     let commit_task = spawn_periodic_commit_task(
         commit_handle,
         Arc::clone(&ack_tracker),
-        commit_interval_from_env(),
+        knobs.commit_interval,
         name.clone(),
         shutdown_rx.clone(),
     );
@@ -1090,7 +1068,7 @@ async fn spawn_mirror(
                 commit_handle: commit_handle_for_poller,
                 cache: Arc::clone(&binding.state),
             },
-            readiness_poll_interval_from_env(),
+            knobs.readiness_poll,
             shutdown_rx.clone(),
         ));
     } else {
@@ -1118,6 +1096,7 @@ async fn spawn_mirror(
     // access to the operator-chosen mirror name. MIRROR_LABELS still
     // carries topic+partition for metric labeling separately.
     let span = tracing::info_span!("mirror", name = %name);
+    let knobs_heartbeat = knobs.heartbeat;
     Ok(tokio::spawn(
         async move {
             tracing::info!(
@@ -1126,7 +1105,7 @@ async fn spawn_mirror(
                 notify = %notify_log,
                 "loop start"
             );
-            let heartbeat = heartbeat_interval_from_env();
+            let heartbeat = knobs_heartbeat;
             let shutdown = shutdown_signal(shutdown_rx);
             // Match-on-notifier so the generic `N: Notifier`
             // monomorphises with the right concrete type per branch
