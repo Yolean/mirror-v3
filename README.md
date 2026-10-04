@@ -61,7 +61,7 @@ kafka_topic_partition_current_offset
 
 A minimal PodMonitor for the checkit chart points at port 9090; the standard process metrics (`process_cpu_*`, `process_open_fds`, …) are also exposed by the exporter.
 
-`run` spawns one task per mirror, each pinned to one `(topic, partition)`. SIGINT/SIGTERM trigger a graceful shutdown that flushes any buffered records on Filesystem and S3 sinks before exiting zero. Any task failure collapses the whole process with a non-zero exit — the orchestrator (k8s) is expected to restart it.
+`run` spawns one task per mirror, each pinned to one `(topic, partition)`. SIGINT/SIGTERM trigger a graceful shutdown that waits for every mirror to flush its buffered records before exiting zero. A failure of a mirror with a cache (`http-access`) or `notify` ends the whole process with a non-zero exit, and the orchestrator (k8s) restarts it; a mirror with neither is opened again inside the process after a backoff (1 s doubling to 60 s, `mirror_v3_mirror_restarts_total`), since it holds no state but its destinations, so a destination outage does not take the process's caches down.
 
 ### `/cache/v1` (drop-in for `Yolean/kafka-keyvalue`)
 
@@ -200,7 +200,7 @@ docker run --rm -v "$PWD/examples:/cfg" mirror-v3:dev validate --config /cfg/kaf
     1. **Destination races.** Two writers will race on destination naming and trip the corrupt-chain detector on the next restart.
     2. **Source-side coordination.** mirror-v3 uses `assign()` instead of `subscribe()` for its Kafka consumer, so there is no consumer-group coordinator deciding which pod owns the partition. Two pods up at once would both consume the same partition and race the consumer-offset commit log.
 - **VersityGW specifically:** `If-None-Match: *` is silently ignored (v1.4.1, POSIX backend, verified in e2e), so the deployment guarantee is the *only* atomicity layer for the cross-process race. AWS S3 honors `If-None-Match: *` and gives API-level atomicity on top of the deployment guarantee.
-- **Any unrecoverable error in any mirror exits the entire process.** Restart correctness is the recovery mechanism; supervision belongs to the orchestrator.
+- **An unrecoverable error ends its mirror.** Restart correctness is the recovery mechanism: a cache or notify mirror ends the process (the orchestrator restarts it), a destination-only mirror is reopened in the process after a backoff. Either way the position comes from the destination again.
 - **For blob destinations, a `(from, to)` filename/key is the durable "offset"** — atomic rename (FS) or single-shot `PutObject` (S3) makes it visible. The destination listing is the source of truth on startup.
 - **Offset holes.** Kafka leaves holes in a partition's offsets where compaction removed records and at transaction markers. A blob object covers consumer positions: `from` is the previous object's `to` + 1 and `to` is the last record it holds, so the chain of names stays contiguous across holes and each record carries its true offset. A Kafka destination cannot reproduce a hole (its next offset is always its high watermark), so a hole in its source ends the mirror with an error saying so: mirror such topics to blobs. A position the broker no longer has (retention deleted records the mirror never read) is an error, never a jump to the earliest offset.
 
