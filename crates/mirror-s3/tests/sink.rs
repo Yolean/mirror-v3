@@ -28,7 +28,8 @@ fn cfg(store: Arc<dyn ObjectStore>, max_offsets: u64) -> S3SinkConfig {
     // Tests use ndjson for ergonomic byte-level assertions; the
     // parquet path is covered by mirror-envelope round-trip tests.
     S3SinkConfig {
-        store,
+        read_store: Arc::clone(&store),
+        write_store: store,
         prefix: Some(Path::from("archive")),
         destination_name: "ops".into(),
         partition: 0,
@@ -149,7 +150,8 @@ async fn put_mode_create_rejects_overwrite() {
     // at offset 0:
     let store2: Arc<dyn ObjectStore> = Arc::clone(&store);
     let mut competitor = S3Sink::open(S3SinkConfig {
-        store: store2,
+        read_store: Arc::clone(&store2),
+        write_store: store2,
         prefix: Some(Path::from("archive")),
         destination_name: "ops".into(),
         partition: 0,
@@ -223,7 +225,8 @@ async fn corrupt_chain_is_rejected_on_open() {
 
 fn cfg_compacted(store: Arc<dyn ObjectStore>, max_offsets: u64) -> S3SinkConfig {
     S3SinkConfig {
-        store,
+        read_store: Arc::clone(&store),
+        write_store: store,
         prefix: Some(Path::from("archive")),
         destination_name: "ops".into(),
         partition: 0,

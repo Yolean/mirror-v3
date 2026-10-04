@@ -31,7 +31,11 @@ pub use mirror_fs::blob::{CompactionMode, FlushTriggers, UnixClock};
 pub type S3Error = BlobError;
 
 pub struct S3SinkConfig {
-    pub store: Arc<dyn ObjectStore>,
+    /// Lists the prefix (and reads the latest snapshot in compaction
+    /// mode). A least-privilege reading identity may list and read only.
+    pub read_store: Arc<dyn ObjectStore>,
+    /// Writes objects. A least-privilege writing identity may only PutObject.
+    pub write_store: Arc<dyn ObjectStore>,
     /// Path prefix inside the store: `<prefix>/<destination_name>/<partition>/`.
     pub prefix: Option<Path>,
     pub destination_name: String,
@@ -49,16 +53,23 @@ pub struct S3SinkConfig {
     pub flush: FlushTriggers,
 }
 
-/// One partition prefix in an object store.
+/// One partition prefix in an object store, reached with two identities:
+/// one that lists and reads, one that writes.
 pub struct S3Store {
-    store: Arc<dyn ObjectStore>,
+    read: Arc<dyn ObjectStore>,
+    write: Arc<dyn ObjectStore>,
     partition_prefix: Path,
 }
 
 impl S3Store {
-    pub fn new(store: Arc<dyn ObjectStore>, partition_prefix: Path) -> Self {
+    pub fn new(
+        read: Arc<dyn ObjectStore>,
+        write: Arc<dyn ObjectStore>,
+        partition_prefix: Path,
+    ) -> Self {
         Self {
-            store,
+            read,
+            write,
             partition_prefix,
         }
     }
@@ -78,7 +89,7 @@ impl S3Store {
 impl BlobStore for S3Store {
     async fn list(&self) -> Result<Vec<String>, BlobError> {
         let mut names = Vec::new();
-        let mut stream = self.store.list(Some(&self.partition_prefix));
+        let mut stream = self.read.list(Some(&self.partition_prefix));
         while let Some(meta) = stream.next().await {
             let meta = meta.map_err(|e| BlobError::Store(format!("object store: {e}")))?;
             if let Some(name) = meta.location.filename() {
@@ -95,7 +106,7 @@ impl BlobStore for S3Store {
             ..Default::default()
         };
         match self
-            .store
+            .write
             .put_opts(&path, PutPayload::from(Bytes::from(bytes)), opts)
             .await
         {
@@ -111,7 +122,7 @@ impl BlobStore for S3Store {
     async fn get(&self, name: &str) -> Result<Vec<u8>, BlobError> {
         let path = self.path(name);
         let got = self
-            .store
+            .read
             .get(&path)
             .await
             .map_err(|e| BlobError::Store(format!("get {path}: {e}")))?;
@@ -129,9 +140,9 @@ impl BlobStore for S3Store {
     async fn list_after(&self, after: Option<&str>) -> Result<Vec<String>, BlobError> {
         let mut stream = match after {
             Some(name) => self
-                .store
+                .read
                 .list_with_offset(Some(&self.partition_prefix), &self.path(name)),
-            None => self.store.list(Some(&self.partition_prefix)),
+            None => self.read.list(Some(&self.partition_prefix)),
         };
         let mut names = Vec::new();
         while let Some(meta) = stream.next().await {
@@ -164,7 +175,7 @@ impl S3Sink {
             compaction: cfg.compaction,
             flush: cfg.flush,
         };
-        let store = S3Store::new(cfg.store, partition_prefix);
+        let store = S3Store::new(cfg.read_store, cfg.write_store, partition_prefix);
         Ok(Self(BlobSink::open_store(store, spec, clock).await?))
     }
 

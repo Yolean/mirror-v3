@@ -285,6 +285,10 @@
               ],
               "default": null
             },
+            "credentials": {
+              "description": "The identities the destination uses, named by the environment\nvariables that hold their keys (keys never go in the config).",
+              "$ref": "#/$defs/S3Credentials"
+            },
             "affects-readiness": {
               "description": "See [`KafkaDestination::affects_readiness`].",
               "type": "boolean",
@@ -299,9 +303,45 @@
           "required": [
             "type",
             "region",
-            "bucket"
+            "bucket",
+            "credentials"
           ]
         }
+      ]
+    },
+    "S3Credentials": {
+      "description": "Two identities, as a least-privilege bucket setup has them: `write` may\nonly PutObject; `read` lists the prefix (resume position, drift\ncheck) and, in compaction mode, reads the latest snapshot. They may\nname the same variables where one key does both.",
+      "type": "object",
+      "properties": {
+        "write": {
+          "$ref": "#/$defs/S3Key"
+        },
+        "read": {
+          "$ref": "#/$defs/S3Key"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "write",
+        "read"
+      ]
+    },
+    "S3Key": {
+      "type": "object",
+      "properties": {
+        "access-key-id-env": {
+          "description": "Name of the environment variable holding the access key id.",
+          "type": "string"
+        },
+        "secret-access-key-env": {
+          "description": "Name of the environment variable holding the secret access key.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "access-key-id-env",
+        "secret-access-key-env"
       ]
     },
     "DestinationFormat": {

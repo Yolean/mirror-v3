@@ -31,7 +31,8 @@ fn rec(offset: u64) -> Record {
 
 fn cfg(store: Arc<dyn ObjectStore>, max_offsets: u64) -> S3SinkConfig {
     S3SinkConfig {
-        store,
+        read_store: Arc::clone(&store),
+        write_store: store,
         prefix: Some(Path::from("archive")),
         destination_name: "ops".into(),
         partition: 0,

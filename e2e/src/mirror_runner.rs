@@ -264,7 +264,8 @@ pub async fn spawn_kafka_to_tee(spec: TeeMirrorSpec) -> Result<MirrorHandle> {
             }
             TeeInnerSpec::S3(s3) => {
                 let cfg = S3SinkConfig {
-                    store: s3.store,
+                    read_store: Arc::clone(&s3.store),
+                    write_store: s3.store,
                     prefix: s3.prefix,
                     destination_name: s3.name.clone(),
                     partition: spec.partition as u32,
@@ -325,7 +326,8 @@ pub async fn spawn_kafka_to_s3(spec: S3MirrorSpec) -> Result<MirrorHandle> {
     let dest_name = spec.destination_name.clone();
     let cache_for_tee = spec.cache.clone();
     let sink_cfg = S3SinkConfig {
-        store: spec.store,
+        read_store: Arc::clone(&spec.store),
+        write_store: spec.store,
         prefix: spec.prefix,
         destination_name: spec.destination_name,
         partition: spec.partition as u32,

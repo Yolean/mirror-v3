@@ -39,12 +39,18 @@ mirrors:
         name: ${TOPIC}-us
         region: us-east-1
         bucket: ${BUCKET_PREFIX}-us-east-1
+        credentials:
+          write: { access-key-id-env: S3_WRITE_ACCESS_KEY_ID, secret-access-key-env: S3_WRITE_SECRET_ACCESS_KEY }
+          read: { access-key-id-env: S3_READ_ACCESS_KEY_ID, secret-access-key-env: S3_READ_SECRET_ACCESS_KEY }
         endpoint: ${S3_ENDPOINT:-}
         prefix: archive/
       - type: s3
         name: ${TOPIC}-eu
         region: eu-west-1
         bucket: ${BUCKET_PREFIX}-eu-west-1
+        credentials:
+          write: { access-key-id-env: S3_WRITE_ACCESS_KEY_ID, secret-access-key-env: S3_WRITE_SECRET_ACCESS_KEY }
+          read: { access-key-id-env: S3_READ_ACCESS_KEY_ID, secret-access-key-env: S3_READ_SECRET_ACCESS_KEY }
         endpoint: ${S3_ENDPOINT:-}
         prefix: archive/
     format: parquet

@@ -117,6 +117,18 @@ mirrors:
 
 Each mirror declares `destinations: [...]`. With more than one destination, one source consumer fans every record to all destinations through a tee (`mirror_core::TeeSink`) — the source broker is read once per record, and each destination keeps its own end-offset gate and flush cadence. See [`examples/dual-write-fs-and-s3.yaml`](examples/dual-write-fs-and-s3.yaml) for the dual-write pattern.
 
+An S3 destination names two identities by the environment variables holding their keys, as a least-privilege bucket setup has them: `write` may only PutObject, `read` lists the prefix (and reads the latest snapshot in compaction mode). Nothing else in the environment changes the client (no `AWS_*` discovery), and a missing variable is a startup error:
+
+```yaml
+      - type: s3
+        endpoint: http://versitygw.observability-s3:7070
+        region: example-region
+        bucket: mirror-userstate
+        credentials:
+          write: { access-key-id-env: S3_WRITE_ACCESS_KEY_ID, secret-access-key-env: S3_WRITE_SECRET_ACCESS_KEY }
+          read:  { access-key-id-env: S3_READ_ACCESS_KEY_ID,  secret-access-key-env: S3_READ_SECRET_ACCESS_KEY }
+```
+
 More examples: [`examples/`](examples/).
 
 The full schema is committed at [`schemas/mirror-v3.config.schema.json`](schemas/mirror-v3.config.schema.json). Editors with a YAML language server (VS Code's `redhat.vscode-yaml`, Neovim, etc.) pick up the `# yaml-language-server: $schema=…` comment and provide completion + validation as you type.
@@ -135,6 +147,7 @@ mirrors:
       - type: s3
         region: ${AWS_REGION:-us-east-1}
         bucket: ${BUCKET_PREFIX:-yolean-mirror}-${AWS_REGION:-us-east-1}
+        credentials: { write: { … }, read: { … } }
 ```
 
 `${VAR}` is required (fails to start if unset), `${VAR:-default}` falls back to `default`, and `$$` escapes to a literal `$`. Substitution is single-pass — expanded values are not re-scanned. See [`examples/env-interpolation-dual-write.yaml`](examples/env-interpolation-dual-write.yaml) for the DRY pattern across duplicated destinations.

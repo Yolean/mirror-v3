@@ -36,6 +36,9 @@ mirrors:
         name: offsite-archive
         region: us-east-1
         bucket: mirror-v3-offsite
+        credentials:
+          write: { access-key-id-env: S3_WRITE_ACCESS_KEY_ID, secret-access-key-env: S3_WRITE_SECRET_ACCESS_KEY }
+          read: { access-key-id-env: S3_READ_ACCESS_KEY_ID, secret-access-key-env: S3_READ_SECRET_ACCESS_KEY }
         prefix: orders/
     # Shared encoding for all blob destinations in this mirror's tee.
     format: parquet

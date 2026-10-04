@@ -112,9 +112,32 @@ pub struct S3Destination {
     /// Key prefix prepended to all written object keys.
     #[serde(default)]
     pub prefix: Option<String>,
+    /// The identities the destination uses, named by the environment
+    /// variables that hold their keys (keys never go in the config).
+    pub credentials: S3Credentials,
     /// See [`KafkaDestination::affects_readiness`].
     #[serde(default = "default_true")]
     pub affects_readiness: bool,
+}
+
+/// Two identities, as a least-privilege bucket setup has them: `write` may
+/// only PutObject; `read` lists the prefix (resume position, drift
+/// check) and, in compaction mode, reads the latest snapshot. They may
+/// name the same variables where one key does both.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct S3Credentials {
+    pub write: S3Key,
+    pub read: S3Key,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct S3Key {
+    /// Name of the environment variable holding the access key id.
+    pub access_key_id_env: String,
+    /// Name of the environment variable holding the secret access key.
+    pub secret_access_key_env: String,
 }
 
 fn default_true() -> bool {

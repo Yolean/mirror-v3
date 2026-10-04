@@ -40,7 +40,8 @@ fn cfg(store: Arc<dyn ObjectStore>, compaction: Option<CompactionMode>) -> S3Sin
         None => Format::Ndjson,
     };
     S3SinkConfig {
-        store,
+        read_store: Arc::clone(&store),
+        write_store: store,
         prefix: Some(Path::from("archive")),
         destination_name: "ops".into(),
         partition: 0,

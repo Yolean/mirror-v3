@@ -1,7 +1,7 @@
 use mirror_config::{
     load_from_str, CacheV1Config, ColumnConfig, ColumnType, Compaction, Config, Destination,
     DestinationFormat, FilesystemDestination, FlushTriggers, HttpAccess, KafkaDestination,
-    KafkaSource, Mirror, S3Destination, TimestampMode,
+    KafkaSource, Mirror, S3Credentials, S3Destination, S3Key, TimestampMode,
 };
 use std::path::PathBuf;
 
@@ -154,6 +154,9 @@ mirrors:
         endpoint: http://versitygw:7070
         region: us-east-1
         bucket: mirror-v3
+        credentials:
+          write: { access-key-id-env: S3_WRITE_ACCESS_KEY_ID, secret-access-key-env: S3_WRITE_SECRET_ACCESS_KEY }
+          read: { access-key-id-env: S3_READ_ACCESS_KEY_ID, secret-access-key-env: S3_READ_SECRET_ACCESS_KEY }
         prefix: archive/
     flush:
       max-time-ms: 60000
@@ -169,6 +172,16 @@ mirrors:
             region: "us-east-1".into(),
             bucket: "mirror-v3".into(),
             prefix: Some("archive/".into()),
+            credentials: S3Credentials {
+                write: S3Key {
+                    access_key_id_env: "S3_WRITE_ACCESS_KEY_ID".into(),
+                    secret_access_key_env: "S3_WRITE_SECRET_ACCESS_KEY".into(),
+                },
+                read: S3Key {
+                    access_key_id_env: "S3_READ_ACCESS_KEY_ID".into(),
+                    secret_access_key_env: "S3_READ_SECRET_ACCESS_KEY".into(),
+                },
+            },
             affects_readiness: true,
         })
     );
@@ -220,6 +233,9 @@ mirrors:
         name: offsite-archive
         region: us-east-1
         bucket: orders-archive
+        credentials:
+          write: { access-key-id-env: S3_WRITE_ACCESS_KEY_ID, secret-access-key-env: S3_WRITE_SECRET_ACCESS_KEY }
+          read: { access-key-id-env: S3_READ_ACCESS_KEY_ID, secret-access-key-env: S3_READ_SECRET_ACCESS_KEY }
     format: parquet
     flush:
       max-time-ms: 5000
@@ -253,6 +269,9 @@ mirrors:
         endpoint: http://versitygw:7070
         region: us-east-1
         bucket: cache
+        credentials:
+          write: { access-key-id-env: S3_WRITE_ACCESS_KEY_ID, secret-access-key-env: S3_WRITE_SECRET_ACCESS_KEY }
+          read: { access-key-id-env: S3_READ_ACCESS_KEY_ID, secret-access-key-env: S3_READ_SECRET_ACCESS_KEY }
         prefix: archive/
     format: parquet
     compression: zstd-1
@@ -270,6 +289,9 @@ mirrors:
         endpoint: http://versitygw:7070
         region: us-east-1
         bucket: cache
+        credentials:
+          write: { access-key-id-env: S3_WRITE_ACCESS_KEY_ID, secret-access-key-env: S3_WRITE_SECRET_ACCESS_KEY }
+          read: { access-key-id-env: S3_READ_ACCESS_KEY_ID, secret-access-key-env: S3_READ_SECRET_ACCESS_KEY }
         prefix: archive/
     format: parquet
     compression: zstd-1

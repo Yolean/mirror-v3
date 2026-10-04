@@ -382,34 +382,7 @@ async fn query_destination_next(mirror: &Mirror, destination: &Destination) -> R
                 .map_err(|e| anyhow::anyhow!("{e}"))
         }
         Destination::S3(s3) => {
-            let params = resolve_blob_params(mirror)?;
-            let mut builder = object_store::aws::AmazonS3Builder::from_env()
-                .with_region(&s3.region)
-                .with_bucket_name(&s3.bucket);
-            if let Some(endpoint) = &s3.endpoint {
-                builder = builder.with_endpoint(endpoint);
-                if endpoint.starts_with("http://") {
-                    builder = builder.with_allow_http(true);
-                }
-            }
-            let store = builder.build().context("building S3 store")?;
-            let cfg = S3SinkConfig {
-                store: Arc::new(store),
-                prefix: s3.prefix.as_deref().map(object_store::path::Path::from),
-                destination_name: dest_name,
-                partition: mirror.partition,
-                format: params.format,
-                compression: params.compression,
-                keys: params.keys,
-                values: params.values,
-                compaction: compaction_to_s3(mirror.compaction),
-                flush: mirror_s3::FlushTriggers {
-                    max_time: params.flush.max_time,
-                    max_bytes: params.flush.max_bytes,
-                    max_offsets: params.flush.max_offsets,
-                    daily_at_utc_seconds: params.flush.daily_at_utc_seconds,
-                },
-            };
+            let cfg = s3_sink_config(s3, mirror, &dest_name)?;
             let mut sink = S3Sink::open(cfg)
                 .await
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -1368,6 +1341,66 @@ impl Sink for NoDestinationSink {
     }
 }
 
+/// The object store for one S3 identity. Configured explicitly: no
+/// `AWS_*` variable other than the two named in the config changes its
+/// behaviour, and missing keys are an error (from_env() would silently
+/// pick up AWS_CONDITIONAL_PUT and friends, and fall back to instance
+/// metadata probing for credentials).
+fn s3_store(
+    s3: &mirror_config::S3Destination,
+    key: &mirror_config::S3Key,
+) -> Result<Arc<dyn object_store::ObjectStore>> {
+    let env = |name: &str| {
+        std::env::var(name).with_context(|| {
+            format!(
+                "S3 destination bucket {}: environment variable {name} (named in its credentials) is not set",
+                s3.bucket
+            )
+        })
+    };
+    let mut builder = object_store::aws::AmazonS3Builder::new()
+        .with_region(&s3.region)
+        .with_bucket_name(&s3.bucket)
+        .with_access_key_id(env(&key.access_key_id_env)?)
+        .with_secret_access_key(env(&key.secret_access_key_env)?);
+    if let Some(endpoint) = &s3.endpoint {
+        builder = builder.with_endpoint(endpoint);
+        if endpoint.starts_with("http://") {
+            builder = builder.with_allow_http(true);
+        }
+    }
+    let store = builder
+        .build()
+        .with_context(|| format!("building the S3 client for bucket {}", s3.bucket))?;
+    Ok(Arc::new(store))
+}
+
+fn s3_sink_config(
+    s3: &mirror_config::S3Destination,
+    mirror: &Mirror,
+    destination_name: &str,
+) -> Result<S3SinkConfig> {
+    let params = resolve_blob_params(mirror)?;
+    Ok(S3SinkConfig {
+        read_store: s3_store(s3, &s3.credentials.read)?,
+        write_store: s3_store(s3, &s3.credentials.write)?,
+        prefix: s3.prefix.as_deref().map(object_store::path::Path::from),
+        destination_name: destination_name.to_string(),
+        partition: mirror.partition,
+        format: params.format,
+        compression: params.compression,
+        keys: params.keys,
+        values: params.values,
+        compaction: compaction_to_s3(mirror.compaction),
+        flush: mirror_s3::FlushTriggers {
+            max_time: params.flush.max_time,
+            max_bytes: params.flush.max_bytes,
+            max_offsets: params.flush.max_offsets,
+            daily_at_utc_seconds: params.flush.daily_at_utc_seconds,
+        },
+    })
+}
+
 async fn open_inner_sink(
     dest: &Destination,
     mirror: &Mirror,
@@ -1412,39 +1445,7 @@ async fn open_inner_sink(
             Ok(Box::new(sink))
         }
         Destination::S3(s3) => {
-            let params = resolve_blob_params(mirror)?;
-            let mut builder = object_store::aws::AmazonS3Builder::from_env()
-                .with_region(&s3.region)
-                .with_bucket_name(&s3.bucket);
-            if let Some(endpoint) = &s3.endpoint {
-                builder = builder.with_endpoint(endpoint);
-                if endpoint.starts_with("http://") {
-                    builder = builder.with_allow_http(true);
-                }
-            }
-            let store = builder.build().with_context(|| {
-                format!(
-                    "building S3 store for mirror {} destination {inner_name}",
-                    mirror.name
-                )
-            })?;
-            let sink_cfg = S3SinkConfig {
-                store: Arc::new(store),
-                prefix: s3.prefix.as_deref().map(object_store::path::Path::from),
-                destination_name: inner_name.to_string(),
-                partition: mirror.partition,
-                format: params.format,
-                compression: params.compression,
-                keys: params.keys,
-                values: params.values,
-                compaction: compaction_to_s3(mirror.compaction),
-                flush: mirror_s3::FlushTriggers {
-                    max_time: params.flush.max_time,
-                    max_bytes: params.flush.max_bytes,
-                    max_offsets: params.flush.max_offsets,
-                    daily_at_utc_seconds: params.flush.daily_at_utc_seconds,
-                },
-            };
+            let sink_cfg = s3_sink_config(s3, mirror, inner_name)?;
             let sink = S3Sink::open(sink_cfg).await.with_context(|| {
                 format!(
                     "opening s3 sink for mirror {} destination {inner_name}",

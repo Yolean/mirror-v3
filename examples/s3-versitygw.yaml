@@ -27,6 +27,9 @@ mirrors:
         endpoint: http://versitygw.storage.svc.cluster.local:7070
         region: us-east-1
         bucket: mirror-v3
+        credentials:
+          write: { access-key-id-env: S3_WRITE_ACCESS_KEY_ID, secret-access-key-env: S3_WRITE_SECRET_ACCESS_KEY }
+          read: { access-key-id-env: S3_READ_ACCESS_KEY_ID, secret-access-key-env: S3_READ_SECRET_ACCESS_KEY }
         prefix: archive/
     format: parquet
     compression: zstd-1
@@ -49,6 +52,9 @@ mirrors:
         endpoint: http://versitygw.storage.svc.cluster.local:7070
         region: us-east-1
         bucket: mirror-v3
+        credentials:
+          write: { access-key-id-env: S3_WRITE_ACCESS_KEY_ID, secret-access-key-env: S3_WRITE_SECRET_ACCESS_KEY }
+          read: { access-key-id-env: S3_READ_ACCESS_KEY_ID, secret-access-key-env: S3_READ_SECRET_ACCESS_KEY }
         prefix: archive/
     format: parquet
     compression: zstd-1
