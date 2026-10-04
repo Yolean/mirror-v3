@@ -41,7 +41,7 @@ clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "signal"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-rdkafka = { version = "0.39", default-features = false, features = ["cmake-build", "tokio"] }
+rdkafka = { version = "0.39", default-features = false, features = ["cmake-build", "tokio", "libz-static", "zstd"] }
 async-trait = "0.1"
 testcontainers = "0.27"
 portpicker = "0.1"

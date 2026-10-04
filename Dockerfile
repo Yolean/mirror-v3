@@ -11,11 +11,15 @@
 # together.
 
 FROM docker.io/library/rust:1-bookworm@sha256:7d0723df719e7f213b69dc7c8c595985c3f4b060cfbee4f7bc0e347a86fe3b6a AS builder
-# librdkafka 2.12+ unconditionally pulls in libcurl (OIDC support);
-# libssl/libsasl2/libzstd/liblz4 give us full feature support. cmake
-# drives the build, g++/make do the compiling, pkg-config is for
-# library discovery. Keep this list aligned with .github/workflows/ci.yaml's
-# LIBRDKAFKA_BUILD_DEPS so local and CI builds match.
+# rdkafka builds librdkafka from source with cmake (`cmake-build`) and
+# links it statically, with zlib (`libz-static`) and zstd (`zstd`,
+# built by zstd-sys) for gzip- and zstd-compressed topics; snappy and
+# lz4 are librdkafka's own. Without TLS or SASL features the binary
+# needs only glibc and libgcc at runtime (distroless/cc). The headers
+# below are what librdkafka 2.12's CMake insists on finding (it probes
+# libcurl for OIDC whatever WITH_CURL says); cmake drives the build,
+# g++/make compile, pkg-config discovers. Keep this list aligned with
+# .github/workflows/ci.yaml's LIBRDKAFKA_BUILD_DEPS.
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         cmake g++ make pkg-config \

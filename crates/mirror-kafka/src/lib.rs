@@ -650,3 +650,28 @@ pub enum KafkaError {
     #[error("kafka client init: {0}")]
     Init(String),
 }
+
+#[cfg(test)]
+mod tests {
+    use rdkafka::config::ClientConfig;
+
+    /// Producers on the topics we mirror compress batches with gzip or
+    /// zstd (Java and Quarkus defaults). A librdkafka built without
+    /// them fails every fetch of such a batch with "Not implemented",
+    /// and the mirror crash-loops on the same batch.
+    #[test]
+    fn librdkafka_decompresses_gzip_and_zstd() {
+        let features = ClientConfig::new()
+            .create_native_config()
+            .expect("native config")
+            .get("builtin.features")
+            .expect("builtin.features");
+        let features: Vec<&str> = features.split(',').collect();
+        for codec in ["gzip", "zstd", "snappy", "lz4"] {
+            assert!(
+                features.contains(&codec),
+                "librdkafka lacks {codec}: builtin.features = {features:?}"
+            );
+        }
+    }
+}
