@@ -339,12 +339,36 @@ impl Inner {
 
         let mut attempt: u32 = 1;
         loop {
-            let addrs = state.resolve_or_cached(self.resolver.as_ref()).await?;
+            // A failed resolution goes through the `connrefused` policy
+            // (WEBHOOKS.md failure table); an empty one means there is
+            // no target to deliver to (a Service scaled
+            // to zero used to fail the mirror, bypassing the policy).
+            let addrs = match state.resolve_or_cached(self.resolver.as_ref()).await {
+                Ok(a) => a,
+                Err(e) => {
+                    let policy = self.outcomes.for_outcome(Outcome::ConnRefused);
+                    if policy.retry && attempt < self.retry.max_attempts {
+                        tracing::warn!(host = %state.host, attempt, error = %e, "notify dns-a resolution failed; retrying");
+                        tokio::time::sleep(backoff_for_attempt(self.retry.backoff_ms, attempt))
+                            .await;
+                        attempt += 1;
+                        continue;
+                    }
+                    return self
+                        .apply_final_action(
+                            &endpoint.url,
+                            &endpoint.target_host,
+                            Outcome::ConnRefused,
+                            policy,
+                            attempt,
+                            e.to_string(),
+                        )
+                        .await;
+                }
+            };
             if addrs.is_empty() {
-                return Err(NotifyError::Transport(format!(
-                    "dns-a resolution of {} returned 0 addresses",
-                    state.host
-                )));
+                tracing::info!(host = %state.host, "notify dns-a: no address; nothing to deliver");
+                return Ok(());
             }
             let futures = addrs.iter().map(|sa| {
                 let mut per_addr_url = endpoint.url.clone();
