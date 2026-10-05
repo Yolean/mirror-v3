@@ -1,7 +1,8 @@
 use mirror_config::{
     load_from_str, CacheV1Config, ColumnConfig, ColumnType, Compaction, Config, Destination,
-    DestinationFormat, FilesystemDestination, FlushTriggers, HttpAccess, KafkaDestination,
-    KafkaSource, Mirror, S3Destination, TimestampMode,
+    DestinationFormat, Encryption, EncryptionNone, FilesystemDestination, FlushTriggers,
+    HttpAccess, KafkaDestination, KafkaSource, Mirror, S3Credentials, S3Destination, S3Key,
+    TimestampMode,
 };
 use std::path::PathBuf;
 
@@ -154,6 +155,10 @@ mirrors:
         endpoint: http://versitygw:7070
         region: us-east-1
         bucket: mirror-v3
+        credentials:
+          write: { access-key-id-env: S3_WRITE_ACCESS_KEY_ID, secret-access-key-env: S3_WRITE_SECRET_ACCESS_KEY }
+          read: { access-key-id-env: S3_READ_ACCESS_KEY_ID, secret-access-key-env: S3_READ_SECRET_ACCESS_KEY }
+        encryption: none
         prefix: archive/
     flush:
       max-time-ms: 60000
@@ -169,6 +174,17 @@ mirrors:
             region: "us-east-1".into(),
             bucket: "mirror-v3".into(),
             prefix: Some("archive/".into()),
+            credentials: S3Credentials {
+                write: S3Key {
+                    access_key_id_env: "S3_WRITE_ACCESS_KEY_ID".into(),
+                    secret_access_key_env: "S3_WRITE_SECRET_ACCESS_KEY".into(),
+                },
+                read: S3Key {
+                    access_key_id_env: "S3_READ_ACCESS_KEY_ID".into(),
+                    secret_access_key_env: "S3_READ_SECRET_ACCESS_KEY".into(),
+                },
+            },
+            encryption: Encryption::None(EncryptionNone::None),
             affects_readiness: true,
         })
     );
@@ -220,6 +236,10 @@ mirrors:
         name: offsite-archive
         region: us-east-1
         bucket: orders-archive
+        credentials:
+          write: { access-key-id-env: S3_WRITE_ACCESS_KEY_ID, secret-access-key-env: S3_WRITE_SECRET_ACCESS_KEY }
+          read: { access-key-id-env: S3_READ_ACCESS_KEY_ID, secret-access-key-env: S3_READ_SECRET_ACCESS_KEY }
+        encryption: none
     format: parquet
     flush:
       max-time-ms: 5000
@@ -253,6 +273,10 @@ mirrors:
         endpoint: http://versitygw:7070
         region: us-east-1
         bucket: cache
+        credentials:
+          write: { access-key-id-env: S3_WRITE_ACCESS_KEY_ID, secret-access-key-env: S3_WRITE_SECRET_ACCESS_KEY }
+          read: { access-key-id-env: S3_READ_ACCESS_KEY_ID, secret-access-key-env: S3_READ_SECRET_ACCESS_KEY }
+        encryption: none
         prefix: archive/
     format: parquet
     compression: zstd-1
@@ -270,6 +294,10 @@ mirrors:
         endpoint: http://versitygw:7070
         region: us-east-1
         bucket: cache
+        credentials:
+          write: { access-key-id-env: S3_WRITE_ACCESS_KEY_ID, secret-access-key-env: S3_WRITE_SECRET_ACCESS_KEY }
+          read: { access-key-id-env: S3_READ_ACCESS_KEY_ID, secret-access-key-env: S3_READ_SECRET_ACCESS_KEY }
+        encryption: none
         prefix: archive/
     format: parquet
     compression: zstd-1
@@ -645,8 +673,10 @@ mirrors:
     );
 }
 
+/// The cache is built from the source, so a mirror whose only
+/// destination is Kafka may serve one too.
 #[test]
-fn http_access_forbidden_for_kafka_only_mirrors() {
+fn http_access_allowed_on_kafka_only_mirrors() {
     let yaml = r#"
 mirrors:
   - name: operations
@@ -659,12 +689,8 @@ mirrors:
     http-access:
       cache-v1: {}
 "#;
-    let err = load_from_str(yaml).expect_err("http-access on kafka-only mirror must be rejected");
-    let msg = format!("{err}");
-    assert!(
-        msg.contains("http-access") && msg.contains("filesystem/s3"),
-        "got: {msg}"
-    );
+    let cfg = load_from_str(yaml).expect("http-access with a kafka destination");
+    assert!(cfg.mirrors[0].http_access.is_some());
 }
 
 #[test]
@@ -933,4 +959,129 @@ mirrors:
             "name {name:?}, got: {msg}"
         );
     }
+}
+
+#[test]
+fn two_mirrors_writing_one_blob_directory_are_rejected() {
+    let yaml = r#"
+mirrors:
+  - name: a
+    source: { bootstrap-servers: k:9092 }
+    topic: ops
+    partition: 0
+    destinations:
+      - { type: filesystem, name: archive, root: /data }
+    flush: { max-time-ms: 1000, max-bytes: 1000, max-offsets: 10 }
+  - name: b
+    source: { bootstrap-servers: k:9092 }
+    topic: other
+    partition: 0
+    destinations:
+      - { type: filesystem, name: archive, root: /data }
+    flush: { max-time-ms: 1000, max-bytes: 1000, max-offsets: 10 }
+"#;
+    let err = load_from_str(yaml).expect_err("one directory, two writers");
+    assert!(
+        format!("{err}").contains("both write /data/archive/0"),
+        "{err}"
+    );
+}
+
+#[test]
+fn two_mirrors_committing_one_group_for_one_partition_are_rejected() {
+    let mirror = |name: &str, topic: &str, group: &str| {
+        format!(
+            r#"
+  - name: {name}
+    source: {{ bootstrap-servers: k:9092, group-id: {group} }}
+    topic: {topic}
+    partition: 0
+    destinations: [{{ type: kafka, bootstrap-servers: r:9092 }}]
+"#
+        )
+    };
+    let same = format!(
+        "mirrors:{}{}",
+        mirror("a", "ops", "g"),
+        mirror("b", "ops", "g")
+    );
+    let err = load_from_str(&same).expect_err("one group, one partition, two mirrors");
+    assert!(
+        format!("{err}").contains("both commit consumer group \"g\" for ops/0"),
+        "{err}"
+    );
+    let other_topic = format!(
+        "mirrors:{}{}",
+        mirror("a", "ops", "g"),
+        mirror("b", "users", "g")
+    );
+    load_from_str(&other_topic).expect("a group commits per topic and partition");
+}
+
+fn s3_mirror_yaml(encryption: &str, format: &str) -> String {
+    format!(
+        r#"
+mirrors:
+  - name: ops
+    source: {{ bootstrap-servers: k:9092 }}
+    topic: ops
+    partition: 0
+    destinations:
+      - type: s3
+        region: example-region
+        bucket: b
+        credentials:
+          write: {{ access-key-id-env: W_ID, secret-access-key-env: W_SECRET }}
+          read: {{ access-key-id-env: R_ID, secret-access-key-env: R_SECRET }}
+{encryption}
+{format}
+    flush: {{ max-time-ms: 1000, max-bytes: 1000, max-offsets: 10 }}
+"#
+    )
+}
+
+#[test]
+fn s3_encryption_must_be_written_out() {
+    let err = load_from_str(&s3_mirror_yaml("", "")).expect_err("encryption is required");
+    assert!(format!("{err}").contains("encryption"), "{err}");
+}
+
+#[test]
+fn s3_encryption_none_and_keys_parse() {
+    let cfg = load_from_str(&s3_mirror_yaml("        encryption: none", "")).unwrap();
+    let Destination::S3(s3) = &cfg.mirrors[0].destinations[0] else {
+        panic!()
+    };
+    assert_eq!(s3.encryption, Encryption::None(EncryptionNone::None));
+    let cfg = load_from_str(&s3_mirror_yaml(
+        "        encryption: { keys-dir: /keys, key-id: k1 }",
+        "    format: parquet",
+    ))
+    .unwrap();
+    let Destination::S3(s3) = &cfg.mirrors[0].destinations[0] else {
+        panic!()
+    };
+    assert_eq!(
+        s3.encryption,
+        Encryption::ParquetKeys(mirror_config::ParquetKeys {
+            keys_dir: "/keys".into(),
+            key_id: "k1".into()
+        })
+    );
+}
+
+#[test]
+fn s3_encryption_needs_explicit_parquet_and_a_key_id() {
+    let err = load_from_str(&s3_mirror_yaml(
+        "        encryption: { keys-dir: /keys, key-id: k1 }",
+        "",
+    ))
+    .expect_err("format must be written out");
+    assert!(format!("{err}").contains("format: parquet"), "{err}");
+    let err = load_from_str(&s3_mirror_yaml(
+        "        encryption: { keys-dir: /keys, key-id: K1 }",
+        "    format: parquet",
+    ))
+    .expect_err("bad key id");
+    assert!(format!("{err}").contains("not a key id"), "{err}");
 }

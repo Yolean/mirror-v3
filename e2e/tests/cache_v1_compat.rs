@@ -151,7 +151,7 @@ async fn compare_kkv_and_mirror_v3_cache_v1() {
         };
         let _ = mirror_cache::serve(mirror_addr, mirror_state, signal).await;
     });
-    let binding = mirror_fs::CacheBinding {
+    let binding = mirror_core::CacheBinding {
         state: Arc::clone(&cache_state),
         mirror_name: "compat".into(),
     };

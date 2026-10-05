@@ -86,11 +86,10 @@ async fn posts_to_default_kkv_path_with_canonical_body() {
     );
 }
 
+/// kafka-keyvalue does not notify a record without a key (it used to
+/// go out here as `""`, which no consumer can re-read meaningfully).
 #[tokio::test]
-async fn null_key_serializes_as_empty_string() {
-    // The Node consumer keys cache invalidations by string; a missing
-    // key turns into "" so it has SOMETHING to call `getValue("")`
-    // with; same as the legacy kkv null handling.
+async fn a_record_without_a_key_is_not_notified() {
     let server = TestServer::start(Reply::Status(200), vec![]).await;
     let cfg = notify_pointing_at(server.addr, NotifyOutcomes::default(), fast_retry(), 1000);
     let mut notifier =
@@ -99,23 +98,12 @@ async fn null_key_serializes_as_empty_string() {
     let mut record = rec(7, "", "v");
     record.key = None;
     notifier.on_record(&record).await.unwrap();
-
-    let body: Value = serde_json::from_slice(&server.captured().await[0].body).unwrap();
-    assert_eq!(body["updates"], serde_json::json!({"": null}));
-}
-
-#[tokio::test]
-async fn respects_explicit_target_path_override() {
-    let server = TestServer::start(Reply::Status(200), vec![]).await;
-    let mut cfg = notify_pointing_at(server.addr, NotifyOutcomes::default(), fast_retry(), 1000);
-    cfg.targets[0].path = Some("/custom/route".into());
-
-    let mut notifier =
-        KkvV1Notifier::from_config(&cfg, "t".into(), 0, ready_cache("m"), "m".into()).unwrap();
-    notifier.on_record(&rec(1, "k", "v")).await.unwrap();
+    notifier.on_record(&rec(8, "k8", "v")).await.unwrap();
 
     let captured = server.captured().await;
-    assert_eq!(captured[0].path, "/custom/route");
+    assert_eq!(captured.len(), 1);
+    let body: Value = serde_json::from_slice(&captured[0].body).unwrap();
+    assert_eq!(body["updates"], serde_json::json!({"k8": null}));
 }
 
 #[tokio::test]

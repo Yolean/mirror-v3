@@ -190,7 +190,7 @@ parity with KKV.
 | `POST /_admin/v1/shutdown[/{exitcode}]`     | mirror-v3 has it; not compared        |
 | `/q/health/ready` (Quarkus)                 | mirror-v3 implements as a drop-in: same path, same `200`/`503` codes, plus a structured `ReadinessReport` JSON body that names any unhealthy mirror by status enum. Existing `@yolean/kafka-keyvalue` Node clients work unchanged. `/q/health` (the wider SmallRye umbrella) is not implemented; we expose `/metrics` (Prometheus) on the metrics port instead |
 | Multi-partition `/cache/v1/offset/{t}/{p}`  | the fixture topic uses 1 partition; the multi-partition case is unit-tested in `mirror-cache`'s handler tests |
-| Readiness 503 timing                        | KKV: `caught_up` flips false→true once and sticks. mirror-v3: non-sticky — tracks per-mirror lag against the broker high-watermark, source-partition assignment, and per-destination flush progress; falls back to 503 if any of those degrades. Plus a per-destination YAML opt-out (`affects-readiness: false`) for best-effort secondary sinks. |
+| Readiness 503 timing                        | Both: `caught_up` flips false→true once and sticks. mirror-v3 reports lag, source assignment and destination progress in the readiness body and metrics, not as a 503. Only mirrors that serve `/cache/v1` gate readiness. |
 
 ## Open
 

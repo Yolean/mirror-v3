@@ -142,7 +142,6 @@ fn notify_dest_flush(addr: std::net::SocketAddr) -> Notify {
         api: NotifyApi::KkvV1,
         targets: vec![NotifyTarget {
             url: format!("http://{addr}"),
-            path: None,
             fan_out: FanOut::None,
         }],
         trigger: NotifyTrigger {

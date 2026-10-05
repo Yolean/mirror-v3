@@ -133,9 +133,9 @@ Field-level notes:
   (e.g. `notify.api: nats-v1`, or a kkv-v2 with auth) can be added
   without re-shaping the block. Same pattern as
   `http-access.api`.
-- **`notify.targets[].url`** is a full URL. The path component
-  defaults to `/kafka-keyvalue/v1/updates` for `api: kkv-v1` if
-  unset; explicit override is allowed for non-kkv clients.
+- **`notify.targets[].url`** is a full URL. A URL without a path
+  gets `/kafka-keyvalue/v1/updates` for `api: kkv-v1`; another path
+  goes in the URL.
 - **`notify.targets[].fan-out`** decides how the URL's host is
   resolved:
   - `none` (default): standard DNS, single connection. Adequate for
@@ -177,8 +177,8 @@ unmodified.
 **Request.**
 
 - Method: `POST`
-- Path: `/kafka-keyvalue/v1/updates` (default; override via
-  `notify.targets[].path`)
+- Path: `/kafka-keyvalue/v1/updates` (unless the target URL has a
+  path)
 - Content-Type: `application/json`
 - Headers:
   - `x-kkv-topic: <source-topic>`
@@ -503,10 +503,10 @@ When `destinations` is empty:
   are forbidden; they all parameterise destinations that don't
   exist. (`keys`/`values` may stay as a future opt-in for key/value
   validation on the source; out of scope for MVP.)
-- `http-access` is forbidden. The cache-v1 contract today requires
-  bootstrapping from durable destination state; a notify-only
-  mirror has none. (A future "bootstrap cache by replaying from
-  broker" mode is conceivable but adds complexity; defer.)
+- `http-access` is allowed: a cache is built from the source's low
+  watermark (README "Bootstrap"), so notify + `http-access` without
+  destinations is kafka-keyvalue's shape. With `http-access`, notify
+  requires `cache-v1-main` as on any other mirror.
 
 When `destinations` is non-empty AND `notify` is set: no change
 from the rules already specified; both `trigger.on` values are
@@ -657,7 +657,7 @@ Per-record DEBUG only; counters cover the operational signal.
 
 ## Validation
 
-- `notify` requires `http-access.cache-v1` on the same mirror.
+- `notify` requires `http-access.cache-v1` and `http-access.cache-v1-main` on the same mirror (consumers re-read from the unprefixed paths).
 - `notify.targets` non-empty.
 - `notify.trigger.debounce.max-records >= 1`, `max-time-ms >= 1`
   (when `trigger.on: source-consume`).

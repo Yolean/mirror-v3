@@ -167,7 +167,7 @@
           "type": "string"
         },
         "group-id": {
-          "description": "Optional consumer group id used for monitoring/back-pressure\nonly. Restart correctness derives from the destination, never\nfrom committed group offsets.",
+          "description": "The consumer group the mirror commits its progress to (default\n`mirror-v3-<mirror name>`): consumer-group lag for monitoring,\nand for a notify mirror the point re-delivery resumes from after\na restart. Destination positions never come from it. Two mirrors\nmay not commit one group for the same topic and partition.",
           "type": [
             "string",
             "null"
@@ -285,6 +285,14 @@
               ],
               "default": null
             },
+            "credentials": {
+              "description": "The identities the destination uses, named by the environment\nvariables that hold their keys (keys never go in the config).",
+              "$ref": "#/$defs/S3Credentials"
+            },
+            "encryption": {
+              "description": "Required, so that clear-text blobs are a written decision:\n`none`, or the Parquet key layout of the observability\ncompactor (`keys-dir`, `key-id`).",
+              "$ref": "#/$defs/Encryption"
+            },
             "affects-readiness": {
               "description": "See [`KafkaDestination::affects_readiness`].",
               "type": "boolean",
@@ -299,9 +307,81 @@
           "required": [
             "type",
             "region",
-            "bucket"
+            "bucket",
+            "credentials",
+            "encryption"
           ]
         }
+      ]
+    },
+    "S3Credentials": {
+      "description": "Two identities, as a least-privilege bucket setup has them: `write` may\nonly PutObject; `read` lists the prefix (resume position, drift\ncheck) and, in compaction mode, reads the latest snapshot. They may\nname the same variables where one key does both.",
+      "type": "object",
+      "properties": {
+        "write": {
+          "$ref": "#/$defs/S3Key"
+        },
+        "read": {
+          "$ref": "#/$defs/S3Key"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "write",
+        "read"
+      ]
+    },
+    "S3Key": {
+      "type": "object",
+      "properties": {
+        "access-key-id-env": {
+          "description": "Name of the environment variable holding the access key id.",
+          "type": "string"
+        },
+        "secret-access-key-env": {
+          "description": "Name of the environment variable holding the secret access key.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "access-key-id-env",
+        "secret-access-key-env"
+      ]
+    },
+    "Encryption": {
+      "description": "An S3 destination's encryption: `encryption: none`, or\n`encryption: { keys-dir: /keys, key-id: k1 }`.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/EncryptionNone"
+        },
+        {
+          "$ref": "#/$defs/ParquetKeys"
+        }
+      ]
+    },
+    "EncryptionNone": {
+      "description": "The literal `none`.",
+      "type": "string",
+      "enum": [
+        "none"
+      ]
+    },
+    "ParquetKeys": {
+      "description": "Parquet modular encryption with keys in the observability\ncompactor's layout: `keys-dir` holds one file per key (the file name\nis the key id, the content the base64 of 32 bytes), and new blobs\nare encrypted with `key-id`. A blob is read with the key whose id\nits name carries (`<from>-<to>.k-<id>.parquet`), so a rotation adds\nthe new key's file and then changes `key-id`; old keys stay while\nblobs need them.",
+      "type": "object",
+      "properties": {
+        "keys-dir": {
+          "type": "string"
+        },
+        "key-id": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "keys-dir",
+        "key-id"
       ]
     },
     "DestinationFormat": {
@@ -593,15 +673,8 @@
       "type": "object",
       "properties": {
         "url": {
-          "description": "Full URL of the target. Path defaults to\n`/kafka-keyvalue/v1/updates` under `api: kkv-v1` if `path`\nis unset; explicit override is allowed for non-kkv clients.",
+          "description": "Full URL of the target. A URL without a path (or `/`) gets\nkkv-v1's `/kafka-keyvalue/v1/updates`, the path every\n`@yolean/kafka-keyvalue` consumer mounts.",
           "type": "string"
-        },
-        "path": {
-          "description": "Override the URL's path segment. Defaults to the\napi-variant-defined path (`/kafka-keyvalue/v1/updates`\nfor kkv-v1).",
-          "type": [
-            "string",
-            "null"
-          ]
         },
         "fan-out": {
           "description": "How the URL's host is resolved. `none` (default) sends one\nPOST to a single keep-alive connection; `dns-a` resolves\nthe host to its full A/AAAA record set and POSTs to every\nreturned address concurrently - the K8s-headless-Service\nfan-out path without a Kubernetes API dependency.",

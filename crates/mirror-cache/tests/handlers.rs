@@ -278,14 +278,14 @@ async fn q_health_ready_returns_503_until_caught_up_then_200() {
     assert_eq!(body["unhealthy"], serde_json::json!([]));
 }
 
+/// DEFAULT DECISION (sticky readiness): once a cache mirror has caught
+/// up, lag no longer turns reads or `/q/health/ready` into 503
+/// (a moment's lag made reads fail and could drop the only
+/// replica from its Service). Lag stays visible in the body.
 #[tokio::test]
-async fn q_health_ready_body_distinguishes_warming_from_degraded() {
-    // Aggregate discriminator: only Warming when every unhealthy
-    // mirror is still warming up; flips to Degraded once at least one
-    // is in a post-warming non-ready state (lag, source unassigned,
-    // destination lagging).
+async fn readiness_is_sticky_once_caught_up_and_lag_stays_in_the_body() {
     let cache = Arc::new(CacheState::new());
-    cache.register_mirror_with_topic("warming-only", 2, None, false, "t", 0);
+    cache.register_mirror_with_topic("userstate", 2, None, true, "t", 0);
     let app = router_with(Arc::clone(&cache));
     let resp = app
         .clone()
@@ -295,21 +295,62 @@ async fn q_health_ready_body_distinguishes_warming_from_degraded() {
     assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     let body: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
     assert_eq!(body["ready"], "warming");
+    assert_eq!(body["unhealthy"], serde_json::json!(["userstate"]));
 
-    // Drive past the warming window so the slot is Ready, then push
-    // the broker end-offset out so it flips to LagBehindSource.
-    cache.apply_record("warming-only", &rec("t", 0, 0, "k0", Some(b"v0")));
-    cache.apply_record("warming-only", &rec("t", 0, 1, "k1", Some(b"v1")));
-    cache.set_broker_end_offset("warming-only", 50);
+    cache.apply_record("userstate", &rec("t", 0, 0, "k0", Some(b"v0")));
+    cache.apply_record("userstate", &rec("t", 0, 1, "k1", Some(b"v1")));
+    cache.set_broker_end_offset("userstate", 50);
     let resp = app
+        .clone()
         .oneshot(Request::get("/q/health/ready").body(Body::empty()).unwrap())
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(resp.status(), StatusCode::OK);
     let body: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
-    assert_eq!(body["ready"], "degraded");
+    assert_eq!(body["ready"], "ready");
     assert_eq!(body["mirrors"][0]["status"], "lag_behind_source");
     assert_eq!(body["mirrors"][0]["source"]["lag"], 48);
+    assert_eq!(body["mirrors"][0]["caught_up"], true);
+    let resp = app
+        .oneshot(
+            Request::get("/cache/v1/raw/k1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "reads are not gated on lag");
+}
+
+/// A mirror without http-access (a blob mirror) is listed but does not
+/// gate readiness: S3 being down must not take the cache out of its
+/// Service.
+#[tokio::test]
+async fn mirrors_without_a_cache_do_not_gate_readiness() {
+    let cache = Arc::new(CacheState::new());
+    cache.register_mirror_with_topic("userstate", 0, None, true, "t", 0);
+    cache.register_progress_only("archive", 10, "t", 0);
+    let resp = router_with(Arc::clone(&cache))
+        .oneshot(Request::get("/q/health/ready").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+    assert_eq!(body["mirrors"][0]["name"], "archive");
+    assert_eq!(body["mirrors"][0]["gates_readiness"], false);
+    assert_eq!(body["mirrors"][0]["caught_up"], false);
+}
+
+/// The kkv manifests probe `/q/health/live`.
+#[tokio::test]
+async fn q_health_live_answers_while_serving() {
+    let cache = Arc::new(CacheState::new());
+    cache.register_mirror_with_topic("userstate", 5, None, true, "t", 0);
+    let resp = router_with(cache)
+        .oneshot(Request::get("/q/health/live").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
 }
 
 #[tokio::test]
@@ -495,5 +536,46 @@ async fn q_health_ready_is_not_in_openapi_spec() {
     assert!(
         !body.contains("/q/health/ready"),
         "/q/health/ready must stay off the OpenAPI spec; got: {body}"
+    );
+}
+
+#[tokio::test]
+async fn raw_carries_the_offset_that_wrote_the_value() {
+    let state = std::sync::Arc::new(mirror_core::CacheState::new());
+    state.register_mirror_with_topic("m", 0, None, true, "t", 0);
+    for (o, v) in [(3u64, "a"), (4, "b")] {
+        state.apply_record(
+            "m",
+            &mirror_core::Record {
+                topic: "t".into(),
+                partition: 0,
+                source_offset: o,
+                timestamp_ms: None,
+                timestamp_type: mirror_core::TimestampType::NotAvailable,
+                key: Some(if o == 3 {
+                    b"k".to_vec()
+                } else {
+                    b"other".to_vec()
+                }),
+                value: Some(v.as_bytes().to_vec()),
+                headers: vec![],
+            },
+        );
+    }
+    let app = router_with(std::sync::Arc::clone(&state));
+    let resp = tower::ServiceExt::oneshot(
+        app,
+        axum::http::Request::builder()
+            .uri("/cache/v1/raw/k")
+            .body(axum::body::Body::empty())
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    assert_eq!(resp.headers()["x-kkv-key-offset"], "3");
+    assert_eq!(
+        resp.headers()["x-kkv-last-seen-offsets"],
+        r#"[{"offset":4,"partition":0,"topic":"t"}]"#
     );
 }

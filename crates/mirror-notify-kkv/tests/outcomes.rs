@@ -276,11 +276,10 @@ async fn outcome_connrefused_default_retries_then_fails() {
     // No server bound; 127.0.0.1:1 reliably refuses on Unix.
     let addr: std::net::SocketAddr = "127.0.0.1:1".parse().unwrap();
     let mut cfg = notify_pointing_at(addr, NotifyOutcomes::default(), retry(3), 1000);
-    // Sanity: the fan_out / path settings are exercised even though
-    // there's no server here.
+    // Sanity: the fan_out setting is exercised even though there's no
+    // server here.
     cfg.targets = vec![NotifyTarget {
         url: format!("http://{addr}"),
-        path: None,
         fan_out: FanOut::None,
     }];
     let mut n =

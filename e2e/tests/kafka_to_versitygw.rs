@@ -136,7 +136,8 @@ async fn mirrors_to_versitygw_with_offset_named_objects() {
 
     // Restart correctness: a fresh S3Sink reports next-expected = N.
     let mut restarted = S3Sink::open(S3SinkConfig {
-        store: Arc::clone(&s3),
+        read_store: Arc::clone(&s3),
+        write_store: Arc::clone(&s3),
         prefix: Some(Path::from("archive")),
         destination_name: "ops".into(),
         partition: 0,
@@ -145,7 +146,7 @@ async fn mirrors_to_versitygw_with_offset_named_objects() {
         keys: mirror_envelope::ColumnType::Utf8,
         values: mirror_envelope::ColumnType::Utf8,
         compaction: None,
-        cache: None,
+        encryption: None,
         flush,
     })
     .await

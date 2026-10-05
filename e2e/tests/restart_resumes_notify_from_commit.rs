@@ -68,7 +68,6 @@ fn notify_pointing_at(addr: std::net::SocketAddr) -> Notify {
         api: NotifyApi::KkvV1,
         targets: vec![NotifyTarget {
             url: format!("http://{addr}"),
-            path: None,
             fan_out: FanOut::None,
         }],
         trigger: NotifyTrigger {
@@ -100,7 +99,6 @@ fn fs_spec(root: &std::path::Path) -> FilesystemSinkConfig {
         keys: ColumnType::Utf8,
         values: ColumnType::Utf8,
         compaction: None,
-        cache: None,
         flush: FlushTriggers {
             max_time: Duration::from_secs(3600),
             max_bytes: u64::MAX,
@@ -162,10 +160,6 @@ async fn webhooks_resume_at_committed_offset_after_restart() {
         let commit_handle = source.commit_handle();
 
         let fs_cfg = FilesystemSinkConfig {
-            cache: Some(mirror_fs::CacheBinding {
-                state: Arc::clone(&cache),
-                mirror_name: "notify".into(),
-            }),
             ..fs_spec(root.path())
         };
         let sink: Box<dyn Sink> = Box::new(FilesystemSink::open(fs_cfg).expect("open fs sink A"));
@@ -280,10 +274,6 @@ async fn webhooks_resume_at_committed_offset_after_restart() {
         .expect("open source B");
 
         let fs_cfg = FilesystemSinkConfig {
-            cache: Some(mirror_fs::CacheBinding {
-                state: Arc::clone(&cache),
-                mirror_name: "notify".into(),
-            }),
             ..fs_spec(root.path())
         };
         let sink: Box<dyn Sink> = Box::new(FilesystemSink::open(fs_cfg).expect("open fs sink B"));
@@ -429,10 +419,6 @@ async fn unacked_notify_window_replays_after_restart() {
         .expect("open source A");
         let commit_handle = source.commit_handle();
         let fs_cfg = FilesystemSinkConfig {
-            cache: Some(mirror_fs::CacheBinding {
-                state: Arc::clone(&cache),
-                mirror_name: "notify".into(),
-            }),
             destination_name: "notify".into(),
             ..fs_spec(root.path())
         };
@@ -502,10 +488,6 @@ async fn unacked_notify_window_replays_after_restart() {
         ))
         .expect("open source B");
         let fs_cfg = FilesystemSinkConfig {
-            cache: Some(mirror_fs::CacheBinding {
-                state: Arc::clone(&cache),
-                mirror_name: "notify".into(),
-            }),
             destination_name: "notify".into(),
             ..fs_spec(root.path())
         };

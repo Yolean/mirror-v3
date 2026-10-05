@@ -112,9 +112,66 @@ pub struct S3Destination {
     /// Key prefix prepended to all written object keys.
     #[serde(default)]
     pub prefix: Option<String>,
+    /// The identities the destination uses, named by the environment
+    /// variables that hold their keys (keys never go in the config).
+    pub credentials: S3Credentials,
+    /// Required, so that clear-text blobs are a written decision:
+    /// `none`, or the Parquet key layout of the observability
+    /// compactor (`keys-dir`, `key-id`).
+    pub encryption: Encryption,
     /// See [`KafkaDestination::affects_readiness`].
     #[serde(default = "default_true")]
     pub affects_readiness: bool,
+}
+
+/// An S3 destination's encryption: `encryption: none`, or
+/// `encryption: { keys-dir: /keys, key-id: k1 }`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(untagged)]
+pub enum Encryption {
+    None(EncryptionNone),
+    ParquetKeys(ParquetKeys),
+}
+
+/// The literal `none`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum EncryptionNone {
+    None,
+}
+
+/// Parquet modular encryption with keys in the observability
+/// compactor's layout: `keys-dir` holds one file per key (the file name
+/// is the key id, the content the base64 of 32 bytes), and new blobs
+/// are encrypted with `key-id`. A blob is read with the key whose id
+/// its name carries (`<from>-<to>.k-<id>.parquet`), so a rotation adds
+/// the new key's file and then changes `key-id`; old keys stay while
+/// blobs need them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct ParquetKeys {
+    pub keys_dir: PathBuf,
+    pub key_id: String,
+}
+
+/// Two identities, as a least-privilege bucket setup has them: `write` may
+/// only PutObject; `read` lists the prefix (resume position, drift
+/// check) and, in compaction mode, reads the latest snapshot. They may
+/// name the same variables where one key does both.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct S3Credentials {
+    pub write: S3Key,
+    pub read: S3Key,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct S3Key {
+    /// Name of the environment variable holding the access key id.
+    pub access_key_id_env: String,
+    /// Name of the environment variable holding the secret access key.
+    pub secret_access_key_env: String,
 }
 
 fn default_true() -> bool {
@@ -273,6 +330,15 @@ impl Mirror {
     pub fn is_enabled(&self) -> bool {
         self.enabled.unwrap_or(true)
     }
+
+    /// The consumer group this mirror commits its progress to:
+    /// `source.group-id`, or `mirror-v3-<name>`.
+    pub fn effective_group_id(&self) -> String {
+        self.source
+            .group_id
+            .clone()
+            .unwrap_or_else(|| format!("mirror-v3-{}", self.name))
+    }
 }
 
 // ============================================================
@@ -320,15 +386,10 @@ pub enum NotifyApi {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct NotifyTarget {
-    /// Full URL of the target. Path defaults to
-    /// `/kafka-keyvalue/v1/updates` under `api: kkv-v1` if `path`
-    /// is unset; explicit override is allowed for non-kkv clients.
+    /// Full URL of the target. A URL without a path (or `/`) gets
+    /// kkv-v1's `/kafka-keyvalue/v1/updates`, the path every
+    /// `@yolean/kafka-keyvalue` consumer mounts.
     pub url: String,
-    /// Override the URL's path segment. Defaults to the
-    /// api-variant-defined path (`/kafka-keyvalue/v1/updates`
-    /// for kkv-v1).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub path: Option<String>,
     /// How the URL's host is resolved. `none` (default) sends one
     /// POST to a single keep-alive connection; `dns-a` resolves
     /// the host to its full A/AAAA record set and POSTs to every
@@ -577,9 +638,11 @@ impl HttpAccess {
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct KafkaSource {
     pub bootstrap_servers: String,
-    /// Optional consumer group id used for monitoring/back-pressure
-    /// only. Restart correctness derives from the destination, never
-    /// from committed group offsets.
+    /// The consumer group the mirror commits its progress to (default
+    /// `mirror-v3-<mirror name>`): consumer-group lag for monitoring,
+    /// and for a notify mirror the point re-delivery resumes from after
+    /// a restart. Destination positions never come from it. Two mirrors
+    /// may not commit one group for the same topic and partition.
     #[serde(default)]
     pub group_id: Option<String>,
 }
@@ -893,6 +956,57 @@ fn validate(cfg: &Config) -> Result<(), LoadError> {
         }
         validate_mirror(m)?;
     }
+    // Cross-mirror: two blob destinations writing the same directory
+    // are two writers of one chain, the corruption the single-writer
+    // invariant exists to prevent: the destination path holds no
+    // topic.
+    let mut blob_dirs: std::collections::HashMap<String, &str> = std::collections::HashMap::new();
+    for m in &cfg.mirrors {
+        for d in &m.destinations {
+            let dir = match d {
+                Destination::S3(s3) => format!(
+                    "s3://{}/{}{}/{}",
+                    s3.bucket,
+                    s3.prefix
+                        .as_deref()
+                        .map(|p| format!("{}/", p.trim_matches('/')))
+                        .unwrap_or_default(),
+                    d.effective_name(&m.name),
+                    m.partition
+                ),
+                Destination::Filesystem(fs) => format!(
+                    "{}/{}/{}",
+                    fs.root.display(),
+                    d.effective_name(&m.name),
+                    m.partition
+                ),
+                Destination::Kafka(_) => continue,
+            };
+            if let Some(other) = blob_dirs.insert(dir.clone(), &m.name) {
+                return Err(LoadError::Validation(format!(
+                    "mirrors {other:?} and {:?} both write {dir}; give one destination another \
+                     `name`, prefix or bucket",
+                    m.name
+                )));
+            }
+        }
+    }
+    // Cross-mirror: commits are kept per (group, topic, partition), so
+    // two mirrors of one partition with one group overwrite each other's
+    // committed offset: lag monitoring shows either, and a notify
+    // mirror's re-delivery after a restart resumes from the other's.
+    let mut groups: std::collections::HashMap<(String, &str, u32), &str> =
+        std::collections::HashMap::new();
+    for m in &cfg.mirrors {
+        let group = m.effective_group_id();
+        if let Some(other) = groups.insert((group.clone(), &m.topic, m.partition), &m.name) {
+            return Err(LoadError::Validation(format!(
+                "mirrors {other:?} and {:?} both commit consumer group {group:?} for {}/{}; \
+                 give one of them a `source.group-id` of its own",
+                m.name, m.topic, m.partition
+            )));
+        }
+    }
     // Cross-mirror: `cache-v1-main` mounts the unprefixed
     // /cache/v1/... routes onto exactly one mirror's view. Two
     // mains would race over the same paths so the supervisor would
@@ -930,22 +1044,14 @@ fn validate_mirror(m: &Mirror) -> Result<(), LoadError> {
     // skipped (everything destination-shaped) or applied with
     // tighter restrictions (e.g. http-access forbidden).
     if m.destinations.is_empty() {
-        let Some(notify) = m.notify.as_ref() else {
-            return Err(LoadError::Validation(format!(
-                "mirror {:?}: `destinations` must contain at least one entry, \
-                 unless `notify` is set (notify-only mirrors are allowed)",
-                m.name
-            )));
-        };
-        if notify.targets.is_empty() {
-            return Err(LoadError::Validation(format!(
-                "mirror {:?}: notify-only mirror requires `notify.targets` to be non-empty",
-                m.name
-            )));
-        }
-        return validate_notify_only(m, notify);
+        validate_no_destinations(m)?;
+    } else {
+        validate_destinations(m)?;
     }
+    validate_http_and_notify(m)
+}
 
+fn validate_destinations(m: &Mirror) -> Result<(), LoadError> {
     // Per-destination identifiers: explicit `name` is required when a
     // mirror has more than one destination (otherwise the default
     // `mirror.name` would collide). With exactly one destination,
@@ -969,6 +1075,29 @@ fn validate_mirror(m: &Mirror) -> Result<(), LoadError> {
             )));
         }
     }
+    for d in &m.destinations {
+        if let Destination::S3(S3Destination {
+            encryption: Encryption::ParquetKeys(k),
+            ..
+        }) = d
+        {
+            if !m
+                .format
+                .is_some_and(|f| matches!(f, DestinationFormat::Parquet))
+            {
+                return Err(LoadError::Validation(format!(
+                    "mirror {:?}: encrypted S3 destinations need `format: parquet` (written out)",
+                    m.name
+                )));
+            }
+            if !is_key_id(&k.key_id) {
+                return Err(LoadError::Validation(format!(
+                    "mirror {:?}: encryption key-id {:?} is not a key id ([a-z0-9][a-z0-9-]{{0,31}})",
+                    m.name, k.key_id
+                )));
+            }
+        }
+    }
     let has_blob = m.destinations.iter().any(|d| d.is_blob());
     let has_kafka = m.destinations.iter().any(|d| !d.is_blob());
 
@@ -980,10 +1109,6 @@ fn validate_mirror(m: &Mirror) -> Result<(), LoadError> {
             ("compression", m.compression.is_some()),
             ("compaction", m.compaction.is_some()),
             ("flush", m.flush.is_some()),
-            (
-                "http-access",
-                m.http_access.as_ref().is_some_and(HttpAccess::any_enabled),
-            ),
         ] {
             if present {
                 return Err(LoadError::Validation(format!(
@@ -1028,17 +1153,23 @@ fn validate_mirror(m: &Mirror) -> Result<(), LoadError> {
                 )));
             }
         }
-        if m.http_access.as_ref().is_some_and(HttpAccess::any_enabled)
-            && matches!(keys.kind, ColumnType::Bytes)
-        {
-            return Err(LoadError::Validation(format!(
-                "mirror {:?}: `http-access` requires `keys.type` ∈ {{utf8, json, json-parseable}}; \
-                 /cache/v1 routes keys through URL path segments",
-                m.name
-            )));
-        }
     }
+    if m.http_access.as_ref().is_some_and(HttpAccess::any_enabled)
+        && m.keys.is_some_and(|k| matches!(k.kind, ColumnType::Bytes))
+    {
+        return Err(LoadError::Validation(format!(
+            "mirror {:?}: `http-access` requires `keys.type` ∈ {{utf8, json, json-parseable}}; \
+             /cache/v1 routes keys through URL path segments",
+            m.name
+        )));
+    }
+    Ok(())
+}
 
+/// `http-access` and `notify`, whatever the destinations. A cache is
+/// built from the source (its low watermark), so it needs no
+/// destination.
+fn validate_http_and_notify(m: &Mirror) -> Result<(), LoadError> {
     if let Some(http) = m.http_access.as_ref() {
         // `cache-v1-main` mounts the unprefixed /cache/v1/... routes
         // onto this mirror's per-mirror view; it has no value without
@@ -1068,11 +1199,25 @@ fn validate_mirror(m: &Mirror) -> Result<(), LoadError> {
     // notify body says "go re-read via /cache/v1/raw/<key>". That's
     // only meaningful when the per-mirror `cache-v1` API is enabled.
     if let Some(notify) = m.notify.as_ref() {
-        let has_cache_v1 = m.http_access.as_ref().is_some_and(|h| h.cache_v1.is_some());
-        if !has_cache_v1 {
+        let has_http = m.http_access.as_ref().is_some_and(HttpAccess::any_enabled);
+        if m.destinations.is_empty() && !has_http {
+            // The notify-only shape (WEBHOOKS.md): no store at all.
+            return validate_notify_shared(m, notify);
+        }
+        // kkv-v1 consumers (the Node client, gateway's Go client)
+        // re-read every notified key from the unprefixed
+        // /cache/v1/raw/{key}, which only `cache-v1-main` mounts; with
+        // per-mirror routes alone every refetch is a 404 and every
+        // update is dropped.
+        let has_main = m
+            .http_access
+            .as_ref()
+            .is_some_and(|h| h.cache_v1.is_some() && h.cache_v1_main.is_some());
+        if !has_main {
             return Err(LoadError::Validation(format!(
-                "mirror {:?}: `notify` requires `http-access.cache-v1` on the same \
-                 mirror (the notify body tells consumers to re-read via /cache/v1)",
+                "mirror {:?}: `notify` requires `http-access: {{ cache-v1: {{}}, cache-v1-main: {{}} }}` \
+                 on the same mirror: kkv-v1 consumers re-read notified keys from the unprefixed \
+                 /cache/v1/raw/{{key}}, which only cache-v1-main serves",
                 m.name
             )));
         }
@@ -1186,11 +1331,18 @@ fn validate_notify_shared(m: &Mirror, notify: &Notify) -> Result<(), LoadError> 
     Ok(())
 }
 
-/// Extra restrictions on top of [`validate_notify_shared`] when the
-/// mirror has no destinations: notify is the only side-effect, so
-/// destination-shaped fields are all forbidden, http-access is
-/// forbidden, and trigger.on must be source-consume.
-fn validate_notify_only(m: &Mirror, notify: &Notify) -> Result<(), LoadError> {
+/// A mirror without destinations is a cache (`http-access`), a notify
+/// feed (`notify`), or both. Destination-shaped fields have nothing to
+/// apply to, and `destination-flush` has no destination to wait for.
+fn validate_no_destinations(m: &Mirror) -> Result<(), LoadError> {
+    let has_http = m.http_access.as_ref().is_some_and(HttpAccess::any_enabled);
+    if m.notify.is_none() && !has_http {
+        return Err(LoadError::Validation(format!(
+            "mirror {:?}: `destinations` must contain at least one entry, unless the mirror \
+             serves a cache (`http-access`) or notifies (`notify`)",
+            m.name
+        )));
+    }
     for (field, present) in [
         ("format", m.format.is_some()),
         ("compression", m.compression.is_some()),
@@ -1199,27 +1351,35 @@ fn validate_notify_only(m: &Mirror, notify: &Notify) -> Result<(), LoadError> {
         ("compaction", m.compaction.is_some()),
         ("flush", m.flush.is_some()),
         ("timestamp-mode", m.timestamp_mode.is_some()),
-        (
-            "http-access",
-            m.http_access.as_ref().is_some_and(HttpAccess::any_enabled),
-        ),
     ] {
         if present {
             return Err(LoadError::Validation(format!(
-                "mirror {:?}: notify-only mirrors (no destinations) cannot set `{field}`; \
+                "mirror {:?}: a mirror without destinations cannot set `{field}`; \
                  there is nothing for it to apply to",
                 m.name
             )));
         }
     }
-    if matches!(notify.trigger.on, TriggerOn::DestinationFlush) {
-        return Err(LoadError::Validation(format!(
-            "mirror {:?}: notify-only mirrors must use `trigger.on: source-consume` \
-             (no destinations to flush)",
-            m.name
-        )));
+    if let Some(notify) = m.notify.as_ref() {
+        if matches!(notify.trigger.on, TriggerOn::DestinationFlush) {
+            return Err(LoadError::Validation(format!(
+                "mirror {:?}: a mirror without destinations must use `trigger.on: source-consume` \
+                 (no destinations to flush)",
+                m.name
+            )));
+        }
     }
-    validate_notify_shared(m, notify)
+    Ok(())
+}
+
+/// The observability compactor's key id: `[a-z0-9][a-z0-9-]{0,31}`.
+fn is_key_id(id: &str) -> bool {
+    let b = id.as_bytes();
+    !b.is_empty()
+        && b.len() <= 32
+        && (b[0].is_ascii_lowercase() || b[0].is_ascii_digit())
+        && b.iter()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'-')
 }
 
 fn raw_destination_name(d: &Destination) -> Option<&str> {

@@ -168,16 +168,17 @@ impl Sink for TeeSink {
         // run per record.
         for inner in self.inners.iter_mut() {
             let head = inner.sink.next_expected_offset().await?;
-            // Per-sink heads only ever advance. If an inner sink
-            // reports a lower value than what we last saw, treat it
-            // as a transient inconsistency (e.g. a partial flush
-            // observed by `scan_validate` mid-rename) and keep the
-            // in-memory head. Truly out-of-band rollbacks at the
-            // destination would surface as the inner sink's own
-            // `UnexpectedPosition` error on next write.
-            if head > inner.head {
-                inner.head = head;
+            // Per-sink heads only ever advance. A lower value means the
+            // destination lost what it had accepted: an error, not a
+            // transient (the blob sinks keep their position in memory
+            // and check the destination themselves).
+            if head < inner.head {
+                return Err(SinkError::Inconsistent(format!(
+                    "inner sink {}: destination went back from next offset {} to {head}",
+                    inner.name, inner.head
+                )));
             }
+            inner.head = head;
         }
         let inner_min = self
             .inners
@@ -192,6 +193,22 @@ impl Sink for TeeSink {
             Some(cursor) => inner_min.min(cursor),
             None => inner_min,
         })
+    }
+
+    async fn furthest_next_offset(&mut self) -> Result<Option<u64>, SinkError> {
+        // The heads as the last next_expected_offset refreshed them. The
+        // resume cursor only lowers where the tee resumes; it says
+        // nothing about where the destinations are.
+        let mut furthest = 0;
+        for inner in self.inners.iter_mut() {
+            let head = inner
+                .sink
+                .furthest_next_offset()
+                .await?
+                .unwrap_or(inner.head);
+            furthest = furthest.max(head);
+        }
+        Ok(Some(furthest))
     }
 
     async fn write(&mut self, record: Record) -> Result<(), SinkError> {
@@ -265,7 +282,7 @@ impl Sink for TeeSink {
             }
         }
         if let Some((name, e)) = first_err {
-            return Err(SinkError::Transport(format!("inner sink {name}: {e}")));
+            return Err(e.context(&format!("inner sink {name}")));
         }
         self.advance_resume_cursor(record_offset);
         Ok(())
@@ -301,9 +318,7 @@ impl Sink for TeeSink {
             }
         }
         if let Some((name, e)) = first_err {
-            return Err(SinkError::Transport(format!(
-                "inner sink {name} flush: {e}"
-            )));
+            return Err(e.context(&format!("inner sink {name} flush")));
         }
         Ok(())
     }
@@ -314,6 +329,11 @@ impl Sink for TeeSink {
         // missing record would leave a permanent gap in that
         // destination's chain.
         self.inners.iter().all(|i| i.sink.allows_compacted_source())
+    }
+
+    fn allows_offset_holes(&self) -> bool {
+        // A hole the loop accepts reaches every inner sink behind it.
+        self.inners.iter().all(|i| i.sink.allows_offset_holes())
     }
 
     async fn align_to_source_low_watermark(&mut self, low_watermark: u64) -> Result<(), SinkError> {
@@ -344,9 +364,7 @@ impl Sink for TeeSink {
             }
         }
         if let Some((name, e)) = first_err {
-            return Err(SinkError::Transport(format!(
-                "inner sink {name} align: {e}"
-            )));
+            return Err(e.context(&format!("inner sink {name} align")));
         }
         // After alignment every inner sink's head advances to
         // `low_watermark`.
@@ -619,6 +637,9 @@ mod tests {
         fn allows_compacted_source(&self) -> bool {
             self.allow_compacted
         }
+        fn allows_offset_holes(&self) -> bool {
+            self.allow_compacted
+        }
         async fn align_to_source_low_watermark(
             &mut self,
             low_watermark: u64,
@@ -637,6 +658,27 @@ mod tests {
 
     fn boxed(s: Recording) -> Box<dyn Sink> {
         Box::new(s) as Box<dyn Sink>
+    }
+
+    /// An inner sink's offset mismatch is not a transport failure: the
+    /// tee names the inner sink and keeps it fatal, so a destination-only
+    /// mirror is not reopened in process over a mismatch.
+    #[tokio::test]
+    async fn an_inner_position_mismatch_stays_fatal_through_the_tee() {
+        let mut tee = TeeSink::from_inners_for_test(
+            vec![(
+                "kafka-v3".into(),
+                Box::new(crate::mock::MockSink::starting_at(5)) as Box<dyn Sink>,
+                3,
+            )],
+            None,
+        );
+        let err = tee.write(rec(3)).await.expect_err("mismatch");
+        assert!(!err.is_transient(), "{err}");
+        assert!(
+            matches!(&err, SinkError::Inconsistent(m) if m.starts_with("inner sink kafka-v3: ")),
+            "{err}"
+        );
     }
 
     #[tokio::test]

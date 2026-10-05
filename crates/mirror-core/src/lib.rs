@@ -28,33 +28,35 @@ pub mod testing;
 pub use cache::{CacheBinding, CacheState, MirrorStatus, MirrorStatusSnapshot};
 pub use tee::TeeSink;
 
-/// Per-mirror Prometheus labels. `topic` and `partition` together
-/// uniquely identify the data stream and join cleanly with broker-
-/// side exporters (kafka_exporter, etc.) - the mirror's operator-
-/// chosen `name` is *not* a metric label, it lives in `tracing`
-/// logs only.
+/// Per-mirror Prometheus labels. `topic` and `partition` identify the
+/// data stream and join with broker-side exporters (kafka_exporter,
+/// etc.); `mirror` is the mirror's name, because one process may run
+/// two mirrors of one partition (a cache and a backup of the same
+/// topic), whose series would otherwise overwrite each other.
 #[derive(Debug, Clone)]
 pub struct MetricLabels {
     pub topic: String,
     pub partition: u32,
+    pub mirror: String,
 }
 
 tokio::task_local! {
     /// Set by the supervisor (mirror-bin) inside the spawn closure so
     /// every metric emitted from this mirror's loop and sink is
-    /// automatically labeled with `topic` and `partition`. If unset
-    /// (e.g. inside `cargo test` outside the supervisor), the labels
-    /// fall back to `unknown` / `0` via [`current_labels`].
+    /// automatically labeled with `topic`, `partition` and `mirror`. If
+    /// unset (e.g. inside `cargo test` outside the supervisor), the
+    /// labels fall back to `unknown` / `0` / `unknown` via
+    /// [`current_labels`].
     pub static MIRROR_LABELS: MetricLabels;
 }
 
 /// Resolve the current mirror's labels from the task-local as
-/// `(topic, partition_as_string)`, falling back to
-/// `("unknown", "0")` when no scope is set.
-pub fn current_labels() -> (String, String) {
+/// `(topic, partition_as_string, mirror)`, falling back to
+/// `("unknown", "0", "unknown")` when no scope is set.
+pub fn current_labels() -> (String, String, String) {
     MIRROR_LABELS
-        .try_with(|l| (l.topic.clone(), l.partition.to_string()))
-        .unwrap_or_else(|_| ("unknown".into(), "0".into()))
+        .try_with(|l| (l.topic.clone(), l.partition.to_string(), l.mirror.clone()))
+        .unwrap_or_else(|_| ("unknown".into(), "0".into(), "unknown".into()))
 }
 
 /// A record in transit. `source_offset` is the partition offset on
@@ -206,6 +208,9 @@ impl ColumnType {
 }
 
 /// A Kafka-shaped record stream pinned to one (topic, partition).
+// async_trait marks the boxed future of each default method #[must_use];
+// clippy 1.99 flags that as double_must_use in the expansion.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait Source: Send {
     /// Position the source so the next `poll_one` returns the record
@@ -227,13 +232,10 @@ pub trait Source: Send {
         Ok(0)
     }
 
-    /// Highest offset still retained by the source (Kafka "high
-    /// watermark"; i.e. `last_offset + 1` if the source has any
-    /// records, or `0` if it's empty). The run loop doesn't query
-    /// this today - the default `Ok(u64::MAX)` is the
-    /// "always-satisfiable" sentinel, so future spec changes (e.g.
-    /// "fatal if sink_next_expected > source_high_watermark") can be
-    /// added without breaking sources that don't implement it.
+    /// The source's high watermark (`last_offset + 1`, or `0` when
+    /// empty). The run loop checks at startup that the destination is
+    /// not ahead of it. The default `Ok(u64::MAX)` never trips the
+    /// check (mocks).
     ///
     /// Implementations should query the broker rather than caching
     /// (same contract as [`Self::low_watermark`]). The Kafka source
@@ -279,12 +281,30 @@ pub trait Source: Send {
 
 /// A destination for exactly-once mirroring. The sink owns the truth
 /// about "where we are" - the loop trusts `next_expected_offset`.
+// async_trait marks the boxed future of each default method #[must_use];
+// clippy 1.99 flags that as double_must_use in the expansion.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait Sink: Send {
-    /// The source offset the destination will accept next. Must be
-    /// re-derived from durable destination state, not cached in memory
-    /// (otherwise the idle-drift check is meaningless).
+    /// The source offset the destination will accept next. Derived from
+    /// durable destination state at open; a sink may keep it in memory
+    /// afterwards (this process is the only writer), but must then
+    /// verify the destination on idle calls, at a cost that does not
+    /// grow with the destination (the drift check), and fail if anything
+    /// else wrote to it.
     async fn next_expected_offset(&mut self) -> Result<u64, SinkError>;
+
+    /// The highest next offset any part of the destination holds, when
+    /// that is not [`Self::next_expected_offset`]: a tee reports its
+    /// furthest inner sink, which neither the minimum over its inner
+    /// sinks nor a replay floor below them shows. The run loop requires
+    /// it not to exceed the source's high watermark at startup, right
+    /// after `next_expected_offset`. `None` (the default) means
+    /// `next_expected_offset` is the furthest; it is not queried again,
+    /// as a query may flush or check for drift.
+    async fn furthest_next_offset(&mut self) -> Result<Option<u64>, SinkError> {
+        Ok(None)
+    }
 
     /// Atomically commit `record` at exactly `record.source_offset`.
     /// MUST fail if the destination is not at that offset at the
@@ -308,6 +328,21 @@ pub trait Sink: Send {
     /// missing earlier offsets mean an incomplete chain and the
     /// bootstrap must fail loudly.
     fn allows_compacted_source(&self) -> bool {
+        false
+    }
+
+    /// Whether the sink accepts a record whose offset is above the next
+    /// expected one: a hole in the source's offsets. Kafka leaves holes
+    /// where compaction removed records and at transaction markers, and
+    /// librdkafka delivers in order, so a hole is not a lost record (the
+    /// source fails on an out-of-range position instead of skipping to
+    /// the earliest offset). Blob destinations name objects by consumer
+    /// position (`from` = previous `to` + 1, `to` = last record in the
+    /// object) and record each record's true offset, so they keep the
+    /// chain contiguous across holes: true. A Kafka destination cannot
+    /// reproduce a hole (its next offset is always high watermark + 1),
+    /// so it keeps the default false and a hole ends the mirror.
+    fn allows_offset_holes(&self) -> bool {
         false
     }
 
@@ -454,6 +489,9 @@ pub trait AckSink: Send + Sync {
 /// Implementations live outside `mirror-core` so this crate stays
 /// HTTP-free. The default impl (no-op) is used by every mirror that
 /// doesn't opt into a `notify:` block in config.
+// async_trait marks the boxed future of each default method #[must_use];
+// clippy 1.99 flags that as double_must_use in the expansion.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait Notifier: Send {
     /// Observe a record that was just successfully written to the
@@ -485,14 +523,59 @@ impl Notifier for NoOpNotifier {}
 pub enum SourceError {
     #[error("source transport: {0}")]
     Transport(String),
+    /// The position to read from is gone from the broker: retention
+    /// deleted records the mirror never read. Reading on would skip
+    /// them, so it is not retried.
+    #[error("source position lost: {0}")]
+    PositionLost(String),
+}
+
+impl SourceError {
+    /// Whether trying again (reopening the mirror) can succeed.
+    pub fn is_transient(&self) -> bool {
+        matches!(self, SourceError::Transport(_))
+    }
 }
 
 #[derive(Debug, Error)]
 pub enum SinkError {
     #[error("destination advanced: expected next-offset {expected}, found {actual}")]
     UnexpectedPosition { expected: u64, actual: u64 },
+    /// The destination could not be reached or answered with an
+    /// error; trying again can succeed.
     #[error("sink transport: {0}")]
     Transport(String),
+    /// The destination contradicts what this mirror wrote or expects:
+    /// an object it did not write, a missing one, a position that went
+    /// back. Trying again cannot fix it.
+    #[error("destination inconsistent: {0}")]
+    Inconsistent(String),
+    /// A record this destination cannot take (a compaction-mode mirror
+    /// and a record without a UTF-8 key). It is read again after any
+    /// restart, so trying again cannot fix it.
+    #[error("record not accepted: {0}")]
+    Rejected(String),
+}
+
+impl SinkError {
+    /// Whether trying again (reopening the mirror) can succeed.
+    pub fn is_transient(&self) -> bool {
+        matches!(self, SinkError::Transport(_))
+    }
+
+    /// The same kind of error, its message prefixed with `context` (an
+    /// inner sink's name). A position mismatch becomes `Inconsistent`,
+    /// which carries a message.
+    pub fn context(self, context: &str) -> SinkError {
+        match self {
+            SinkError::Transport(m) => SinkError::Transport(format!("{context}: {m}")),
+            SinkError::Rejected(m) => SinkError::Rejected(format!("{context}: {m}")),
+            SinkError::Inconsistent(m) => SinkError::Inconsistent(format!("{context}: {m}")),
+            e @ SinkError::UnexpectedPosition { .. } => {
+                SinkError::Inconsistent(format!("{context}: {e}"))
+            }
+        }
+    }
 }
 
 /// Error produced by a [`Notifier`]. `Transport` carries a single
@@ -523,23 +606,32 @@ pub enum MirrorError {
     /// destination chain that has somehow advanced past the broker.
     #[error("source delivered offset {got}, expected at least {expected} (went backwards)")]
     SourceWentBackwards { expected: u64, got: u64 },
-    /// Source delivered an offset *above* `expected`. Hard error in
-    /// append mode (would leave a gap in the destination chain).
-    /// Recoverable under `compaction: log`: the run loop aligns the
-    /// sink to the delivered offset and continues - the broker's
-    /// `LogStartOffset` reports 0 for a `cleanup.policy=compact`
-    /// topic even when the earliest deliverable record is much later
-    /// (compaction deduplicates by key but does not advance the
-    /// segment start), so the bootstrap pre-align can only be a hint
-    /// and the first-delivery offset is the authoritative starting
-    /// point.
-    #[error("source delivered offset {got}, expected {expected} (gap above expected)")]
+    /// Source delivered an offset *above* `expected` (a hole: records
+    /// compacted away, or a transaction marker) and the sink cannot
+    /// reproduce holes ([`Sink::allows_offset_holes`] is false: a Kafka
+    /// destination).
+    #[error(
+        "source delivered offset {got}, expected {expected}: the source has an offset hole \
+         (compaction or a transaction marker), and a Kafka destination cannot reproduce one; \
+         mirror such a topic to a blob destination"
+    )]
     SourceGapAboveExpected { expected: u64, got: u64 },
     /// Sink's view of next-expected-offset diverged from what we
     /// believed while we were idle. Indicates an out-of-band write or
     /// a topic reset.
     #[error("destination drift while idle: expected next-offset {expected}, found {actual}")]
     DestinationDrift { expected: u64, actual: u64 },
+    /// The destination holds offsets the source does not have: the
+    /// topic was recreated (a re-provisioned broker that lost its data
+    /// while the destination kept its), or the partition was truncated
+    /// by an unclean leader election.
+    #[error(
+        "the destination is ahead of the source: it continues at offset {sink_offset}, \
+         but the source's high watermark is {source_hwm}. Was the topic recreated, or \
+         truncated? Mirroring would append another topic's records to this chain; move the \
+         destination aside or point the mirror at a fresh one"
+    )]
+    SinkAheadOfSource { sink_offset: u64, source_hwm: u64 },
     /// Source's earliest available offset is greater than the sink's
     /// next-expected-offset, and the sink is not willing to skip
     /// records (i.e. it's not a compaction:log destination). This
@@ -558,6 +650,21 @@ pub enum MirrorError {
         low_watermark: u64,
         low_watermark_minus_one: u64,
     },
+}
+
+impl MirrorError {
+    /// Whether trying again (reopening the mirror) can succeed: the
+    /// source or a destination could not be reached. Every other error
+    /// says that the source and the destination disagree, or that the
+    /// configuration or the data cannot work, and repeats on every
+    /// attempt.
+    pub fn is_transient(&self) -> bool {
+        match self {
+            MirrorError::Source(e) => e.is_transient(),
+            MirrorError::Sink(e) => e.is_transient(),
+            _ => false,
+        }
+    }
 }
 
 /// How often the loop emits an INFO-level "heartbeat" log line. This
@@ -636,6 +743,22 @@ where
 {
     let sink_start = sink.next_expected_offset().await?;
     let low_watermark = source.low_watermark().await?;
+    let high_watermark = source.high_watermark().await?;
+    // Checked on the furthest destination, not on `sink_start`: a tee
+    // resumes from its slowest inner sink, or from a replay floor below
+    // all of them (a cache read from the low watermark, notify
+    // re-delivery), and skips each inner sink up to its own position.
+    // Without this, a recreated topic either delivered offset 0
+    // (SourceWentBackwards, a misleading crash loop) or, once refilled
+    // past the destination, got appended to the old topic's chain with
+    // no error at all.
+    let sink_furthest = sink.furthest_next_offset().await?.unwrap_or(sink_start);
+    if sink_furthest > high_watermark {
+        return Err(MirrorError::SinkAheadOfSource {
+            sink_offset: sink_furthest,
+            source_hwm: high_watermark,
+        });
+    }
     let compaction_mode = if sink.allows_compacted_source() {
         "log"
     } else {
@@ -674,29 +797,16 @@ where
     source.seek(expected).await?;
     let mut expected = expected;
     let mut last_heartbeat_offset = expected;
-    // Initial /metrics state for this mirror:
-    //   - `_offset_verified` carries the destination's startup
-    //     position so an idle mirror is visible to Prometheus.
-    //   - `_offset_inflight_retry` is the current attempt index
-    //     (1-based) for the in-flight write, gauge, resets to 0 on
-    //     success. > 0 = the destination is having problems. Today
-    //     we don't add a retry layer at the sink boundary so the
-    //     visible value is always 0; the slot is reserved so
-    //     dashboards can be pre-built. A future retry layer should
-    //     `set(n)` before each attempt and `set(0)` on success.
-    let (topic, partition) = current_labels();
+    // `_offset_verified` carries the destination's startup position so
+    // an idle mirror is visible to Prometheus.
+    let (topic, partition, mirror) = current_labels();
     metrics::gauge!(
         "mirror_v3_destination_offset_verified",
         "topic" => topic.clone(),
         "partition" => partition.clone(),
+        "mirror" => mirror.clone(),
     )
     .set(expected as f64);
-    metrics::gauge!(
-        "mirror_v3_destination_offset_inflight_retry",
-        "topic" => topic.clone(),
-        "partition" => partition.clone(),
-    )
-    .set(0.0);
 
     tokio::pin!(shutdown);
     let mut heartbeat = if heartbeat_interval.is_zero() {
@@ -751,42 +861,26 @@ where
                             });
                         }
                         if record.source_offset > expected {
-                            if sink.allows_compacted_source() {
-                                // `cleanup.policy=compact` leaves
-                                // `LogStartOffset` at 0 even when the
-                                // earliest deliverable record is much
-                                // later; the bootstrap pre-align (which
-                                // uses `low_watermark`) misses this
-                                // case and gaps also surface mid-stream
-                                // every time the broker dropped a
-                                // superseded record. The sink's `write`
-                                // accepts forward gaps under
-                                // `compaction:log` so we only bump the
-                                // local `expected` tracker here. The
-                                // bootstrap-time `align_to_source_low_watermark`
-                                // is still called (with an empty
-                                // buffer) so the first snapshot file's
-                                // `from` reflects the broker's low
-                                // watermark when that path applies.
+                            if sink.allows_offset_holes() {
+                                // A hole in the source's offsets:
+                                // compaction removed records, or a
+                                // transaction marker sits there. The
+                                // sink records true offsets and keeps
+                                // its chain contiguous, so only the
+                                // local tracker moves.
                                 //
-                                // Not logged per-record: a compacted
-                                // topic can have a gap on every
-                                // delivered record (one per surviving
-                                // key after upstream dedup), so any
-                                // log level here scales with millions
-                                // of lines per restart. Observability
-                                // for gap rate is the dedicated
-                                // counter below - plot a rate or
-                                // alert on a threshold rather than
-                                // reading logs. The startup `loop
-                                // start … compaction="log"` INFO
-                                // line is the one-shot "expect gaps
-                                // here" signal.
-                                let (topic_l, partition_l) = current_labels();
+                                // Not logged per record: a compacted
+                                // topic can have a hole before every
+                                // delivered record, so a log line here
+                                // scales with millions of lines per
+                                // restart. The counter below is the
+                                // signal.
+                                let (topic_l, partition_l, mirror_l) = current_labels();
                                 metrics::counter!(
                                     "mirror_v3_source_offset_gap_records_total",
                                     "topic" => topic_l,
                                     "partition" => partition_l,
+                                    "mirror" => mirror_l,
                                 )
                                 .increment(1);
                                 expected = record.source_offset;
@@ -807,19 +901,11 @@ where
                         expected = expected
                             .checked_add(1)
                             .expect("source offset overflowed u64");
-                        // Successful write -> reset the retry gauge
-                        // back to 0 (idempotent when no retry layer
-                        // is wired up yet, but it's the contract).
-                        metrics::gauge!(
-                            "mirror_v3_destination_offset_inflight_retry",
-                            "topic" => topic.clone(),
-                            "partition" => partition.clone(),
-                        )
-                        .set(0.0);
                         metrics::counter!(
                             "mirror_v3_destination_records_total",
                             "topic" => topic.clone(),
                             "partition" => partition.clone(),
+                            "mirror" => mirror.clone(),
                         )
                         .increment(1);
                         // Notifier observes only after the destination

@@ -422,12 +422,36 @@ impl Inner {
 
         let mut attempt: u32 = 1;
         loop {
-            let addrs = state.resolve_or_cached(self.resolver.as_ref()).await?;
+            // A failed resolution goes through the `connrefused` policy
+            // (WEBHOOKS.md failure table); an empty one means there is
+            // no target to deliver to (a Service scaled
+            // to zero used to fail the mirror, bypassing the policy).
+            let addrs = match state.resolve_or_cached(self.resolver.as_ref()).await {
+                Ok(a) => a,
+                Err(e) => {
+                    let policy = self.outcomes.for_outcome(Outcome::ConnRefused);
+                    if policy.retry && attempt < self.retry.max_attempts {
+                        tracing::warn!(host = %state.host, attempt, error = %e, "notify dns-a resolution failed; retrying");
+                        tokio::time::sleep(backoff_for_attempt(self.retry.backoff_ms, attempt))
+                            .await;
+                        attempt += 1;
+                        continue;
+                    }
+                    return self
+                        .apply_final_action(
+                            &endpoint.url,
+                            &endpoint.target_host,
+                            Outcome::ConnRefused,
+                            policy,
+                            attempt,
+                            e.to_string(),
+                        )
+                        .await;
+                }
+            };
             if addrs.is_empty() {
-                return Err(NotifyError::Transport(format!(
-                    "dns-a resolution of {} returned 0 addresses",
-                    state.host
-                )));
+                tracing::info!(host = %state.host, "notify dns-a: no address; nothing to deliver");
+                return Ok(());
             }
             let futures = addrs.iter().map(|sa| {
                 let mut per_addr_url = endpoint.url.clone();
@@ -810,14 +834,28 @@ impl Notifier for KkvV1Notifier {
             return Ok(());
         }
 
-        // Keys may be missing or non-UTF-8. Legacy kkv emits whatever
-        // string repr the consumer expects; mirror-v3 chooses
-        // lossy-UTF-8 on bytes and `""` on missing key. Real
-        // deployments use UTF-8 keys; this keeps the surface working
-        // on edge cases instead of crashing.
-        let key_str = render_key(record.key.as_deref());
-
         let (topic_l, partition_l) = self.inner.labels();
+        // kafka-keyvalue does not notify a record without a key; nor a
+        // key that is not UTF-8 here (the consumer re-reads it as a
+        // /raw/{key} path, and the cache skipped it too).
+        let key_str = match record.key.as_deref().map(std::str::from_utf8) {
+            Some(Ok(k)) => k.to_string(),
+            other => {
+                let reason = if other.is_none() {
+                    "null_key"
+                } else {
+                    "non_utf8_key"
+                };
+                metrics::counter!(
+                    "mirror_v3_notify_skipped_records_total",
+                    "topic" => topic_l,
+                    "partition" => partition_l,
+                    "reason" => reason,
+                )
+                .increment(1);
+                return Ok(());
+            }
+        };
         metrics::counter!(
             "mirror_v3_notify_records_total",
             "topic" => topic_l.clone(),
@@ -1258,21 +1296,9 @@ fn build_endpoint(target: &NotifyTarget, client: Client) -> Result<Endpoint, Bui
             url: target.url.clone(),
         });
     }
-    // Apply the api-default path when the operator left it implicit.
-    // An explicit `path:` override wins; a URL whose path is `/` (the
-    // default url crate emits for hostname-only inputs) is treated as
-    // "no path specified".
-    let explicit_path = target.path.as_deref();
-    let url_has_path = !matches!(url.path(), "" | "/");
-    let path_to_set: Option<&str> = explicit_path.or({
-        if url_has_path {
-            None
-        } else {
-            Some(KKV_V1_DEFAULT_PATH)
-        }
-    });
-    if let Some(p) = path_to_set {
-        url.set_path(p);
+    // kkv-v1's path when the URL names none.
+    if matches!(url.path(), "" | "/") {
+        url.set_path(KKV_V1_DEFAULT_PATH);
     }
     let target_host = url.host_str().unwrap_or("").to_string();
     let fan_out = match target.fan_out {
@@ -1302,13 +1328,6 @@ fn build_endpoint(target: &NotifyTarget, client: Client) -> Result<Endpoint, Bui
         client,
         fan_out,
     })
-}
-
-fn render_key(key: Option<&[u8]>) -> String {
-    match key {
-        None => String::new(),
-        Some(bytes) => String::from_utf8_lossy(bytes).into_owned(),
-    }
 }
 
 /// Exponential backoff capped at 30s. `base * 2^(attempt-1)`. Attempt
@@ -1376,13 +1395,11 @@ fn classify(result: reqwest::Result<reqwest::Response>, error: &mut String) -> O
             } else if status.is_client_error() {
                 *error = format!("HTTP {status}");
                 Outcome::FourXx
-            } else if status.is_server_error() {
+            } else {
+                // 5xx, and the 1xx a final response cannot be (reqwest
+                // consumes interim ones): not a delivery.
                 *error = format!("HTTP {status}");
                 Outcome::FiveXx
-            } else {
-                // 1xx; informational. Treat as 2xx (spec doesn't
-                // enumerate; reqwest already filters most of these).
-                Outcome::TwoXx
             }
         }
         Err(e) => {
@@ -1479,20 +1496,9 @@ mod unit_tests {
     }
 
     #[test]
-    fn render_key_handles_none_and_lossy_utf8() {
-        assert_eq!(render_key(None), "");
-        assert_eq!(render_key(Some(b"hello")), "hello");
-        // 0xff is not valid UTF-8; lossy substitution should produce
-        // the replacement character rather than panicking.
-        let s = render_key(Some(&[b'a', 0xff, b'b']));
-        assert!(s.starts_with('a') && s.ends_with('b'));
-    }
-
-    #[test]
     fn build_endpoint_applies_default_kkv_path_when_url_is_host_only() {
         let target = NotifyTarget {
             url: "http://kkv-target.example".into(),
-            path: None,
             fan_out: mirror_config::FanOut::None,
         };
         let ep = build_endpoint(&target, Client::new()).unwrap();
@@ -1500,21 +1506,9 @@ mod unit_tests {
     }
 
     #[test]
-    fn build_endpoint_respects_explicit_path_override() {
-        let target = NotifyTarget {
-            url: "http://kkv-target.example".into(),
-            path: Some("/custom/route".into()),
-            fan_out: mirror_config::FanOut::None,
-        };
-        let ep = build_endpoint(&target, Client::new()).unwrap();
-        assert_eq!(ep.url.path(), "/custom/route");
-    }
-
-    #[test]
     fn build_endpoint_respects_path_in_url_when_no_override() {
         let target = NotifyTarget {
             url: "http://kkv-target.example/already/has/path".into(),
-            path: None,
             fan_out: mirror_config::FanOut::None,
         };
         let ep = build_endpoint(&target, Client::new()).unwrap();
@@ -1525,7 +1519,6 @@ mod unit_tests {
     fn build_endpoint_rejects_non_http_scheme() {
         let target = NotifyTarget {
             url: "file:///etc/passwd".into(),
-            path: None,
             fan_out: mirror_config::FanOut::None,
         };
         let err = build_endpoint(&target, Client::new()).unwrap_err();

@@ -60,7 +60,6 @@ fn cfg(root: &std::path::Path, compaction: Option<CompactionMode>) -> Filesystem
         keys: ColumnType::Utf8,
         values: ColumnType::Utf8,
         compaction,
-        cache: None,
         // Huge thresholds so explicit `flush()` is the only thing
         // that actually rotates a file; matrix rows that *don't*
         // call flush get to control buffer state precisely.
@@ -123,11 +122,11 @@ enum Outcome {
     NextExpectedIs(u64),
     /// `SinkError::UnexpectedPosition { expected, actual }`.
     UnexpectedPosition { expected: u64, actual: u64 },
-    /// `SinkError::Transport(message)` where the message contains
+    /// `SinkError::Inconsistent(message)` where the message contains
     /// this substring. Used for the align preconditions, which fail
-    /// with descriptive transport errors rather than the structured
+    /// with a descriptive message rather than the structured
     /// `UnexpectedPosition` variant.
-    TransportContains(&'static str),
+    InconsistentContains(&'static str),
 }
 
 struct Case {
@@ -233,10 +232,10 @@ async fn run_case(case: &Case) {
                 case.name
             );
         }
-        (Outcome::TransportContains(needle), Err(SinkError::Transport(msg))) => {
+        (Outcome::InconsistentContains(needle), Err(SinkError::Inconsistent(msg))) => {
             assert!(
                 msg.contains(needle),
-                "[{}] Transport({msg:?}) should contain {needle:?}",
+                "[{}] Inconsistent({msg:?}) should contain {needle:?}",
                 case.name
             );
         }
@@ -272,17 +271,14 @@ fn matrix_cases() -> Vec<Case> {
             action: Action::Write(0),
             expected: Outcome::Ok,
         },
-        // append × empty × write above expected → reject (gap forbidden)
+        // append × empty × write above expected → OK: a source offset hole
         Case {
-            name: "append/empty/write_above_expected/rejects",
+            name: "append/empty/write_above_expected/hole_ok",
             mode: Mode::Append,
             preload: &[],
             buffer_state: BufferState::Empty,
             action: Action::Write(5),
-            expected: Outcome::UnexpectedPosition {
-                expected: 0,
-                actual: 5,
-            },
+            expected: Outcome::Ok,
         },
         // append × empty (post-flush, durable=5) × write below durable → reject (backwards)
         Case {
@@ -305,17 +301,14 @@ fn matrix_cases() -> Vec<Case> {
             action: Action::Write(3),
             expected: Outcome::Ok,
         },
-        // append × non-empty × write above expected → reject (gap forbidden)
+        // append × non-empty × write above expected → OK: a source offset hole
         Case {
-            name: "append/non_empty/write_above_expected/rejects",
+            name: "append/non_empty/write_above_expected/hole_ok",
             mode: Mode::Append,
             preload: &[0, 1, 2],
             buffer_state: BufferState::NonEmpty,
             action: Action::Write(7),
-            expected: Outcome::UnexpectedPosition {
-                expected: 3,
-                actual: 7,
-            },
+            expected: Outcome::Ok,
         },
         // append × non-empty × write below buffered head → reject (backwards)
         Case {
@@ -414,7 +407,7 @@ fn matrix_cases() -> Vec<Case> {
             preload: &[0, 1, 2],
             buffer_state: BufferState::NonEmpty,
             action: Action::Align { low_watermark: 461 },
-            expected: Outcome::TransportContains("inconsistent state"),
+            expected: Outcome::InconsistentContains("inconsistent state"),
         },
         // append × empty × align → reject (compaction-mode precondition)
         Case {
@@ -423,13 +416,25 @@ fn matrix_cases() -> Vec<Case> {
             preload: &[],
             buffer_state: BufferState::Empty,
             action: Action::Align { low_watermark: 461 },
-            expected: Outcome::TransportContains("non-compaction sink"),
+            expected: Outcome::InconsistentContains("non-compaction sink"),
         },
         // ============================================================
         //  FLUSH; filename encodes the offset range correctly
         // ============================================================
 
         // append × non-empty × flush → file `<dur>-<dur+len-1>` (contiguous)
+        // append × non-empty with a hole × flush → the name covers the hole
+        Case {
+            name: "append/non_empty_with_hole/flush/name_covers_hole",
+            mode: Mode::Append,
+            preload: &[0, 1, 5],
+            buffer_state: BufferState::NonEmpty,
+            action: Action::Flush {
+                expected_from: 0,
+                expected_to: 5,
+            },
+            expected: Outcome::Ok,
+        },
         Case {
             name: "append/non_empty/flush/contiguous_filename",
             mode: Mode::Append,

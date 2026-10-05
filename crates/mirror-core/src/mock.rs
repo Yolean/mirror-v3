@@ -191,6 +191,12 @@ impl Sink for MockSink {
         self.allows_compacted_source
     }
 
+    /// A compaction-capable mock stands for a blob destination, which
+    /// accepts holes; the default stands for a Kafka destination.
+    fn allows_offset_holes(&self) -> bool {
+        self.allows_compacted_source
+    }
+
     async fn align_to_source_low_watermark(&mut self, low_watermark: u64) -> Result<(), SinkError> {
         // Mirror the real sinks: advance the in-memory position so
         // the next `write()` accepts a record at `low_watermark`.

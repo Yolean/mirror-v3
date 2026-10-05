@@ -28,7 +28,8 @@ fn cfg(store: Arc<dyn ObjectStore>, max_offsets: u64) -> S3SinkConfig {
     // Tests use ndjson for ergonomic byte-level assertions; the
     // parquet path is covered by mirror-envelope round-trip tests.
     S3SinkConfig {
-        store,
+        read_store: Arc::clone(&store),
+        write_store: store,
         prefix: Some(Path::from("archive")),
         destination_name: "ops".into(),
         partition: 0,
@@ -37,7 +38,7 @@ fn cfg(store: Arc<dyn ObjectStore>, max_offsets: u64) -> S3SinkConfig {
         keys: mirror_envelope::ColumnType::Utf8,
         values: mirror_envelope::ColumnType::Utf8,
         compaction: None,
-        cache: None,
+        encryption: None,
         flush: FlushTriggers {
             max_time: Duration::from_secs(3600),
             max_bytes: u64::MAX,
@@ -113,12 +114,21 @@ async fn restart_recomputes_position_from_listing() {
 }
 
 #[tokio::test]
-async fn rejects_out_of_order_write() {
+async fn keeps_offset_holes_and_rejects_going_back() {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let mut sink = S3Sink::open(cfg(Arc::clone(&store), 100)).await.unwrap();
     sink.write(rec(0)).await.unwrap();
-    let err = sink.write(rec(2)).await.expect_err("gap must error");
+    sink.write(rec(2)).await.unwrap();
+    let err = sink.write(rec(1)).await.expect_err("backwards must error");
     assert!(format!("{err}").contains("expected"), "got {err}");
+    sink.flush_now().await.unwrap();
+    assert_eq!(
+        list_names(store.as_ref(), &Path::from("archive/ops/0")).await,
+        vec!["00000000000000000000-00000000000000000002.ndjson".to_string()]
+    );
+    drop(sink);
+    let mut reopened = S3Sink::open(cfg(Arc::clone(&store), 100)).await.unwrap();
+    assert_eq!(reopened.next_expected_offset().await.unwrap(), 3);
 }
 
 #[tokio::test]
@@ -141,7 +151,8 @@ async fn put_mode_create_rejects_overwrite() {
     // at offset 0:
     let store2: Arc<dyn ObjectStore> = Arc::clone(&store);
     let mut competitor = S3Sink::open(S3SinkConfig {
-        store: store2,
+        read_store: Arc::clone(&store2),
+        write_store: store2,
         prefix: Some(Path::from("archive")),
         destination_name: "ops".into(),
         partition: 0,
@@ -150,7 +161,7 @@ async fn put_mode_create_rejects_overwrite() {
         keys: mirror_envelope::ColumnType::Utf8,
         values: mirror_envelope::ColumnType::Utf8,
         compaction: None,
-        cache: None,
+        encryption: None,
         flush: FlushTriggers {
             max_time: Duration::from_secs(3600),
             max_bytes: u64::MAX,
@@ -216,7 +227,8 @@ async fn corrupt_chain_is_rejected_on_open() {
 
 fn cfg_compacted(store: Arc<dyn ObjectStore>, max_offsets: u64) -> S3SinkConfig {
     S3SinkConfig {
-        store,
+        read_store: Arc::clone(&store),
+        write_store: store,
         prefix: Some(Path::from("archive")),
         destination_name: "ops".into(),
         partition: 0,
@@ -225,7 +237,7 @@ fn cfg_compacted(store: Arc<dyn ObjectStore>, max_offsets: u64) -> S3SinkConfig 
         keys: mirror_envelope::ColumnType::Utf8,
         values: mirror_envelope::ColumnType::Utf8,
         compaction: Some(mirror_s3::CompactionMode::Log),
-        cache: None,
+        encryption: None,
         flush: FlushTriggers {
             max_time: Duration::from_secs(3600),
             max_bytes: u64::MAX,
@@ -288,4 +300,28 @@ async fn compaction_rejects_null_key_at_write() {
     r.key = None;
     let err = sink.write(r).await.expect_err("null key must be rejected");
     assert!(format!("{err}").contains("null"), "got: {err}");
+}
+
+/// `max-time` was only evaluated in `write`, so a
+/// burst followed by silence stayed in memory until the next record.
+/// The loop's idle path (`next_expected_offset` on an empty poll) now
+/// flushes it.
+#[tokio::test]
+async fn max_time_flushes_while_idle() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let mut c = cfg(Arc::clone(&store), 100);
+    c.flush.max_time = Duration::from_millis(20);
+    let mut sink = S3Sink::open(c).await.unwrap();
+    sink.write(rec(0)).await.unwrap();
+    sink.write(rec(1)).await.unwrap();
+    assert_eq!(sink.next_expected_offset().await.unwrap(), 2);
+    assert!(list_names(store.as_ref(), &Path::from("archive/ops/0"))
+        .await
+        .is_empty());
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    assert_eq!(sink.next_expected_offset().await.unwrap(), 2);
+    assert_eq!(
+        list_names(store.as_ref(), &Path::from("archive/ops/0")).await,
+        vec!["00000000000000000000-00000000000000000001.ndjson".to_string()]
+    );
 }

@@ -15,6 +15,9 @@ use std::net::SocketAddr;
 
 use async_trait::async_trait;
 
+// See mirror-core's Source: async_trait's expansion trips clippy 1.99's
+// double_must_use.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait DnsAResolver: Send + Sync {
     /// Resolve `host:port` to the full A/AAAA address set.

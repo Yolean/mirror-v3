@@ -9,9 +9,9 @@
 //! See `TESTING.md` at the repo root for the catalogue of layers and
 //! which one a given spec change belongs in.
 
-use mirror_core::mock::{rec, MockSource, MockSourceEvent};
+use mirror_core::mock::{rec, MockSink, MockSource, MockSourceEvent};
 use mirror_core::testing::{BlanketMockSink, Call};
-use mirror_core::{run_mirror, MirrorError, SinkError};
+use mirror_core::{run_mirror, MirrorError, Sink, SinkError, TeeSink};
 
 fn drive<F>(future: F) -> Result<(), MirrorError>
 where
@@ -177,61 +177,61 @@ fn palette_records_call_order_for_post_hoc_assertion() {
 
 /// Demonstration #5; TDD sketch for a future spec.
 ///
-/// This test is `#[ignore]`d because the spec it asserts on doesn't
-/// exist yet. It compiles, runs in `--include-ignored` mode, and
-/// fails with a clear panic naming the work to do; exactly the
-/// red-green-refactor entrypoint a contributor wants when picking
-/// up the work.
-///
 /// **The spec:** "It's a fatal condition if any sink has a higher
-/// offset than its source." Concretely: at startup, the run loop
-/// must compare `sink.next_expected_offset()` against
-/// `source.high_watermark()` and crash with a specific error if the
-/// sink is ahead.
-///
-/// **What the palette provides today:**
-///   - `MockSource::with_high_watermark(100)` to script the source's
-///     HWM (the trait method's default is `u64::MAX` so existing
-///     tests are unaffected).
-///   - `BlanketMockSink::with_next_expected_offset(150)` to script
-///     a sink that's ahead.
-///
-/// **What the spec implementer would add:**
-///   - A new `MirrorError::SinkAheadOfSource { sink_offset, source_hwm }`
-///     variant in `crates/mirror-core/src/lib.rs`.
-///   - A check in `run_mirror_with_heartbeat` after the initial
-///     `sink.next_expected_offset()` call (or on idle, if the spec
-///     wants ongoing monitoring) that calls `source.high_watermark()`
-///     and returns the new variant when sink > hwm.
-///
-/// Removing the `#[ignore]` and replacing the body with the actual
-/// assertion (see the commented sketch below) is the green-side
-/// landing.
+/// offset than its source." At startup, the run loop compares
+/// `sink.furthest_next_offset()` against `source.high_watermark()` and
+/// fails with `SinkAheadOfSource` if the sink is ahead
+/// (a recreated topic otherwise crash-loops on SourceWentBackwards,
+/// or gets appended to the old topic's chain without an error).
 #[test]
-#[ignore = "TODO: spec not yet implemented; see body for the TDD pattern"]
-fn future_spec_sink_ahead_of_source_is_fatal() {
-    // Palette setup that the future test would use:
-    //
-    // let source = MockSource::new([MockSourceEvent::Hang])
-    //     .with_high_watermark(100); // broker HWM
-    // let sink = BlanketMockSink::builder()
-    //     .with_next_expected_offset(150); // sink claims to be at 150
-    //
-    // let result = drive(run_mirror(source, sink, never()));
-    // match result {
-    //     Err(MirrorError::SinkAheadOfSource { sink_offset, source_hwm }) => {
-    //         assert_eq!(sink_offset, 150);
-    //         assert_eq!(source_hwm, 100);
-    //     }
-    //     other => panic!("expected SinkAheadOfSource, got {other:?}"),
-    // }
-    panic!(
-        "Implement `MirrorError::SinkAheadOfSource` + the HWM check in \
-         `run_mirror_with_heartbeat`, then drop the `#[ignore]` and \
-         uncomment the body above. The palette ({MockSource}::with_high_watermark, \
-         {BlanketMockSink}::with_next_expected_offset) already supports \
-         everything the test needs.",
-        MockSource = "MockSource",
-        BlanketMockSink = "BlanketMockSink"
+fn sink_ahead_of_source_is_fatal() {
+    let source = MockSource::new([MockSourceEvent::Hang]).with_high_watermark(100);
+    let sink = BlanketMockSink::builder().with_next_expected_offset(150);
+    match drive(run_mirror(source, sink, never())) {
+        Err(MirrorError::SinkAheadOfSource {
+            sink_offset,
+            source_hwm,
+        }) => {
+            assert_eq!(sink_offset, 150);
+            assert_eq!(source_hwm, 100);
+        }
+        other => panic!("expected SinkAheadOfSource, got {other:?}"),
+    }
+}
+
+/// The same spec through a tee that resumes below its furthest inner
+/// sink: one destination behind the source, one ahead of it, and a
+/// replay floor at the low watermark (a cache mirror with destinations).
+/// The tee resumes at 0, under the source's high watermark, but the
+/// destination at 150 is ahead of the source and the mirror must not
+/// start.
+#[test]
+fn sink_ahead_of_source_is_fatal_behind_a_resume_floor() {
+    let source = MockSource::new([MockSourceEvent::Hang]).with_high_watermark(100);
+    let mut tee = TeeSink::from_inners_for_test(
+        vec![
+            (
+                "behind".into(),
+                Box::new(MockSink::starting_at(40)) as Box<dyn Sink>,
+                40,
+            ),
+            (
+                "ahead".into(),
+                Box::new(MockSink::starting_at(150)) as Box<dyn Sink>,
+                150,
+            ),
+        ],
+        None,
     );
+    tee.set_resume_floor(0);
+    match drive(run_mirror(source, tee, never())) {
+        Err(MirrorError::SinkAheadOfSource {
+            sink_offset,
+            source_hwm,
+        }) => {
+            assert_eq!(sink_offset, 150);
+            assert_eq!(source_hwm, 100);
+        }
+        other => panic!("expected SinkAheadOfSource, got {other:?}"),
+    }
 }

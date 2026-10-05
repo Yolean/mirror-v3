@@ -63,7 +63,6 @@ fn notify_dns_a() -> Notify {
             // it. Port 80 is the default; the dispatcher rewrites
             // both host and port per resolved SocketAddr.
             url: "http://stub-host.invalid".into(),
-            path: None,
             fan_out: FanOut::DnsA,
         }],
         trigger: NotifyTrigger {
@@ -124,8 +123,11 @@ async fn posts_to_every_resolved_address() {
     );
 }
 
+/// A headless Service with no ready pods (the consumers scaled to zero)
+/// resolves to no address: there is no one to notify, not a failure
+/// (a4240f9), so the batch counts as delivered.
 #[tokio::test]
-async fn empty_address_set_returns_transport_error() {
+async fn empty_address_set_is_no_target() {
     let calls = Arc::new(AtomicUsize::new(0));
     let resolver = Arc::new(StubResolver {
         addrs: vec![],
@@ -142,12 +144,8 @@ async fn empty_address_set_returns_transport_error() {
     )
     .unwrap();
 
-    let err = n.on_record(&rec(1)).await.unwrap_err();
-    let s = format!("{err}");
-    assert!(
-        s.contains("0 addresses"),
-        "error must mention 0-address result, got: {s}"
-    );
+    n.on_record(&rec(1)).await.expect("no address is no target");
+    assert!(calls.load(Ordering::SeqCst) >= 1, "the target was resolved");
 }
 
 #[tokio::test]

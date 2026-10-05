@@ -147,7 +147,6 @@ async fn flush_dispatcher_acks_through_to_plus_one_on_success() {
         api: NotifyApi::KkvV1,
         targets: vec![NotifyTarget {
             url: format!("http://{}", server.addr),
-            path: None,
             fan_out: FanOut::None,
         }],
         trigger: NotifyTrigger {
@@ -203,7 +202,6 @@ async fn flush_dispatcher_does_not_ack_when_dispatch_exhausts() {
         api: NotifyApi::KkvV1,
         targets: vec![NotifyTarget {
             url: format!("http://{}", server.addr),
-            path: None,
             fan_out: FanOut::None,
         }],
         trigger: NotifyTrigger {

@@ -24,7 +24,7 @@ mirrors:
         root: /var/mirror
     format: parquet
     compression: zstd-1
-    http-access: { cache-v1: {} }
+    http-access: { cache-v1: {}, cache-v1-main: {} }
     flush:
       max-time-ms: 60000
       max-bytes: 67108864
@@ -44,7 +44,6 @@ fn minimal_notify_block_parses_with_all_defaults() {
     assert_eq!(notify.api, NotifyApi::KkvV1);
     assert_eq!(notify.targets.len(), 1);
     assert_eq!(notify.targets[0].url, "http://events-cache:8080");
-    assert_eq!(notify.targets[0].path, None);
     assert_eq!(notify.targets[0].fan_out, mirror_config::FanOut::None);
 
     // Spec-default trigger + debounce.
@@ -119,7 +118,7 @@ mirrors:
     destinations:
       - type: filesystem
         root: /var/mirror
-    http-access: { cache-v1: {} }
+    http-access: { cache-v1: {}, cache-v1-main: {} }
     flush:
       max-time-ms: 60000
       max-bytes: 67108864
@@ -128,12 +127,10 @@ mirrors:
       api: kkv-v1
       targets:
         - url: http://my-headless-service:8080
-          path: /custom/path
           fan-out: dns-a
 "#;
     let cfg = load_from_str(yaml).expect("must parse");
     let t = &cfg.mirrors[0].notify.as_ref().unwrap().targets[0];
-    assert_eq!(t.path.as_deref(), Some("/custom/path"));
     assert_eq!(t.fan_out, mirror_config::FanOut::DnsA);
 }
 
@@ -180,7 +177,7 @@ mirrors:
     destinations:
       - type: filesystem
         root: /var/mirror
-    http-access: { cache-v1: {} }
+    http-access: { cache-v1: {}, cache-v1-main: {} }
     flush:
       max-time-ms: 60000
       max-bytes: 67108864
@@ -208,7 +205,7 @@ mirrors:
     destinations:
       - type: filesystem
         root: /var/mirror
-    http-access: { cache-v1: {} }
+    http-access: { cache-v1: {}, cache-v1-main: {} }
     flush:
       max-time-ms: 60000
       max-bytes: 67108864
@@ -237,7 +234,7 @@ mirrors:
     destinations:
       - type: filesystem
         root: /var/mirror
-    http-access: { cache-v1: {} }
+    http-access: { cache-v1: {}, cache-v1-main: {} }
     flush:
       max-time-ms: 60000
       max-bytes: 67108864
@@ -266,7 +263,7 @@ mirrors:
     destinations:
       - type: filesystem
         root: /var/mirror
-    http-access: { cache-v1: {} }
+    http-access: { cache-v1: {}, cache-v1-main: {} }
     flush:
       max-time-ms: 60000
       max-bytes: 67108864
@@ -298,7 +295,7 @@ mirrors:
     destinations:
       - type: filesystem
         root: /var/mirror
-    http-access: { cache-v1: {} }
+    http-access: { cache-v1: {}, cache-v1-main: {} }
     flush:
       max-time-ms: 60000
       max-bytes: 67108864
@@ -330,7 +327,7 @@ mirrors:
     destinations:
       - type: filesystem
         root: /var/mirror
-    http-access: { cache-v1: {} }
+    http-access: { cache-v1: {}, cache-v1-main: {} }
     flush:
       max-time-ms: 60000
       max-bytes: 67108864
@@ -360,7 +357,7 @@ mirrors:
     destinations:
       - type: filesystem
         root: /var/mirror
-    http-access: { cache-v1: {} }
+    http-access: { cache-v1: {}, cache-v1-main: {} }
     flush:
       max-time-ms: 60000
       max-bytes: 67108864
@@ -445,32 +442,44 @@ mirrors:
     let err = load_from_str(yaml).expect_err("must reject");
     let msg = format!("{err}");
     assert!(
-        msg.contains("notify-only") && msg.contains("source-consume"),
+        msg.contains("without destinations") && msg.contains("source-consume"),
         "got: {msg}"
     );
 }
 
+/// A cache mirror needs no destination: it is built from the source's
+/// low watermark, like kafka-keyvalue. With notify this is kkv's shape.
 #[test]
-fn notify_only_with_http_access_rejected() {
+fn no_destinations_with_cache_and_notify_accepted() {
     let yaml = r#"
 mirrors:
-  - name: invalidator
-    source: { bootstrap-servers: kafka:9092 }
+  - name: userstate
+    source: { bootstrap-servers: kafka:9092, group-id: mirror-v3-userstate }
     topic: events
     partition: 0
     destinations: []
-    http-access: { cache-v1: {} }
+    http-access: { cache-v1: {}, cache-v1-main: {} }
     notify:
       api: kkv-v1
       targets:
         - url: http://cache-target:8080
 "#;
+    let cfg = load_from_str(yaml).expect("cache + notify without destinations");
+    assert!(cfg.mirrors[0].destinations.is_empty());
+}
+
+#[test]
+fn no_destinations_and_nothing_else_rejected() {
+    let yaml = r#"
+mirrors:
+  - name: idle
+    source: { bootstrap-servers: kafka:9092 }
+    topic: events
+    partition: 0
+    destinations: []
+"#;
     let err = load_from_str(yaml).expect_err("must reject");
-    let msg = format!("{err}");
-    assert!(
-        msg.contains("notify-only") && msg.contains("http-access"),
-        "got: {msg}"
-    );
+    assert!(format!("{err}").contains("at least one entry"), "{err}");
 }
 
 #[test]
@@ -491,7 +500,7 @@ mirrors:
     let err = load_from_str(yaml).expect_err("must reject");
     let msg = format!("{err}");
     assert!(
-        msg.contains("notify-only") && msg.contains("format"),
+        msg.contains("without destinations") && msg.contains("format"),
         "got: {msg}"
     );
 }
@@ -517,7 +526,7 @@ mirrors:
     let err = load_from_str(yaml).expect_err("must reject");
     let msg = format!("{err}");
     assert!(
-        msg.contains("notify-only") && msg.contains("flush"),
+        msg.contains("without destinations") && msg.contains("flush"),
         "got: {msg}"
     );
 }
@@ -537,10 +546,7 @@ mirrors:
 "#;
     let err = load_from_str(yaml).expect_err("must reject");
     let msg = format!("{err}");
-    assert!(
-        msg.contains("notify-only") && msg.contains("targets"),
-        "got: {msg}"
-    );
+    assert!(msg.contains("notify.targets"), "got: {msg}");
 }
 
 // ============================================================
@@ -608,4 +614,30 @@ fn destination_flush_with_filesystem_destination_is_accepted() {
         cfg.mirrors[0].notify.as_ref().unwrap().trigger.on,
         TriggerOn::DestinationFlush
     );
+}
+
+#[test]
+fn notify_requires_cache_v1_main() {
+    let yaml = r#"
+mirrors:
+  - name: events
+    source: { bootstrap-servers: k:9092 }
+    topic: events
+    partition: 0
+    destinations:
+      - type: filesystem
+        root: /var/mirror
+    flush:
+      max-time-ms: 60000
+      max-bytes: 67108864
+      max-offsets: 10000
+    http-access: { cache-v1: {} }
+    notify:
+      api: kkv-v1
+      targets:
+        - url: http://events-cache:8080
+"#;
+    let err = load_from_str(yaml).expect_err("notify without cache-v1-main must be rejected");
+    let msg = format!("{err}");
+    assert!(msg.contains("cache-v1-main"), "got: {msg}");
 }

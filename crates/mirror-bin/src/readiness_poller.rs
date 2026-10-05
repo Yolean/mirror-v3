@@ -24,31 +24,6 @@ use mirror_core::CacheState;
 use mirror_kafka::KafkaCommitHandle;
 use tokio::sync::watch;
 
-const DEFAULT_READINESS_POLL: Duration = Duration::from_secs(2);
-
-/// Read the poll interval from `MIRROR_V3_READINESS_POLL_MS`,
-/// falling back to [`DEFAULT_READINESS_POLL`]. A value of `0`
-/// disables the poller.
-pub fn readiness_poll_interval_from_env() -> Duration {
-    match std::env::var("MIRROR_V3_READINESS_POLL_MS").ok().as_deref() {
-        Some(s) => match s.parse::<u64>() {
-            Ok(ms) => Duration::from_millis(ms),
-            Err(_) => DEFAULT_READINESS_POLL,
-        },
-        None => DEFAULT_READINESS_POLL,
-    }
-}
-
-/// Read the lag tolerance from `MIRROR_V3_READINESS_LAG`, falling
-/// back to `0` (any positive lag fires `LagBehindSource`).
-pub fn readiness_lag_tolerance_from_env() -> u64 {
-    std::env::var("MIRROR_V3_READINESS_LAG")
-        .ok()
-        .as_deref()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0)
-}
-
 pub struct PollSpec {
     pub mirror_name: String,
     pub bootstrap_servers: String,
@@ -107,7 +82,23 @@ pub fn spawn_readiness_poller(
                     match hwm_result {
                         Ok(Ok(hwm)) => {
                             spec.cache
-                                .set_broker_end_offset(&spec.mirror_name, hwm.max(0) as u64);
+                                .set_broker_end_offset(&spec.mirror_name, hwm);
+                            // Lag is a metric, not an HTTP status (readiness
+                            // is sticky once caught up).
+                            if let Some(s) = spec
+                                .cache
+                                .status_snapshot()
+                                .into_iter()
+                                .find(|s| s.name == spec.mirror_name)
+                            {
+                                metrics::gauge!(
+                                    "mirror_v3_source_lag_offsets",
+                                    "topic" => spec.topic.clone(),
+                                    "partition" => spec.partition.to_string(),
+                                    "mirror" => spec.mirror_name.clone(),
+                                )
+                                .set(s.broker_end_offset.saturating_sub(s.last_applied_offset) as f64);
+                            }
                         }
                         Ok(Err(e)) => {
                             tracing::warn!(

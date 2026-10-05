@@ -210,6 +210,10 @@ impl Sink for BlanketMockSink {
         self.on_allows_compacted_source
     }
 
+    fn allows_offset_holes(&self) -> bool {
+        self.on_allows_compacted_source
+    }
+
     async fn align_to_source_low_watermark(&mut self, low_watermark: u64) -> Result<(), SinkError> {
         self.calls
             .lock()

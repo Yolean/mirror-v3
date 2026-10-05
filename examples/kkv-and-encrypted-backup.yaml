@@ -1,0 +1,105 @@
+# yaml-language-server: $schema=../schemas/mirror-v3.config.schema.json
+#
+# One process, three mirrors: a shape that replaces
+# kafka-keyvalue for the userstate topic and back up two topics to S3.
+#
+#   userstate          kafka-keyvalue's job: the /cache/v1 surface (built
+#                      from the topic's low watermark) and the kkv-v1
+#                      onupdate webhooks to every consumer pod behind the
+#                      headless target Service. No destination, so S3
+#                      cannot stop the cache or the notifications.
+#   userstate-backup   The same topic, as encrypted Parquet blobs.
+#   operations-backup  The operations topic, as encrypted Parquet blobs.
+#
+# A backup mirror that fails (S3 down) is opened again inside the
+# process after a backoff; the cache mirror is not affected.
+#
+# The S3 identities are least-privilege ones: the writer may only
+# PutObject, the lister may only list keys. The Parquet keys directory
+# is a mounted Secret in the observability compactor's layout.
+
+mirrors:
+
+- name: userstate
+  source:
+    bootstrap-servers: ${USERSTATES_BOOTSTRAP:-kafka:9092}
+    group-id: mirror-v3-userstate
+  topic: ${USERSTATES_TOPIC:-user-states}
+  partition: 0
+  destinations: []
+  http-access:
+    cache-v1: {}
+    cache-v1-main: {}
+  notify:
+    api: kkv-v1
+    targets:
+    - url: http://kkvtarget-userstate:8080
+      fan-out: dns-a
+    trigger:
+      on: source-consume
+      debounce:
+        max-records: 100
+        max-time-ms: 250
+    timeout-ms: 5000
+    retry:
+      max-attempts: 5
+      backoff-ms: 500
+    # A consumer that is restarting, not listening yet, or answering an
+    # error is retried with the rest of the fan-out, re-resolved each
+    # round, and then skipped (logged, the batch counts as delivered) so
+    # one pod cannot stop the cache; a redirect is a misconfiguration.
+    outcomes:
+      timeout:     { retry: true,  final: skip }
+      connrefused: { retry: true,  final: skip }
+      2xx:         { retry: false, final: accept }
+      3xx:         { retry: false, final: fail }
+      4xx:         { retry: true,  final: skip }
+      5xx:         { retry: true,  final: skip }
+
+- name: userstate-backup
+  source:
+    bootstrap-servers: ${USERSTATES_BOOTSTRAP:-kafka:9092}
+    group-id: mirror-v3-userstate-backup
+  topic: ${USERSTATES_TOPIC:-user-states}
+  partition: 0
+  destinations:
+  - type: s3
+    name: userstate
+    endpoint: ${MIRROR_S3_ENDPOINT:-http://versitygw.observability-s3:7070}
+    region: ${MIRROR_S3_REGION:-example-region}
+    bucket: ${MIRROR_S3_BUCKET:-mirror-v3}
+    prefix: sites/${SITE:-dev}
+    credentials:
+      write: { access-key-id-env: MIRROR_S3_WRITE_ACCESS_KEY_ID, secret-access-key-env: MIRROR_S3_WRITE_SECRET_ACCESS_KEY }
+      read: { access-key-id-env: MIRROR_S3_READ_ACCESS_KEY_ID, secret-access-key-env: MIRROR_S3_READ_SECRET_ACCESS_KEY }
+    encryption: { keys-dir: /etc/mirror-v3/parquet-keys, key-id: "${PARQUET_KEY_ID:-k1}" }
+  format: parquet
+  compression: zstd-1
+  flush:
+    max-time-ms: 60000
+    max-bytes: 16777216
+    max-offsets: 10000
+
+- name: operations-backup
+  source:
+    bootstrap-servers: ${OPS_BOOTSTRAP:-kafka:9092}
+    group-id: mirror-v3-operations-backup
+  topic: ${OPS_TOPIC:-operations}
+  partition: 0
+  destinations:
+  - type: s3
+    name: operations
+    endpoint: ${MIRROR_S3_ENDPOINT:-http://versitygw.observability-s3:7070}
+    region: ${MIRROR_S3_REGION:-example-region}
+    bucket: ${MIRROR_S3_BUCKET:-mirror-v3}
+    prefix: sites/${SITE:-dev}
+    credentials:
+      write: { access-key-id-env: MIRROR_S3_WRITE_ACCESS_KEY_ID, secret-access-key-env: MIRROR_S3_WRITE_SECRET_ACCESS_KEY }
+      read: { access-key-id-env: MIRROR_S3_READ_ACCESS_KEY_ID, secret-access-key-env: MIRROR_S3_READ_SECRET_ACCESS_KEY }
+    encryption: { keys-dir: /etc/mirror-v3/parquet-keys, key-id: "${PARQUET_KEY_ID:-k1}" }
+  format: parquet
+  compression: zstd-1
+  flush:
+    max-time-ms: 60000
+    max-bytes: 16777216
+    max-offsets: 10000

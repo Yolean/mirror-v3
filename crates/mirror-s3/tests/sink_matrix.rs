@@ -40,7 +40,8 @@ fn cfg(store: Arc<dyn ObjectStore>, compaction: Option<CompactionMode>) -> S3Sin
         None => Format::Ndjson,
     };
     S3SinkConfig {
-        store,
+        read_store: Arc::clone(&store),
+        write_store: store,
         prefix: Some(Path::from("archive")),
         destination_name: "ops".into(),
         partition: 0,
@@ -49,7 +50,7 @@ fn cfg(store: Arc<dyn ObjectStore>, compaction: Option<CompactionMode>) -> S3Sin
         keys: ColumnType::Utf8,
         values: ColumnType::Utf8,
         compaction,
-        cache: None,
+        encryption: None,
         flush: FlushTriggers {
             max_time: Duration::from_secs(3600),
             max_bytes: u64::MAX,
@@ -98,7 +99,7 @@ enum Outcome {
     Ok,
     NextExpectedIs(u64),
     UnexpectedPosition { expected: u64, actual: u64 },
-    TransportContains(&'static str),
+    InconsistentContains(&'static str),
 }
 
 struct Case {
@@ -195,10 +196,10 @@ async fn run_case(case: &Case) {
                 case.name
             );
         }
-        (Outcome::TransportContains(needle), Err(SinkError::Transport(msg))) => {
+        (Outcome::InconsistentContains(needle), Err(SinkError::Inconsistent(msg))) => {
             assert!(
                 msg.contains(needle),
-                "[{}] Transport({msg:?}) should contain {needle:?}",
+                "[{}] Inconsistent({msg:?}) should contain {needle:?}",
                 case.name
             );
         }
@@ -231,16 +232,19 @@ fn matrix_cases() -> Vec<Case> {
             action: Action::Write(0),
             expected: Outcome::Ok,
         },
+        // append × empty × write above expected → OK: a source offset hole
         Case {
-            name: "append/empty/write_above_expected/rejects",
+            name: "append/empty/write_above_expected/hole_ok",
+
             mode: Mode::Append,
+
             preload: &[],
+
             buffer_state: BufferState::Empty,
+
             action: Action::Write(5),
-            expected: Outcome::UnexpectedPosition {
-                expected: 0,
-                actual: 5,
-            },
+
+            expected: Outcome::Ok,
         },
         Case {
             name: "append/empty_after_flush/write_below_durable/rejects",
@@ -261,16 +265,19 @@ fn matrix_cases() -> Vec<Case> {
             action: Action::Write(3),
             expected: Outcome::Ok,
         },
+        // append × non-empty × write above expected → OK: a source offset hole
         Case {
-            name: "append/non_empty/write_above_expected/rejects",
+            name: "append/non_empty/write_above_expected/hole_ok",
+
             mode: Mode::Append,
+
             preload: &[0, 1, 2],
+
             buffer_state: BufferState::NonEmpty,
+
             action: Action::Write(7),
-            expected: Outcome::UnexpectedPosition {
-                expected: 3,
-                actual: 7,
-            },
+
+            expected: Outcome::Ok,
         },
         Case {
             name: "append/non_empty/write_below_buffered_head/rejects",
@@ -357,7 +364,7 @@ fn matrix_cases() -> Vec<Case> {
             preload: &[0, 1, 2],
             buffer_state: BufferState::NonEmpty,
             action: Action::Align { low_watermark: 461 },
-            expected: Outcome::TransportContains("inconsistent state"),
+            expected: Outcome::InconsistentContains("inconsistent state"),
         },
         Case {
             name: "append/empty/align/rejects_on_non_compaction_sink",
@@ -365,11 +372,23 @@ fn matrix_cases() -> Vec<Case> {
             preload: &[],
             buffer_state: BufferState::Empty,
             action: Action::Align { low_watermark: 461 },
-            expected: Outcome::TransportContains("non-compaction sink"),
+            expected: Outcome::InconsistentContains("non-compaction sink"),
         },
         // ============================================================
         //  FLUSH
         // ============================================================
+        // append × non-empty with a hole × flush → the name covers the hole
+        Case {
+            name: "append/non_empty_with_hole/flush/name_covers_hole",
+            mode: Mode::Append,
+            preload: &[0, 1, 5],
+            buffer_state: BufferState::NonEmpty,
+            action: Action::Flush {
+                expected_from: 0,
+                expected_to: 5,
+            },
+            expected: Outcome::Ok,
+        },
         Case {
             name: "append/non_empty/flush/contiguous_object_name",
             mode: Mode::Append,

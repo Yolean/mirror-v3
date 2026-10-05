@@ -18,6 +18,7 @@ use mirror_core::{
 };
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{BaseConsumer, CommitMode, Consumer, StreamConsumer};
+use rdkafka::error::RDKafkaErrorCode;
 use rdkafka::message::{Header as RdHeader, Headers, Message, OwnedHeaders};
 use rdkafka::producer::{FutureProducer, FutureRecord};
 use rdkafka::topic_partition_list::Offset;
@@ -36,7 +37,7 @@ pub fn fetch_high_watermark(
     topic: &str,
     partition: i32,
     timeout: Duration,
-) -> Result<i64, KafkaError> {
+) -> Result<u64, KafkaError> {
     let (_low, high) = fetch_watermarks(bootstrap, topic, partition, timeout)?;
     Ok(high)
 }
@@ -50,7 +51,7 @@ pub fn fetch_low_watermark(
     topic: &str,
     partition: i32,
     timeout: Duration,
-) -> Result<i64, KafkaError> {
+) -> Result<u64, KafkaError> {
     let (low, _high) = fetch_watermarks(bootstrap, topic, partition, timeout)?;
     Ok(low)
 }
@@ -58,7 +59,8 @@ pub fn fetch_low_watermark(
 /// Read the broker's `__consumer_offsets` entry for the
 /// `(group_id, topic, partition)` tuple. `Ok(None)` is the
 /// "no committed value yet" sentinel (a fresh group, or a group
-/// that hasn't committed for this partition). Sync; wrap in
+/// that hasn't committed for this partition); a committed value that
+/// is not a position is an error. Sync; wrap in
 /// `spawn_blocking` for async contexts. Mirrors the `fetch_*_watermark`
 /// pattern so the supervisor can read the per-mirror committed
 /// offset at startup without instantiating a full `KafkaSource`.
@@ -85,12 +87,27 @@ pub fn fetch_committed_offset(
             "committed_offsets returned no entry for {topic}/{partition}"
         ))
     })?;
-    match elem.offset() {
+    committed_position(elem.offset(), group_id, topic, partition)
+}
+
+/// A committed offset as a position: `Invalid` is librdkafka's "no
+/// committed offset for this group" (`None`). Anything else that is not
+/// a position (a logical offset, a negative number) is an error: reading
+/// it as "no commit" would turn a returning deploy into a fresh one
+/// (notify suppression from the high watermark).
+fn committed_position(
+    offset: Offset,
+    group_id: &str,
+    topic: &str,
+    partition: i32,
+) -> Result<Option<u64>, KafkaError> {
+    match offset {
         Offset::Offset(n) if n >= 0 => Ok(Some(n as u64)),
-        // `Invalid` is librdkafka's "no committed offset for this
-        // group". The other `Offset::*` variants don't appear in a
-        // `committed_offsets` result; treat them as `None`.
-        _ => Ok(None),
+        Offset::Invalid => Ok(None),
+        other => Err(KafkaError::Init(format!(
+            "group {group_id} has committed offset {other:?} for {topic}/{partition}, \
+             which is not a position"
+        ))),
     }
 }
 
@@ -99,16 +116,30 @@ fn fetch_watermarks(
     topic: &str,
     partition: i32,
     timeout: Duration,
-) -> Result<(i64, i64), KafkaError> {
+) -> Result<(u64, u64), KafkaError> {
     let consumer: BaseConsumer = ClientConfig::new()
         .set("bootstrap.servers", bootstrap)
         .set("group.id", "mirror-v3-status-noop")
         .set("enable.auto.commit", "false")
         .create()
         .map_err(|e| KafkaError::Init(e.to_string()))?;
-    consumer
+    let (low, high) = consumer
         .fetch_watermarks(topic, partition, Timeout::After(timeout))
-        .map_err(|e| KafkaError::Init(format!("fetch_watermarks: {e}")))
+        .map_err(|e| KafkaError::Init(format!("fetch_watermarks: {e}")))?;
+    Ok((
+        watermark(low, topic, partition)?,
+        watermark(high, topic, partition)?,
+    ))
+}
+
+/// librdkafka reports an unknown watermark as -1; that is an error, not
+/// offset 0 (which `.max(0)` used to make of it).
+fn watermark(w: i64, topic: &str, partition: i32) -> Result<u64, KafkaError> {
+    u64::try_from(w).map_err(|_| {
+        KafkaError::Init(format!(
+            "the broker reported watermark {w} for {topic}/{partition} (unknown)"
+        ))
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -151,23 +182,31 @@ pub struct KafkaSource {
     last_stored_offset: Arc<AtomicU64>,
 }
 
+/// Consumer settings for the source. Offsets are committed through
+/// [`KafkaCommitHandle`] only (`store_offsets` needs the auto-store
+/// path off). `auto.offset.reset=error`: the loop always seeks to an
+/// explicit position (the destination's next offset, or the low
+/// watermark), and if that position is gone (retention deleted it
+/// while the mirror was down or lagging) the source fails instead of
+/// jumping to the earliest offset. Blob destinations accept offset
+/// holes (compaction, transaction markers), so a silent jump would
+/// otherwise look like a hole and lose the records in between
+/// unnoticed. The legacy Java worker used `earliest`; it also failed
+/// whenever the destination did not match, which a hole-tolerant
+/// destination no longer does.
+fn consumer_config(bootstrap_servers: &str, group_id: &str) -> ClientConfig {
+    let mut cfg = ClientConfig::new();
+    cfg.set("bootstrap.servers", bootstrap_servers)
+        .set("group.id", group_id)
+        .set("enable.auto.commit", "false")
+        .set("enable.auto.offset.store", "false")
+        .set("auto.offset.reset", "error");
+    cfg
+}
+
 impl KafkaSource {
     pub fn open(cfg: KafkaSourceConfig) -> Result<Self, KafkaError> {
-        let consumer: StreamConsumer = ClientConfig::new()
-            .set("bootstrap.servers", &cfg.bootstrap_servers)
-            .set("group.id", &cfg.group_id)
-            .set("enable.auto.commit", "false")
-            // Required by `store_offsets`: rdkafka rejects manual
-            // offset staging when its auto-store path is also live.
-            // We always commit through `KafkaCommitHandle`, so the
-            // auto-store path is never the right choice here.
-            .set("enable.auto.offset.store", "false")
-            .set("auto.offset.reset", "earliest")
-            // Note: the Java worker used `max.poll.records=1` for
-            // single-record progression; that property is Java-client
-            // only, not librdkafka. The loop in mirror-core already
-            // takes one record at a time via `recv()` so we don't
-            // need a fetcher-side cap to preserve the invariant.
+        let consumer: StreamConsumer = consumer_config(&cfg.bootstrap_servers, &cfg.group_id)
             .create()
             .map_err(|e| KafkaError::Init(e.to_string()))?;
         Ok(Self {
@@ -325,7 +364,14 @@ impl Source for KafkaSource {
     async fn poll_one(&mut self) -> Result<Option<Record>, SourceError> {
         match tokio::time::timeout(self.poll_timeout, self.consumer.recv()).await {
             Ok(Ok(borrowed)) => Ok(Some(borrowed_to_record(&borrowed))),
-            Ok(Err(e)) => Err(SourceError::Transport(e.to_string())),
+            // `auto.offset.reset=error` reports a position the broker
+            // no longer has as AutoOffsetReset.
+            Ok(Err(e)) => Err(match e.rdkafka_error_code() {
+                Some(RDKafkaErrorCode::AutoOffsetReset | RDKafkaErrorCode::OffsetOutOfRange) => {
+                    SourceError::PositionLost(e.to_string())
+                }
+                _ => SourceError::Transport(e.to_string()),
+            }),
             Err(_elapsed) => Ok(None),
         }
     }
@@ -358,7 +404,20 @@ impl Source for KafkaSource {
         .await
         .map_err(|e| SourceError::Transport(format!("low_watermark join: {e}")))?
         .map_err(|e| SourceError::Transport(format!("fetch_low_watermark: {e}")))?;
-        Ok(low.max(0) as u64)
+        Ok(low)
+    }
+
+    async fn high_watermark(&mut self) -> Result<u64, SourceError> {
+        let bootstrap = self.bootstrap_servers.clone();
+        let topic = self.topic.clone();
+        let partition = self.partition;
+        let high = tokio::task::spawn_blocking(move || {
+            fetch_high_watermark(&bootstrap, &topic, partition, DEFAULT_WATERMARK_TIMEOUT)
+        })
+        .await
+        .map_err(|e| SourceError::Transport(format!("high_watermark join: {e}")))?
+        .map_err(|e| SourceError::Transport(format!("fetch_high_watermark: {e}")))?;
+        Ok(high)
     }
 
     async fn commit_through(&mut self, through: u64) -> Result<(), SourceError> {
@@ -484,6 +543,27 @@ impl KafkaSinkConfig {
     }
 }
 
+/// Producer settings for the Kafka destination. The high-watermark gate
+/// before each produce is the only retry: a produce that fails, or whose
+/// ack is lost, ends the mirror, and the restart re-reads the
+/// destination's high watermark, so a record that did land is not
+/// produced again and one that did not is produced once. librdkafka's own
+/// retries sit beneath the gate and cannot see it: a lost ack plus a
+/// retry writes the record twice, and the restart then skips the next
+/// source record. So `message.send.max.retries=0`.
+/// `acks=all`, idempotence off and one request in flight are the legacy
+/// Java worker's settings (MirrorProducer.java): the deployment that this
+/// replaces chose them, and the gate makes ordering explicit.
+fn producer_config(bootstrap_servers: &str) -> ClientConfig {
+    let mut cfg = ClientConfig::new();
+    cfg.set("bootstrap.servers", bootstrap_servers)
+        .set("acks", "all")
+        .set("enable.idempotence", "false")
+        .set("max.in.flight.requests.per.connection", "1")
+        .set("message.send.max.retries", "0");
+    cfg
+}
+
 pub struct KafkaSink {
     producer: FutureProducer,
     watermark_consumer: Arc<BaseConsumer>,
@@ -502,13 +582,7 @@ pub struct KafkaSink {
 
 impl KafkaSink {
     pub fn open(cfg: KafkaSinkConfig) -> Result<Self, KafkaError> {
-        let producer: FutureProducer = ClientConfig::new()
-            .set("bootstrap.servers", &cfg.bootstrap_servers)
-            .set("acks", "all")
-            // The gate is what enforces ordering; idempotence not needed
-            // and incompatible with the offset-equality assertion.
-            .set("enable.idempotence", "false")
-            .set("max.in.flight.requests.per.connection", "1")
+        let producer: FutureProducer = producer_config(&cfg.bootstrap_servers)
             .create()
             .map_err(|e| KafkaError::Init(e.to_string()))?;
         let watermark_consumer: BaseConsumer = ClientConfig::new()
@@ -541,7 +615,12 @@ impl KafkaSink {
         .await
         .map_err(|e| SinkError::Transport(format!("join: {e}")))?
         .map_err(|e| SinkError::Transport(e.to_string()))?;
-        Ok(high.max(0) as u64)
+        u64::try_from(high).map_err(|_| {
+            SinkError::Transport(format!(
+                "the destination broker reported high watermark {high} for {}/{} (unknown)",
+                self.topic, self.partition
+            ))
+        })
     }
 }
 
@@ -612,11 +691,12 @@ impl Sink for KafkaSink {
         // source offset the destination will accept is
         // `delivery.offset + 1`, which equals the destination's high
         // watermark — i.e. the verified-durable boundary.
-        let (topic, partition) = mirror_core::current_labels();
+        let (topic, partition, mirror) = mirror_core::current_labels();
         metrics::gauge!(
             "mirror_v3_destination_offset_verified",
             "topic" => topic,
             "partition" => partition,
+            "mirror" => mirror,
         )
         .set((delivery.offset as u64 + 1) as f64);
         // Per-write ack signal. The supervisor's installed observer
@@ -649,4 +729,71 @@ fn build_headers(headers: &[Header]) -> OwnedHeaders {
 pub enum KafkaError {
     #[error("kafka client init: {0}")]
     Init(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use rdkafka::config::ClientConfig;
+
+    #[test]
+    fn a_committed_offset_is_a_position_or_no_commit() {
+        use rdkafka::topic_partition_list::Offset;
+        let pos = |o| super::committed_position(o, "g", "ops", 0);
+        assert_eq!(pos(Offset::Offset(42)).unwrap(), Some(42));
+        assert_eq!(pos(Offset::Offset(0)).unwrap(), Some(0));
+        assert_eq!(pos(Offset::Invalid).unwrap(), None);
+        for odd in [
+            Offset::Offset(-5),
+            Offset::End,
+            Offset::Beginning,
+            Offset::Stored,
+        ] {
+            let err = pos(odd).expect_err("not a position");
+            assert!(
+                err.to_string().contains("group g has committed offset"),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn source_fails_on_a_lost_position_instead_of_jumping() {
+        let native = super::consumer_config("localhost:9092", "g")
+            .create_native_config()
+            .expect("native config");
+        assert_eq!(native.get("auto.offset.reset").unwrap(), "error");
+        assert_eq!(native.get("enable.auto.commit").unwrap(), "false");
+    }
+
+    #[test]
+    fn producer_never_retries_beneath_the_gate() {
+        let native = super::producer_config("localhost:9092")
+            .create_native_config()
+            .expect("native config");
+        let get = |k: &str| native.get(k).expect(k);
+        assert_eq!(get("message.send.max.retries"), "0");
+        assert_eq!(get("enable.idempotence"), "false");
+        assert_eq!(get("acks"), "-1", "acks=all");
+        assert_eq!(get("max.in.flight.requests.per.connection"), "1");
+    }
+
+    /// Producers on the topics we mirror compress batches with gzip or
+    /// zstd (Java and Quarkus defaults). A librdkafka built without
+    /// them fails every fetch of such a batch with "Not implemented",
+    /// and the mirror crash-loops on the same batch.
+    #[test]
+    fn librdkafka_decompresses_gzip_and_zstd() {
+        let features = ClientConfig::new()
+            .create_native_config()
+            .expect("native config")
+            .get("builtin.features")
+            .expect("builtin.features");
+        let features: Vec<&str> = features.split(',').collect();
+        for codec in ["gzip", "zstd", "snappy", "lz4"] {
+            assert!(
+                features.contains(&codec),
+                "librdkafka lacks {codec}: builtin.features = {features:?}"
+            );
+        }
+    }
 }

@@ -7,22 +7,19 @@ use clap::{Parser, Subcommand};
 use mirror_config::{Destination, HttpAccess, Mirror};
 
 mod ack_tracker;
+mod knobs;
 mod readiness_poller;
 use ack_tracker::{
-    commit_interval_from_env, final_commit, spawn_periodic_commit_task, AckTracker, DestAckSlot,
-    FlushAckShim, WriteAckShim,
+    final_commit, spawn_periodic_commit_task, AckTracker, DestAckSlot, FlushAckShim, WriteAckShim,
 };
+use knobs::Knobs;
 use mirror_core::{
-    heartbeat_interval_from_env, run_mirror_with_notifier, MetricLabels, NoOpNotifier, Record,
-    Sink, SinkError, MIRROR_LABELS,
+    run_mirror_with_notifier, MetricLabels, NoOpNotifier, Record, Sink, SinkError, MIRROR_LABELS,
 };
 use mirror_fs::{FilesystemSink, FilesystemSinkConfig};
 use mirror_kafka::{KafkaSink, KafkaSinkConfig, KafkaSource, KafkaSourceConfig};
 use mirror_s3::{S3Sink, S3SinkConfig};
-use readiness_poller::{
-    readiness_lag_tolerance_from_env, readiness_poll_interval_from_env, spawn_readiness_poller,
-    PollSpec,
-};
+use readiness_poller::{spawn_readiness_poller, PollSpec};
 use tracing::Instrument;
 use tracing_subscriber::EnvFilter;
 
@@ -133,9 +130,13 @@ fn init_tracing() {
     // stdout stays available for structured output (e.g. `status
     // --format json`) and standard `1>` / `2>` redirects do the
     // expected thing.
+    // Colours only on a terminal: in a pod the escape codes end up in
+    // the log store.
+    use std::io::IsTerminal;
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(true)
+        .with_ansi(std::io::stderr().is_terminal())
         .with_writer(std::io::stderr)
         .try_init();
 }
@@ -275,16 +276,18 @@ fn resolve_blob_params(mirror: &Mirror) -> Result<BlobMirrorParams> {
 #[derive(Debug, serde::Serialize)]
 struct StatusRow {
     name: String,
-    source_high: Option<i64>,
+    source_high: Option<u64>,
     dest_next: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
 }
 
 impl StatusRow {
+    /// Source high watermark minus destination next offset; negative
+    /// when the destination is ahead (a recreated topic).
     fn lag(&self) -> Option<i64> {
         match (self.source_high, self.dest_next) {
-            (Some(h), Some(n)) => Some(h.saturating_sub(n as i64).max(0)),
+            (Some(h), Some(n)) => Some(h as i64 - n as i64),
             _ => None,
         }
     }
@@ -374,7 +377,6 @@ async fn query_destination_next(mirror: &Mirror, destination: &Destination) -> R
                 keys: params.keys,
                 values: params.values,
                 compaction: compaction_to_fs(mirror.compaction),
-                cache: None,
                 flush: params.flush,
             };
             let mut sink = FilesystemSink::open(cfg).map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -383,35 +385,7 @@ async fn query_destination_next(mirror: &Mirror, destination: &Destination) -> R
                 .map_err(|e| anyhow::anyhow!("{e}"))
         }
         Destination::S3(s3) => {
-            let params = resolve_blob_params(mirror)?;
-            let mut builder = object_store::aws::AmazonS3Builder::from_env()
-                .with_region(&s3.region)
-                .with_bucket_name(&s3.bucket);
-            if let Some(endpoint) = &s3.endpoint {
-                builder = builder.with_endpoint(endpoint);
-                if endpoint.starts_with("http://") {
-                    builder = builder.with_allow_http(true);
-                }
-            }
-            let store = builder.build().context("building S3 store")?;
-            let cfg = S3SinkConfig {
-                store: Arc::new(store),
-                prefix: s3.prefix.as_deref().map(object_store::path::Path::from),
-                destination_name: dest_name,
-                partition: mirror.partition,
-                format: params.format,
-                compression: params.compression,
-                keys: params.keys,
-                values: params.values,
-                compaction: compaction_to_s3(mirror.compaction),
-                cache: None,
-                flush: mirror_s3::FlushTriggers {
-                    max_time: params.flush.max_time,
-                    max_bytes: params.flush.max_bytes,
-                    max_offsets: params.flush.max_offsets,
-                    daily_at_utc_seconds: params.flush.daily_at_utc_seconds,
-                },
-            };
+            let cfg = s3_sink_config(s3, mirror, &dest_name)?;
             let mut sink = S3Sink::open(cfg)
                 .await
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -451,6 +425,7 @@ fn print_status_table(rows: &[StatusRow]) {
 async fn run(path: PathBuf) -> Result<()> {
     let cfg = mirror_config::load_from_path(&path)
         .with_context(|| format!("loading {}", path.display()))?;
+    let knobs = Knobs::from_env()?;
 
     // Drop disabled mirrors before anything else so the cache state,
     // readiness gate and spawn loop only see what we'll actually run.
@@ -480,13 +455,10 @@ async fn run(path: PathBuf) -> Result<()> {
         destinations = total_destinations,
         "starting mirror-v3"
     );
-    install_metrics_exporter();
+    install_metrics_exporter(knobs.metrics_port)?;
 
-    // One shutdown channel, cloned per mirror. Listening for Ctrl-C
-    // here means SIGINT triggers graceful flush; in containers,
-    // SIGTERM will arrive on the same path because tokio's
-    // ctrl_c handler is the platform's INT handler - for full SIGTERM
-    // support a unix-signals branch can be added next.
+    // One shutdown channel, cloned per mirror. SIGINT and SIGTERM
+    // trigger a graceful flush.
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let signal_tx = shutdown_tx.clone();
     tokio::spawn(async move {
@@ -498,15 +470,15 @@ async fn run(path: PathBuf) -> Result<()> {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{signal, SignalKind};
-        if let Ok(mut sigterm) = signal(SignalKind::terminate()) {
-            let term_tx = shutdown_tx.clone();
-            tokio::spawn(async move {
-                if sigterm.recv().await.is_some() {
-                    tracing::info!("received SIGTERM; requesting graceful shutdown");
-                    let _ = term_tx.send(true);
-                }
-            });
-        }
+        let mut sigterm =
+            signal(SignalKind::terminate()).context("installing the SIGTERM handler")?;
+        let term_tx = shutdown_tx.clone();
+        tokio::spawn(async move {
+            if sigterm.recv().await.is_some() {
+                tracing::info!("received SIGTERM; requesting graceful shutdown");
+                let _ = term_tx.send(true);
+            }
+        });
     }
 
     // Every *enabled* mirror gets a `CacheState` slot, regardless of
@@ -525,7 +497,7 @@ async fn run(path: PathBuf) -> Result<()> {
     let cache_state = if enabled_mirrors.is_empty() {
         None
     } else {
-        let tolerance = readiness_lag_tolerance_from_env();
+        let tolerance = knobs.readiness_lag;
         let state = std::sync::Arc::new(
             mirror_core::CacheState::new().with_readiness_lag_tolerance(tolerance),
         );
@@ -546,14 +518,18 @@ async fn run(path: PathBuf) -> Result<()> {
                 lag_tolerance = tolerance,
                 "registering mirror with cache readiness gate"
             );
-            state.register_mirror_with_topic(
-                &m.name,
-                hwm,
-                last_committed,
-                is_main,
-                &m.topic,
-                m.partition,
-            );
+            if serves_cache(m) {
+                state.register_mirror_with_topic(
+                    &m.name,
+                    hwm,
+                    last_committed,
+                    is_main,
+                    &m.topic,
+                    m.partition,
+                );
+            } else {
+                state.register_progress_only(&m.name, hwm, &m.topic, m.partition);
+            }
         }
         Some(state)
     };
@@ -565,54 +541,185 @@ async fn run(path: PathBuf) -> Result<()> {
     let wants_http_routes = enabled_mirrors
         .iter()
         .any(|m| m.http_access.as_ref().is_some_and(HttpAccess::any_enabled));
+    let mut handles = Vec::with_capacity(enabled_mirrors.len() + 1);
     if let (Some(state), true) = (cache_state.as_ref(), wants_http_routes) {
-        let addr = cache_listen_addr();
+        let addr = std::net::SocketAddr::from(([0, 0, 0, 0], knobs.cache_port));
         let state = std::sync::Arc::clone(state);
         let cache_shutdown_rx = shutdown_rx.clone();
         let cache_shutdown_tx = shutdown_tx.clone();
-        tokio::spawn(async move {
-            let signal = shutdown_signal(cache_shutdown_rx);
-            match mirror_cache::serve(addr, state, signal).await {
-                Ok(_code) => {
-                    // Admin shutdown signalled. Propagate to the
-                    // mirror loops so the whole process exits.
-                    let _ = cache_shutdown_tx.send(true);
-                }
-                Err(e) => {
-                    tracing::error!(error = %e, "cache HTTP server failed");
-                    let _ = cache_shutdown_tx.send(true);
-                }
-            }
-        });
+        // The server is waited for like a mirror: its failure (a port
+        // in use) ends the process non-zero, where it used to request a
+        // graceful shutdown and exit 0.
+        handles.push((
+            "cache-http".to_string(),
+            tokio::spawn(async move {
+                let signal = shutdown_signal(cache_shutdown_rx);
+                let result = mirror_cache::serve(addr, state, signal).await;
+                // Admin shutdown, or our own: stop the mirrors too.
+                let _ = cache_shutdown_tx.send(true);
+                result
+                    .map(|_code| ())
+                    .map_err(|e| anyhow::anyhow!("cache HTTP server: {e}"))
+            }),
+        ));
     }
 
-    let mut handles = Vec::with_capacity(enabled_mirrors.len());
     for mirror in &enabled_mirrors {
         let binding = mirror_cache_binding(mirror, cache_state.as_ref());
-        let handle = spawn_mirror((*mirror).clone(), shutdown_rx.clone(), binding).await?;
+        let handle = if restarts_in_process(mirror) {
+            tokio::spawn(supervise_in_process(
+                (*mirror).clone(),
+                knobs.clone(),
+                shutdown_rx.clone(),
+                binding,
+            ))
+        } else {
+            spawn_mirror((*mirror).clone(), &knobs, shutdown_rx.clone(), binding).await?
+        };
         handles.push((mirror.name.clone(), handle));
     }
 
-    // Wait for the first task to terminate. Any termination collapses
-    // the whole process. Successful (graceful) termination is Ok(())
-    // so the process exits zero on shutdown.
-    let (which, result) = wait_first(handles).await;
-    if result.is_ok() {
-        tracing::info!(mirror = %which, "mirror task terminated gracefully");
-    } else {
-        tracing::error!(mirror = %which, "mirror task errored; exiting process");
+    // The first error ends the process. A mirror that ends without
+    // error has seen the shutdown signal, so every other mirror is
+    // stopping too: wait for all of them, so each one's final flush and
+    // commit completes before the runtime is dropped
+    // (returning on the first graceful exit cancelled the others'
+    // in-flight PUTs and final commits).
+    let result = wait_mirrors(handles).await;
+    if let Err(e) = &result {
+        tracing::error!(error = %format!("{e:#}"), "mirror task errored; exiting process");
     }
     result
 }
 
-/// Pick the listen address for the cache HTTP server. Defaults to
-/// 0.0.0.0:8080, overridable via `MIRROR_V3_CACHE_PORT`.
-fn cache_listen_addr() -> std::net::SocketAddr {
-    let port = std::env::var("MIRROR_V3_CACHE_PORT")
-        .ok()
-        .and_then(|s| s.parse::<u16>().ok())
-        .unwrap_or(8080);
-    std::net::SocketAddr::from(([0, 0, 0, 0], port))
+/// Wait for every mirror task; return the first error as soon as it
+/// happens, or `Ok` once all have ended without one.
+async fn wait_mirrors(handles: Vec<(String, tokio::task::JoinHandle<Result<()>>)>) -> Result<()> {
+    let mut pending: futures::stream::FuturesUnordered<_> = handles
+        .into_iter()
+        .map(|(name, handle)| async move {
+            let r = match handle.await {
+                Ok(inner) => inner,
+                Err(join) => Err(anyhow::anyhow!("task join: {join}")),
+            };
+            (name, r)
+        })
+        .collect();
+    use futures::StreamExt;
+    while let Some((name, result)) = pending.next().await {
+        match result {
+            Ok(()) => tracing::info!(mirror = %name, "mirror task terminated gracefully"),
+            Err(e) => return Err(e.context(format!("mirror {name}"))),
+        }
+    }
+    Ok(())
+}
+
+/// Whether the mirror serves `/cache/v1` and so holds every key's latest
+/// value in memory. Only these mirrors keep values; the cache is built by
+/// reading the source topic from its low watermark (kkv's bootstrap), never
+/// from a destination, so a cache does not depend on S3 being up and a blob
+/// mirror does not download its archive at startup.
+fn serves_cache(mirror: &Mirror) -> bool {
+    mirror
+        .http_access
+        .as_ref()
+        .is_some_and(HttpAccess::any_enabled)
+}
+
+/// Whether a failed mirror is restarted inside the process instead of
+/// ending it, when its failure is transient ([`is_transient`]). A mirror
+/// with neither a cache nor notify holds no state but its destinations,
+/// and opening it again re-derives its position from them, exactly as a
+/// process restart would. Restarting it alone keeps a destination outage
+/// (S3 down, a full disk) from taking the process, and with it the caches
+/// and notifications other mirrors serve, down with it. A cache or notify mirror ends the process: its in-memory
+/// state belongs to the process and is rebuilt by the orchestrator's
+/// restart.
+fn restarts_in_process(mirror: &Mirror) -> bool {
+    !serves_cache(mirror) && mirror.notify.is_none()
+}
+
+/// Whether a failed run of a mirror can succeed when it is opened again:
+/// the source or a destination could not be reached. Anything else, a
+/// destination that contradicts the source (an offset mismatch, a foreign
+/// object, a corrupt chain), a lost source position, or data or
+/// configuration that cannot work, repeats on every attempt; it ends the
+/// process so that it shows as a crash loop, as it does for a cache or
+/// notify mirror.
+fn is_transient(err: &anyhow::Error) -> bool {
+    for cause in err.chain() {
+        if let Some(e) = cause.downcast_ref::<mirror_core::MirrorError>() {
+            return e.is_transient();
+        }
+        if let Some(e) = cause.downcast_ref::<SinkError>() {
+            return e.is_transient();
+        }
+        if let Some(e) = cause.downcast_ref::<mirror_core::SourceError>() {
+            return e.is_transient();
+        }
+        if let Some(e) = cause.downcast_ref::<mirror_fs::BlobError>() {
+            return matches!(e, mirror_fs::BlobError::Store(_));
+        }
+    }
+    false
+}
+
+const RESTART_BACKOFF_MIN: std::time::Duration = std::time::Duration::from_secs(1);
+const RESTART_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Run a mirror and, while the process is not shutting down, open and run
+/// it again after each transient failure, with a backoff from 1 s doubling
+/// to 60 s (reset after a run that lasted longer than the cap). Every such
+/// failure is logged as an error and counted in
+/// `mirror_v3_mirror_restarts_total`; any other failure is returned and
+/// ends the process.
+async fn supervise_in_process(
+    mirror: Mirror,
+    knobs: Knobs,
+    shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    cache: Option<mirror_core::CacheBinding>,
+) -> Result<()> {
+    let mut backoff = RESTART_BACKOFF_MIN;
+    loop {
+        let started = std::time::Instant::now();
+        let result =
+            match spawn_mirror(mirror.clone(), &knobs, shutdown_rx.clone(), cache.clone()).await {
+                Ok(handle) => match handle.await {
+                    Ok(r) => r,
+                    Err(join) => Err(anyhow::anyhow!("task join: {join}")),
+                },
+                Err(e) => Err(e),
+            };
+        let err = match result {
+            Ok(()) => return Ok(()),
+            Err(e) => e,
+        };
+        if *shutdown_rx.borrow() || !is_transient(&err) {
+            return Err(err);
+        }
+        if started.elapsed() > RESTART_BACKOFF_MAX {
+            backoff = RESTART_BACKOFF_MIN;
+        }
+        tracing::error!(
+            mirror = %mirror.name,
+            error = %format!("{err:#}"),
+            retry_in_s = backoff.as_secs(),
+            "mirror failed; it holds no state but its destinations, so it is opened again in this process"
+        );
+        metrics::counter!(
+            "mirror_v3_mirror_restarts_total",
+            "topic" => mirror.topic.clone(),
+            "partition" => mirror.partition.to_string(),
+            "mirror" => mirror.name.clone(),
+        )
+        .increment(1);
+        tokio::select! {
+            _ = tokio::time::sleep(backoff) => {}
+            _ = shutdown_signal(shutdown_rx.clone()) => return Ok(()),
+        }
+        backoff = (backoff * 2).min(RESTART_BACKOFF_MAX);
+    }
 }
 
 /// Materialise a `CacheBinding` for the given mirror. Every enabled
@@ -652,7 +759,7 @@ async fn fetch_hwm_for_mirror(mirror: &Mirror) -> Result<u64> {
     .await
     .with_context(|| format!("mirror {mirror_name}: hwm task join"))?
     .with_context(|| format!("mirror {mirror_name}: fetch high watermark"))?;
-    Ok(hwm.max(0) as u64)
+    Ok(hwm)
 }
 
 /// Read the broker's `__consumer_offsets` for this mirror's group
@@ -662,11 +769,7 @@ async fn fetch_hwm_for_mirror(mirror: &Mirror) -> Result<u64> {
 /// this hits `BaseConsumer` synchronously under `spawn_blocking`.
 async fn fetch_committed_offset_for_mirror(mirror: &Mirror) -> Result<Option<u64>> {
     let bootstrap = mirror.source.bootstrap_servers.clone();
-    let group_id = mirror
-        .source
-        .group_id
-        .clone()
-        .unwrap_or_else(|| format!("mirror-v3-{}", mirror.name));
+    let group_id = mirror.effective_group_id();
     let topic = mirror.topic.clone();
     let partition = mirror.partition as i32;
     let mirror_name = mirror.name.clone();
@@ -706,7 +809,7 @@ async fn fetch_low_watermark_for_mirror(mirror: &Mirror) -> Result<u64> {
     .await
     .with_context(|| format!("mirror {mirror_name}: low watermark task join"))?
     .with_context(|| format!("mirror {mirror_name}: fetch low watermark"))?;
-    Ok(low.max(0) as u64)
+    Ok(low)
 }
 
 async fn shutdown_signal(mut rx: tokio::sync::watch::Receiver<bool>) {
@@ -716,42 +819,27 @@ async fn shutdown_signal(mut rx: tokio::sync::watch::Receiver<bool>) {
     let _ = rx.changed().await;
 }
 
-/// Install the Prometheus exporter on `0.0.0.0:<port>`. Port defaults
-/// to 9090; override with `MIRROR_V3_METRICS_PORT` (set to `0` to
-/// disable). A failure to bind logs at warn level and is non-fatal -
-/// the operator's observability story degrades, but the mirror keeps
-/// running.
-fn install_metrics_exporter() {
-    let port = std::env::var("MIRROR_V3_METRICS_PORT")
-        .ok()
-        .and_then(|s| s.parse::<u16>().ok())
-        .unwrap_or(9090);
-    if port == 0 {
-        tracing::info!("metrics exporter disabled (MIRROR_V3_METRICS_PORT=0)");
-        return;
-    }
+/// Install the Prometheus exporter on `0.0.0.0:<port>`. A failure is a
+/// startup error: an unmonitored mirror is not running as configured.
+fn install_metrics_exporter(port: u16) -> Result<()> {
     let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
-    match metrics_exporter_prometheus::PrometheusBuilder::new()
+    metrics_exporter_prometheus::PrometheusBuilder::new()
         .with_http_listener(addr)
         .install()
-    {
-        Ok(()) => tracing::info!(%addr, "metrics exporter listening on /metrics"),
-        Err(e) => tracing::warn!(error = %e, %addr, "metrics exporter failed; continuing"),
-    }
+        .with_context(|| format!("installing the metrics exporter on {addr}"))?;
+    tracing::info!(%addr, "metrics exporter listening on /metrics");
+    Ok(())
 }
 
 async fn spawn_mirror(
     mirror: Mirror,
+    knobs: &Knobs,
     shutdown_rx: tokio::sync::watch::Receiver<bool>,
     cache: Option<mirror_core::CacheBinding>,
 ) -> Result<tokio::task::JoinHandle<Result<()>>> {
     let source_cfg = KafkaSourceConfig::new(
         mirror.source.bootstrap_servers.clone(),
-        mirror
-            .source
-            .group_id
-            .clone()
-            .unwrap_or_else(|| format!("mirror-v3-{}", mirror.name)),
+        mirror.effective_group_id(),
         mirror.topic.clone(),
         mirror.partition as i32,
     );
@@ -770,15 +858,16 @@ async fn spawn_mirror(
     let labels = MetricLabels {
         topic: mirror.topic.clone(),
         partition: mirror.partition,
+        mirror: mirror.name.clone(),
     };
     let compaction = compaction_label(mirror.compaction);
 
     // Build one inner Sink per destination, then wrap them in a tee.
     // The single-destination case routes through a length-1 tee too -
     // this keeps the cache binding's per-record fanout on a single
-    // code path. A *notify-only* mirror (no destinations + a notify
-    // block, validated upstream) wraps a single in-memory
-    // [`NotifyOnlySink`] in the tee so the rest of the run loop -
+    // code path. A mirror without destinations (a cache, a notify
+    // feed, or both; validated upstream) wraps a single in-memory
+    // [`NoDestinationSink`] in the tee so the rest of the run loop -
     // bootstrap, low-watermark alignment, idle-drift checks - keeps
     // its existing shape.
     let mut inners: Vec<(String, Box<dyn Sink>)> = Vec::with_capacity(
@@ -799,8 +888,7 @@ async fn spawn_mirror(
         let inner_name = dest.effective_name(&mirror.name);
         let kind = destination_type(dest);
         dest_descriptions.push(format!("{inner_name}({kind})"));
-        let mut sink: Box<dyn Sink> =
-            open_inner_sink(dest, &mirror, &inner_name, cache.as_ref()).await?;
+        let mut sink: Box<dyn Sink> = open_inner_sink(dest, &mirror, &inner_name).await?;
         let slot = Arc::new(DestAckSlot::new(
             inner_name.clone(),
             dest.affects_readiness(),
@@ -834,21 +922,20 @@ async fn spawn_mirror(
         inners.push((inner_name, sink));
     }
     if inners.is_empty() {
-        // Notify-only mirror: spec says "On every startup the source
-        // seeks to the broker's low watermark". `NotifyOnlySink`
-        // declares `allows_compacted_source = true` so the run loop's
-        // bootstrap branch aligns the (in-memory) head to
-        // `low_watermark`. The notifier sees every record from there
-        // forward.
+        // No destinations: the source is read from the broker's low
+        // watermark on every startup. `NoDestinationSink` declares
+        // `allows_compacted_source = true` so the run loop's bootstrap
+        // branch aligns its (in-memory) head to `low_watermark`; the
+        // cache and the notifier see every record from there.
         inners.push((
-            "notify-only".to_string(),
-            Box::new(NotifyOnlySink::default()) as Box<dyn Sink>,
+            "none".to_string(),
+            Box::new(NoDestinationSink::default()) as Box<dyn Sink>,
         ));
-        dest_descriptions.push("notify-only".to_string());
+        dest_descriptions.push("none".to_string());
     }
     let mut tee = mirror_core::TeeSink::open(inners, cache.clone())
         .await
-        .map_err(|e| anyhow::anyhow!("opening tee for mirror {name}: {e}"))?;
+        .with_context(|| format!("opening tee for mirror {name}"))?;
 
     // Build the per-mirror ack tracker. Notify-side slot exists iff
     // the mirror has a `notify:` block; destinations always
@@ -895,7 +982,22 @@ async fn spawn_mirror(
         }
         _ => None,
     };
-    if notifier_opt.is_some() {
+    if serves_cache(&mirror) && !mirror.destinations.is_empty() {
+        // The cache holds the latest value of every key, so it reads the
+        // topic from the low watermark like kkv. The destinations are
+        // past that already: the tee skips their writes below each head,
+        // and the notifier's suppression threshold (the committed offset,
+        // or the bootstrap watermark on a fresh group) keeps the replay
+        // from firing webhooks for records the previous pod notified.
+        let low = fetch_low_watermark_for_mirror(&mirror).await?;
+        tracing::info!(
+            mirror = %name,
+            low_watermark = low,
+            destination_min_head = min_head,
+            "cache mirror: reading the source from its low watermark"
+        );
+        tee.set_resume_floor(low);
+    } else if notifier_opt.is_some() {
         if let Some(committed) = notify_committed {
             if committed < min_head {
                 // Re-read the gap from the source; the tee skips the
@@ -970,10 +1072,10 @@ async fn spawn_mirror(
     // it via the Kafka commit handle, and flushes to the broker.
     // The handle clones an `Arc<StreamConsumer>` internally so this
     // task runs independently of the source-owning run loop.
-    let _commit_task = spawn_periodic_commit_task(
+    let commit_task = spawn_periodic_commit_task(
         commit_handle,
         Arc::clone(&ack_tracker),
-        commit_interval_from_env(),
+        knobs.commit_interval,
         name.clone(),
         shutdown_rx.clone(),
     );
@@ -982,8 +1084,9 @@ async fn spawn_mirror(
     // exists (i.e. the mirror has `http_access` or `notify`). The
     // poller refreshes the broker end offset for the lag-based
     // readiness predicate and detects source-assignment loss.
+    let mut poller = None;
     if let Some(binding) = cache.as_ref() {
-        let _poller = spawn_readiness_poller(
+        poller = Some(spawn_readiness_poller(
             PollSpec {
                 mirror_name: name.clone(),
                 bootstrap_servers: mirror.source.bootstrap_servers.clone(),
@@ -992,9 +1095,9 @@ async fn spawn_mirror(
                 commit_handle: commit_handle_for_poller,
                 cache: Arc::clone(&binding.state),
             },
-            readiness_poll_interval_from_env(),
+            knobs.readiness_poll,
             shutdown_rx.clone(),
-        );
+        ));
     } else {
         // No cache slot => no readiness gate to drive. Drop the
         // extra handle.
@@ -1020,6 +1123,7 @@ async fn spawn_mirror(
     // access to the operator-chosen mirror name. MIRROR_LABELS still
     // carries topic+partition for metric labeling separately.
     let span = tracing::info_span!("mirror", name = %name);
+    let knobs_heartbeat = knobs.heartbeat;
     Ok(tokio::spawn(
         async move {
             tracing::info!(
@@ -1028,7 +1132,7 @@ async fn spawn_mirror(
                 notify = %notify_log,
                 "loop start"
             );
-            let heartbeat = heartbeat_interval_from_env();
+            let heartbeat = knobs_heartbeat;
             let shutdown = shutdown_signal(shutdown_rx);
             // Match-on-notifier so the generic `N: Notifier`
             // monomorphises with the right concrete type per branch
@@ -1079,9 +1183,16 @@ async fn spawn_mirror(
             // regardless of why the loop stopped, and committing
             // them shrinks the duplicate-webhook replay on restart.
             final_commit(commit_handle_final, &ack_tracker_final, &name).await;
+            // The commit task and the poller hold this run's consumer;
+            // they end with the run, also when the process goes on (a
+            // mirror restarted in process opens a new consumer).
+            commit_task.abort();
+            if let Some(p) = poller {
+                p.abort();
+            }
             match (result, flush_drain) {
                 (Ok(()), Ok(())) => Ok(()),
-                (Err(e), _) => Err(anyhow::anyhow!("mirror {name}: {e}")),
+                (Err(e), _) => Err(e.context(format!("mirror {name}"))),
                 (Ok(()), Err(e)) => Err(anyhow::anyhow!(
                     "mirror {name}: flush notify drain on shutdown: {e}"
                 )),
@@ -1195,15 +1306,15 @@ fn build_flush_dispatcher(
 /// only its own "next expected offset" and accepts any record at or
 /// above it. `allows_compacted_source = true` so the run loop's
 /// bootstrap branch can align the head to the broker's low
-/// watermark - matching the spec's "seeks to low watermark on every
-/// startup" behaviour for notify-only mirrors.
+/// watermark - the "seeks to low watermark on every startup" behaviour
+/// of mirrors without destinations (caches, notify feeds).
 #[derive(Debug, Default)]
-struct NotifyOnlySink {
+struct NoDestinationSink {
     position: u64,
 }
 
 #[async_trait::async_trait]
-impl Sink for NotifyOnlySink {
+impl Sink for NoDestinationSink {
     async fn next_expected_offset(&mut self) -> Result<u64, SinkError> {
         Ok(self.position)
     }
@@ -1226,17 +1337,94 @@ impl Sink for NotifyOnlySink {
         true
     }
 
+    fn allows_offset_holes(&self) -> bool {
+        true
+    }
+
     async fn align_to_source_low_watermark(&mut self, low_watermark: u64) -> Result<(), SinkError> {
         self.position = low_watermark;
         Ok(())
     }
 }
 
+/// The object store for one S3 identity. Configured explicitly: no
+/// `AWS_*` variable other than the two named in the config changes its
+/// behaviour, and missing keys are an error (from_env() would silently
+/// pick up AWS_CONDITIONAL_PUT and friends, and fall back to instance
+/// metadata probing for credentials).
+fn s3_store(
+    s3: &mirror_config::S3Destination,
+    key: &mirror_config::S3Key,
+) -> Result<Arc<dyn object_store::ObjectStore>> {
+    let env = |name: &str| {
+        std::env::var(name).with_context(|| {
+            format!(
+                "S3 destination bucket {}: environment variable {name} (named in its credentials) is not set",
+                s3.bucket
+            )
+        })
+    };
+    let mut builder = object_store::aws::AmazonS3Builder::new()
+        .with_region(&s3.region)
+        .with_bucket_name(&s3.bucket)
+        .with_access_key_id(env(&key.access_key_id_env)?)
+        .with_secret_access_key(env(&key.secret_access_key_env)?);
+    if let Some(endpoint) = &s3.endpoint {
+        builder = builder.with_endpoint(endpoint);
+        if endpoint.starts_with("http://") {
+            builder = builder.with_allow_http(true);
+        }
+    }
+    let store = builder
+        .build()
+        .with_context(|| format!("building the S3 client for bucket {}", s3.bucket))?;
+    Ok(Arc::new(store))
+}
+
+fn s3_sink_config(
+    s3: &mirror_config::S3Destination,
+    mirror: &Mirror,
+    destination_name: &str,
+) -> Result<S3SinkConfig> {
+    let params = resolve_blob_params(mirror)?;
+    Ok(S3SinkConfig {
+        read_store: s3_store(s3, &s3.credentials.read)?,
+        write_store: s3_store(s3, &s3.credentials.write)?,
+        prefix: s3.prefix.as_deref().map(object_store::path::Path::from),
+        destination_name: destination_name.to_string(),
+        partition: mirror.partition,
+        format: params.format,
+        compression: params.compression,
+        keys: params.keys,
+        values: params.values,
+        compaction: compaction_to_s3(mirror.compaction),
+        flush: mirror_s3::FlushTriggers {
+            max_time: params.flush.max_time,
+            max_bytes: params.flush.max_bytes,
+            max_offsets: params.flush.max_offsets,
+            daily_at_utc_seconds: params.flush.daily_at_utc_seconds,
+        },
+        encryption: match &s3.encryption {
+            mirror_config::Encryption::None(_) => None,
+            mirror_config::Encryption::ParquetKeys(k) => {
+                let keyring = mirror_envelope::Keyring::load(&k.keys_dir)
+                    .with_context(|| format!("S3 destination bucket {}", s3.bucket))?;
+                keyring
+                    .get(&k.key_id)
+                    .with_context(|| format!("S3 destination bucket {}", s3.bucket))?;
+                Some(mirror_s3::BlobEncryption {
+                    key_id: k.key_id.clone(),
+                    keyring: Arc::new(keyring),
+                })
+            }
+        },
+    })
+}
+
 async fn open_inner_sink(
     dest: &Destination,
     mirror: &Mirror,
     inner_name: &str,
-    cache_for_bootstrap: Option<&mirror_core::CacheBinding>,
 ) -> Result<Box<dyn mirror_core::Sink>> {
     match dest {
         Destination::Kafka(k) => {
@@ -1257,12 +1445,6 @@ async fn open_inner_sink(
         }
         Destination::Filesystem(fs) => {
             let params = resolve_blob_params(mirror)?;
-            // Cache bootstrap-replay happens at sink-open time in
-            // each blob sink. The tee's `cache` binding is what
-            // matters for the per-record path; passing the binding
-            // to every inner blob sink seeds the cache from durable
-            // state on restart. CacheState is monotonic so multiple
-            // inner sinks bootstrapping the same binding is safe.
             let sink_cfg = FilesystemSinkConfig {
                 root: fs.root.clone(),
                 destination_name: inner_name.to_string(),
@@ -1272,7 +1454,6 @@ async fn open_inner_sink(
                 keys: params.keys,
                 values: params.values,
                 compaction: compaction_to_fs(mirror.compaction),
-                cache: cache_for_bootstrap.cloned(),
                 flush: params.flush,
             };
             let sink = FilesystemSink::open(sink_cfg).with_context(|| {
@@ -1284,40 +1465,7 @@ async fn open_inner_sink(
             Ok(Box::new(sink))
         }
         Destination::S3(s3) => {
-            let params = resolve_blob_params(mirror)?;
-            let mut builder = object_store::aws::AmazonS3Builder::from_env()
-                .with_region(&s3.region)
-                .with_bucket_name(&s3.bucket);
-            if let Some(endpoint) = &s3.endpoint {
-                builder = builder.with_endpoint(endpoint);
-                if endpoint.starts_with("http://") {
-                    builder = builder.with_allow_http(true);
-                }
-            }
-            let store = builder.build().with_context(|| {
-                format!(
-                    "building S3 store for mirror {} destination {inner_name}",
-                    mirror.name
-                )
-            })?;
-            let sink_cfg = S3SinkConfig {
-                store: Arc::new(store),
-                prefix: s3.prefix.as_deref().map(object_store::path::Path::from),
-                destination_name: inner_name.to_string(),
-                partition: mirror.partition,
-                format: params.format,
-                compression: params.compression,
-                keys: params.keys,
-                values: params.values,
-                compaction: compaction_to_s3(mirror.compaction),
-                cache: cache_for_bootstrap.cloned(),
-                flush: mirror_s3::FlushTriggers {
-                    max_time: params.flush.max_time,
-                    max_bytes: params.flush.max_bytes,
-                    max_offsets: params.flush.max_offsets,
-                    daily_at_utc_seconds: params.flush.daily_at_utc_seconds,
-                },
-            };
+            let sink_cfg = s3_sink_config(s3, mirror, inner_name)?;
             let sink = S3Sink::open(sink_cfg).await.with_context(|| {
                 format!(
                     "opening s3 sink for mirror {} destination {inner_name}",
@@ -1329,55 +1477,120 @@ async fn open_inner_sink(
     }
 }
 
-async fn wait_first(
-    handles: Vec<(String, tokio::task::JoinHandle<Result<()>>)>,
-) -> (String, Result<()>) {
-    if handles.is_empty() {
-        return (
-            "(none)".into(),
-            Err(anyhow::anyhow!("no mirrors configured")),
-        );
-    }
-    let mut futures = Vec::with_capacity(handles.len());
-    for (name, handle) in handles {
-        futures.push(Box::pin(async move {
-            let r = handle.await;
-            (
-                name,
-                match r {
-                    Ok(inner) => inner,
-                    Err(join) => Err(anyhow::anyhow!("task join: {join}")),
-                },
-            )
-        }));
-    }
-    let ((name, result), _idx, _rest) = futures_select_all(futures).await;
-    (name, result)
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-/// Tiny stand-in for `futures::future::select_all` to avoid pulling
-/// the `futures` crate just for one combinator.
-async fn futures_select_all<T, F>(
-    mut futures: Vec<std::pin::Pin<Box<F>>>,
-) -> (T, usize, Vec<std::pin::Pin<Box<F>>>)
-where
-    F: std::future::Future<Output = T> + ?Sized,
-{
-    use std::future::poll_fn;
-    use std::task::Poll;
-    poll_fn(move |cx| {
-        for (i, fut) in futures.iter_mut().enumerate() {
-            if let Poll::Ready(v) = fut.as_mut().poll(cx) {
-                let rest: Vec<_> = futures
-                    .drain(..)
-                    .enumerate()
-                    .filter(|(j, _)| *j != i)
-                    .map(|(_, f)| f)
-                    .collect();
-                return Poll::Ready((v, i, rest));
-            }
+    fn task(
+        delay_ms: u64,
+        result: Result<()>,
+        done: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) -> tokio::task::JoinHandle<Result<()>> {
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            done.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            result
+        })
+    }
+
+    #[tokio::test]
+    async fn graceful_exit_waits_for_every_mirror() {
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let handles = vec![
+            ("fast".to_string(), task(1, Ok(()), done.clone())),
+            ("slow".to_string(), task(80, Ok(()), done.clone())),
+        ];
+        wait_mirrors(handles).await.unwrap();
+        assert_eq!(done.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn first_error_ends_the_wait() {
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let handles = vec![
+            (
+                "broken".to_string(),
+                task(1, Err(anyhow::anyhow!("boom")), done.clone()),
+            ),
+            ("slow".to_string(), task(5_000, Ok(()), done.clone())),
+        ];
+        let started = std::time::Instant::now();
+        let err = wait_mirrors(handles).await.unwrap_err();
+        assert!(
+            format!("{err:#}").contains("mirror broken: boom"),
+            "{err:#}"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    }
+
+    fn mirror(yaml: &str) -> Mirror {
+        mirror_config::load_from_str(yaml)
+            .unwrap()
+            .mirrors
+            .remove(0)
+    }
+
+    #[test]
+    fn only_mirrors_without_cache_or_notify_restart_in_process() {
+        let blob = mirror(
+            r#"
+mirrors:
+  - name: ops
+    source: { bootstrap-servers: k:9092 }
+    topic: ops
+    partition: 0
+    destinations: [{ type: filesystem, root: /tmp/x }]
+    flush: { max-time-ms: 1000, max-bytes: 1000, max-offsets: 10 }
+"#,
+        );
+        assert!(restarts_in_process(&blob));
+        let cache = mirror(
+            r#"
+mirrors:
+  - name: userstate
+    source: { bootstrap-servers: k:9092 }
+    topic: userstate
+    partition: 0
+    destinations: []
+    http-access: { cache-v1: {}, cache-v1-main: {} }
+"#,
+        );
+        assert!(!restarts_in_process(&cache));
+    }
+
+    #[test]
+    fn only_unreachable_sources_and_destinations_are_transient() {
+        use mirror_core::{MirrorError, SourceError};
+        use mirror_fs::BlobError;
+        let transient = [
+            anyhow::Error::from(MirrorError::Sink(SinkError::Transport("503".into())))
+                .context("mirror ops"),
+            anyhow::Error::from(MirrorError::Source(SourceError::Transport("down".into()))),
+            anyhow::Error::from(BlobError::Store("timeout".into())).context("opening s3 sink"),
+            anyhow::Error::from(SinkError::Transport("503".into())).context("opening tee"),
+        ];
+        for e in &transient {
+            assert!(is_transient(e), "{e:#}");
         }
-        Poll::Pending
-    })
-    .await
+        let fatal = [
+            anyhow::Error::from(MirrorError::SinkAheadOfSource {
+                sink_offset: 150,
+                source_hwm: 100,
+            }),
+            anyhow::Error::from(MirrorError::Sink(SinkError::UnexpectedPosition {
+                expected: 5,
+                actual: 6,
+            })),
+            anyhow::Error::from(MirrorError::Sink(SinkError::Inconsistent("foreign".into())))
+                .context("mirror ops"),
+            anyhow::Error::from(MirrorError::Source(SourceError::PositionLost(
+                "gone".into(),
+            ))),
+            anyhow::Error::from(BlobError::CorruptChain("overlap".into())).context("opening"),
+            anyhow::anyhow!("environment variable S3_KEY is not set"),
+        ];
+        for e in &fatal {
+            assert!(!is_transient(e), "{e:#}");
+        }
+    }
 }

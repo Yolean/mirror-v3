@@ -48,7 +48,7 @@ These are not style preferences. Breaking any of them defeats the whole point of
 1. **Restart correctness derives from the destination.** Never persist source position to a local file, lock file, sidecar DB, or consumer-group commit *as the truth*. Group commits are monitoring-only.
 2. **Before producing source offset N, verify the destination is exactly at N.** For Kafka sinks: read target `end_offsets` and require it equals N. For blob sinks: derive next-expected offset from the prefix listing, require it equals N. Any mismatch is a hard exit.
 3. **Atomic writes only.** Filesystem = same-directory `rename(2)`. S3 = single `PutObject`, ideally with `PutMode::Create` (`If-None-Match: *`). Multi-step writes that could leave the destination in an inconsistent state are unacceptable.
-4. **Naming encodes both `from` and `to` source offsets** for blob destinations. Listing → `max(to)+1` is the next-expected offset. Two objects sharing a `from` is a corruption-detection signal — exit and alert.
+4. **Naming encodes both `from` and `to` source offsets** for blob destinations (`from` = previous `to` + 1, so the chain is contiguous across source offset holes; see README "Offset holes"). Listing → `max(to)+1` is the next-expected offset. Two objects sharing a `from` is a corruption-detection signal — exit and alert.
 5. **One process = one writer per `(topic, partition)`.** Deployments run a single replica with `Recreate`. Don't add leader election or coordination; the orchestrator owns singleton-ness.
 6. **Correctness > performance, always.** If you have to choose, choose to exit and let k8s restart you.
 
@@ -96,7 +96,7 @@ The image runs as `nonroot`. The binary needs no extra capabilities.
 
 ## Dependencies of note
 
-- **`rdkafka`** (Phase 1+): librdkafka bindings. Builder image needs `librdkafka-dev` + `libsasl2-dev` apt-installed. Cargo feature default is dynamic linking; do not switch to `cmake-build` static unless you've verified glibc is still available in the runtime image.
+- **`rdkafka`** (Phase 1+): librdkafka bindings, built from source with CMake (`cmake-build`). The build packages are in README.md, "Development on Ubuntu", the same set the Dockerfile's builder installs.
 - **`object_store`** (Phase 3+): one trait covers `LocalFileSystem` + `AmazonS3`. `PutMode::Create` is the preferred atomicity primitive; fall back to scan-validate on backends that ignore it.
 - **`schemars`** v1: derive macro + `schema_for!`. Always re-run `xtask gen-schema` after touching structs.
 

@@ -21,7 +21,6 @@ fn notify_dest_flush(addr: std::net::SocketAddr) -> Notify {
         api: NotifyApi::KkvV1,
         targets: vec![NotifyTarget {
             url: format!("http://{addr}"),
-            path: None,
             fan_out: FanOut::None,
         }],
         trigger: NotifyTrigger {
@@ -219,4 +218,33 @@ async fn shutdown_drains_queued_flush_events_before_stopping() {
         2,
         "both queued flush events must dispatch before shutdown returns"
     );
+}
+
+struct EmptyResolver;
+
+#[async_trait::async_trait]
+impl mirror_notify_kkv::DnsAResolver for EmptyResolver {
+    async fn resolve(&self, _: &str, _: u16) -> std::io::Result<Vec<std::net::SocketAddr>> {
+        Ok(vec![])
+    }
+}
+
+/// Zero addresses (a target Service scaled to zero)
+/// failed the mirror. It means there is nothing to deliver.
+#[tokio::test]
+async fn dns_a_with_no_address_delivers_nothing_and_does_not_fail() {
+    let mut cfg = notify_dest_flush("127.0.0.1:1".parse().unwrap());
+    cfg.targets[0].url = "http://scaled-to-zero.invalid:8080".into();
+    cfg.targets[0].fan_out = mirror_config::FanOut::DnsA;
+    let mut d = FlushDispatcher::from_config_with_resolver(
+        &cfg,
+        "t".into(),
+        0,
+        common::ready_cache("m"),
+        "m".into(),
+        std::sync::Arc::new(EmptyResolver),
+    )
+    .unwrap();
+    d.on_flushed(0, 9);
+    d.shutdown().await.expect("no address is not an error");
 }
