@@ -143,6 +143,16 @@ impl FsMirrorSpec {
 }
 
 pub fn spawn_kafka_to_filesystem(spec: FsMirrorSpec) -> Result<MirrorHandle> {
+    spawn_kafka_to_filesystem_with_drift_check(spec, mirror_fs::blob::DRIFT_CHECK_INTERVAL)
+}
+
+/// [`spawn_kafka_to_filesystem`] with the idle check for foreign
+/// objects run this often, so a test of that check does not wait out
+/// the production interval.
+pub fn spawn_kafka_to_filesystem_with_drift_check(
+    spec: FsMirrorSpec,
+    drift_check_interval: Duration,
+) -> Result<MirrorHandle> {
     let src_cfg = {
         let mut c = KafkaSourceConfig::new(
             spec.source_bootstrap,
@@ -167,7 +177,9 @@ pub fn spawn_kafka_to_filesystem(spec: FsMirrorSpec) -> Result<MirrorHandle> {
         compaction: spec.compaction,
         flush: spec.flush,
     };
-    let sink = FilesystemSink::open(sink_cfg).context("open FilesystemSink")?;
+    let sink = FilesystemSink::open(sink_cfg)
+        .context("open FilesystemSink")?
+        .with_drift_check_interval(drift_check_interval);
     let (shutdown, signal) = shutdown_pair();
     let handle = tokio::spawn(async move {
         // Even the single-destination path routes through a length-1

@@ -13,7 +13,9 @@ use std::time::Duration;
 
 use mirror_e2e::docker::DockerProvisioner;
 use mirror_e2e::kafka_helpers::{create_topic, produce_records};
-use mirror_e2e::mirror_runner::{spawn_kafka_to_filesystem, FsMirrorSpec};
+use mirror_e2e::mirror_runner::{
+    spawn_kafka_to_filesystem, spawn_kafka_to_filesystem_with_drift_check, FsMirrorSpec,
+};
 use mirror_e2e::{ProvisionedStack, Provisioner};
 use mirror_fs::{FilesystemSink, FilesystemSinkConfig, FlushTriggers};
 
@@ -80,12 +82,12 @@ async fn out_of_band_file_in_destination_terminates_mirror_with_error() {
         .await
         .expect("produce");
 
-    let mirror = spawn_kafka_to_filesystem(spec(
-        &source,
-        root.path(),
-        "adversarial-oob",
-        flush_every(100),
-    ))
+    // The production check runs once a minute; a second keeps the test
+    // short and still exercises the idle path that runs it.
+    let mirror = spawn_kafka_to_filesystem_with_drift_check(
+        spec(&source, root.path(), "adversarial-oob", flush_every(100)),
+        Duration::from_secs(1),
+    )
     .expect("spawn mirror");
 
     // Give the mirror time to consume records into its buffer.
@@ -100,9 +102,9 @@ async fn out_of_band_file_in_destination_terminates_mirror_with_error() {
     )
     .unwrap();
 
-    // The mirror's next idle poll calls next_expected_offset(), which
-    // calls scan_validate, which sees a gap (durable=0 but listing
-    // claims to start at 900) and returns CorruptChain. The mirror
+    // The next idle drift check lists from the end of the mirror's
+    // chain (here nothing is flushed, so the whole directory), finds a
+    // name the mirror did not write and fails the sink; the mirror
     // returns an error from run_mirror.
     let result = tokio::time::timeout(Duration::from_secs(15), mirror.wait_for_termination()).await;
     let result = result.expect("mirror should terminate within 15s");
