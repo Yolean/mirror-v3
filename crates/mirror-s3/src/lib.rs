@@ -94,8 +94,8 @@ impl BlobStore for S3Store {
         let mut stream = self.read.list(Some(&self.partition_prefix));
         while let Some(meta) = stream.next().await {
             let meta = meta.map_err(|e| BlobError::Store(format!("object store: {e}")))?;
-            if let Some(name) = meta.location.filename() {
-                names.push(name.to_string());
+            if let Some(name) = name_in_directory(&self.partition_prefix, &meta.location) {
+                names.push(name);
             }
         }
         Ok(names)
@@ -149,11 +149,36 @@ impl BlobStore for S3Store {
         let mut names = Vec::new();
         while let Some(meta) = stream.next().await {
             let meta = meta.map_err(|e| BlobError::Store(format!("object store: {e}")))?;
-            if let Some(name) = meta.location.filename() {
-                names.push(name.to_string());
+            if let Some(name) = name_in_directory(&self.partition_prefix, &meta.location) {
+                names.push(name);
             }
         }
         Ok(names)
+    }
+}
+
+/// The name of a listed object within the partition directory `dir`,
+/// for the chain validation and the drift check, which treat every name
+/// that is not one of the mirror's blobs as a foreign object. `None` for
+/// the directory's own placeholder (a key ending in `/`, as the GCS
+/// console and gcsfuse create for a folder: object_store lists it as the
+/// directory's path), which holds no data. An object in a subdirectory
+/// keeps its path below `dir` (`sub/x`), so the error that rejects it
+/// says where it is.
+fn name_in_directory(dir: &Path, location: &Path) -> Option<String> {
+    let mut parts = location.parts();
+    for want in dir.parts() {
+        if parts.next()? != want {
+            // object_store lists below `dir` only; keep any other name
+            // whole so it fails as foreign.
+            return Some(location.to_string());
+        }
+    }
+    let rest: Vec<String> = parts.map(|p| p.as_ref().to_string()).collect();
+    if rest.is_empty() {
+        None
+    } else {
+        Some(rest.join("/"))
     }
 }
 
@@ -237,4 +262,28 @@ fn build_prefix(root: Option<&Path>, destination_name: &str, partition: u32) -> 
     parts.push(destination_name.to_string());
     parts.push(partition.to_string());
     Path::from_iter(parts)
+}
+
+#[cfg(test)]
+mod tests {
+    use object_store::path::Path;
+
+    use super::name_in_directory;
+
+    #[test]
+    fn a_folder_placeholder_is_not_an_object_of_the_directory() {
+        let dir = Path::from("sites/dev/operations/0");
+        assert_eq!(
+            name_in_directory(&dir, &Path::parse("sites/dev/operations/0/").unwrap()),
+            None
+        );
+        assert_eq!(
+            name_in_directory(&dir, &Path::from("sites/dev/operations/0/0-9.parquet")).as_deref(),
+            Some("0-9.parquet")
+        );
+        assert_eq!(
+            name_in_directory(&dir, &Path::from("sites/dev/operations/0/sub/x")).as_deref(),
+            Some("sub/x")
+        );
+    }
 }
