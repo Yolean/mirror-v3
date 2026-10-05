@@ -560,6 +560,10 @@ impl Sink for FilesystemSink {
     fn set_flush_observer(&mut self, observer: std::sync::Arc<dyn mirror_core::FlushObserver>) {
         self.flush_observer = Some(observer);
     }
+
+    fn supports_flush_observer(&self) -> bool {
+        true
+    }
 }
 
 fn unix_now_seconds() -> u64 {

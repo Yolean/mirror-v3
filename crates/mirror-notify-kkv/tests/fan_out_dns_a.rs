@@ -176,10 +176,12 @@ async fn one_address_failure_fails_the_whole_batch() {
 
     let err = n.on_record(&rec(1)).await.unwrap_err();
     assert!(matches!(err, NotifyError::Exhausted { .. }), "got {err:?}");
-    // A retried (2 attempts), B got one success POST. The
-    // important thing is the whole batch surfaced as failure.
+    // Retries happen at the endpoint level with a fresh resolution
+    // per round, so B receives the (idempotent) batch once per
+    // round alongside A's failing attempts. The important thing is
+    // the whole batch surfaced as failure.
     assert_eq!(server_a.request_count(), 2);
-    assert_eq!(server_b.request_count(), 1);
+    assert_eq!(server_b.request_count(), 2);
 }
 
 #[tokio::test]
@@ -288,4 +290,72 @@ async fn dispatches_concurrently_to_all_addresses() {
     );
     assert_eq!(server_a.request_count(), 1);
     assert_eq!(server_b.request_count(), 1);
+}
+
+/// Rolling-restart resolver: returns a dead address on the first
+/// resolve and the live server afterwards, modelling a K8s headless
+/// service whose pod was replaced between the resolve and the POST.
+#[derive(Debug)]
+struct RollingResolver {
+    first: Vec<SocketAddr>,
+    then: Vec<SocketAddr>,
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl DnsAResolver for RollingResolver {
+    async fn resolve(&self, _host: &str, _port: u16) -> std::io::Result<Vec<SocketAddr>> {
+        let n = self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(if n == 0 {
+            self.first.clone()
+        } else {
+            self.then.clone()
+        })
+    }
+}
+
+/// The receiver-rollout regression: the first resolution points at a
+/// dead pod IP. Retries must re-resolve (the failure invalidates the
+/// cache) and deliver to the replacement pod instead of burning the
+/// whole retry budget against the dead IP and crashing the mirror.
+#[tokio::test]
+async fn retry_re_resolves_instead_of_pinning_the_dead_address() {
+    let live = TestServer::start(Reply::Status(200), vec![]).await;
+    // A bound-then-dropped listener yields a port that refuses
+    // connections.
+    let dead_addr = {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        l.local_addr().unwrap()
+    };
+    let calls = Arc::new(AtomicUsize::new(0));
+    let resolver = Arc::new(RollingResolver {
+        first: vec![dead_addr],
+        then: vec![live.addr],
+        calls: Arc::clone(&calls),
+    });
+
+    let cfg = notify_dns_a();
+    let mut n = KkvV1Notifier::from_config_with_resolver(
+        &cfg,
+        "t".into(),
+        0,
+        ready_cache("m"),
+        "m".into(),
+        resolver,
+    )
+    .unwrap();
+
+    n.on_record(&rec(1))
+        .await
+        .expect("batch must succeed via the re-resolved address");
+
+    assert_eq!(
+        live.request_count(),
+        1,
+        "the replacement pod must receive the batch"
+    );
+    assert!(
+        calls.load(Ordering::SeqCst) >= 2,
+        "a retry must have re-resolved instead of reusing the dead address"
+    );
 }

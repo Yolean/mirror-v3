@@ -6,10 +6,11 @@
 # libgcc + libstdc++ — enough for our dynamically-linked binary and,
 # in later phases, librdkafka.
 #
-# When a new image is cut, replace `:latest` with `@sha256:<digest>`
-# and commit the digest. Update both stages together.
+# Both stages are digest-pinned (tag kept for readability). To
+# update: `crane digest <image>:<tag>` and bump both stages
+# together.
 
-FROM docker.io/library/rust:1-bookworm AS builder
+FROM docker.io/library/rust:1-bookworm@sha256:7d0723df719e7f213b69dc7c8c595985c3f4b060cfbee4f7bc0e347a86fe3b6a AS builder
 # librdkafka 2.12+ unconditionally pulls in libcurl (OIDC support);
 # libssl/libsasl2/libzstd/liblz4 give us full feature support. cmake
 # drives the build, g++/make do the compiling, pkg-config is for
@@ -36,7 +37,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo build --release --bin mirror-v3 --locked && \
     cp target/release/mirror-v3 /usr/local/bin/mirror-v3
 
-FROM gcr.io/distroless/cc-debian12:latest
+FROM gcr.io/distroless/cc-debian12:latest@sha256:a90cf0f046efb32466b38b0972fef3a95e7c580e392e79ff1b7ac08c15fed0bc
 COPY --from=builder /usr/local/bin/mirror-v3 /usr/local/bin/mirror-v3
 USER nonroot:nonroot
 ENTRYPOINT ["/usr/local/bin/mirror-v3"]

@@ -144,8 +144,9 @@ Field-level notes:
     every address that comes back. Headless Kubernetes Services
     naturally return one A record per pod, so this gives the same
     fan-out kkv used to do via the Endpoints API; without mirror-v3
-    needing K8s API access. Resolutions are cached up to the DNS
-    record TTL.
+    needing K8s API access. Resolutions are cached for a fixed 30 s
+    window (`tokio::net::lookup_host` does not expose record TTLs)
+    and invalidated early on any dispatch failure.
 - **`notify.trigger`** decides what internal event causes a POST.
   See the dedicated section below; default is `source-consume` with
   small debounce, matching kkv's "as records arrive" behaviour.
@@ -536,22 +537,26 @@ coupling.
 
 mirror-v3's `fan-out: dns-a` should:
 
-1. Resolve the URL's host on first send. Cache the A/AAAA record set
-   up to the DNS TTL (default 30 s if no TTL is published).
+1. Resolve the URL's host on first send. Cache the A/AAAA record
+   set for a fixed 30 s window (the system resolver API does not
+   expose record TTLs).
 2. Open one HTTP/1.1 keep-alive connection per address (kept inside
    a pool, capped at the resolved set size).
-3. POST the batch to all addresses concurrently. Aggregate the
-   results; if any address returns non-2xx after retry, the whole
-   batch is failed.
-4. Re-resolve when the cache TTL expires OR when an address fails
-   repeatedly (forces an immediate re-resolve to pick up scale-up /
-   scale-down).
+3. POST the batch once per address, concurrently. The retry loop
+   sits at the endpoint level: any address whose outcome policy
+   says retry triggers a retry of the whole set, and every retry
+   round resolves fresh (failure invalidates the cache). Addresses
+   that already accepted receive the batch again on later rounds;
+   kkv invalidations are idempotent so this stays within
+   at-least-once.
+4. When the retry budget is exhausted (or the outcome says
+   `retry: false`), each still-failing address's configured final
+   action applies; any `fail` fails the whole batch.
 
 This handles the rolling-update case: during a Deployment rollout,
-the headless Service's A-record set has both old and new pod IPs
-for a few seconds; mirror-v3 POSTs to both, the old terminating
-pods drain on whatever they got, and the next re-resolve drops
-them. Same behaviour kkv had via Endpoints API.
+a batch that hits a terminating pod IP fails that round, the retry
+re-resolves and delivers to the replacement pod. A dead IP never
+consumes the whole retry budget.
 
 For non-K8s use (a standalone service behind a single hostname),
 `fan-out: none` skips all of that and uses a single keep-alive
@@ -627,7 +632,7 @@ Adds, alongside the existing `mirror_v3_destination_*` counters:
 | Metric                                          | Type    | Labels                                  | Meaning                                       |
 |-------------------------------------------------|---------|------------------------------------------|-----------------------------------------------|
 | `mirror_v3_notify_records_total`                | counter | `topic`, `partition`                     | Records appended to a notify batch            |
-| `mirror_v3_notify_batches_total`                | counter | `topic`, `partition`, `result=ok\|fail`  | Batches sent                                  |
+| `mirror_v3_notify_batches_total`                | counter | `topic`, `partition`, `result=ok\|skip\|fail` | Batches sent                             |
 | `mirror_v3_notify_post_duration_seconds`        | histogram | `topic`, `partition`, `target_host`    | Per-target HTTP latency                       |
 | `mirror_v3_notify_inflight_retry`               | gauge   | `topic`, `partition`, `target_host`      | Current retry attempt (1-based, 0 when idle)  |
 | `mirror_v3_notify_buffer_records`               | gauge   | `topic`, `partition`                     | Current buffer depth                          |
@@ -641,7 +646,8 @@ latency.
 - One INFO line at startup per notify-enabled mirror:
   `notify start mirror=<name> api=kkv-v1 targets=<host>[,host…] fan-out=<mode>`.
 - One INFO line per successful batch:
-  `notify sent mirror=<name> batch_records=<n> highest_offset=<o> targets=<n> elapsed_ms=<m>`.
+  `notify sent` with `topic`, `partition`, `batch_keys`,
+  `high_offset`, `targets` and `elapsed_ms` fields.
 - One WARN per failed attempt with retry remaining:
   `notify retry mirror=<name> target=<addr> attempt=<i>/<max> reason=<err>`.
 - One ERROR on retry exhaustion (mirror-task-fatal):
@@ -661,18 +667,21 @@ Per-record DEBUG only; counters cover the operational signal.
   default table above. Listing all six is allowed and
   recommended for production configs so the policy is explicit.
 - `final: accept` on `timeout`/`connrefused`/`5xx` with
-  `retry: false` is a valid but unusual combination; the validator
-  warns (operator probably meant `retry: true, final: accept`).
+  `retry: false` is a valid but unusual combination (operator
+  probably meant `retry: true, final: accept`); not currently
+  flagged by the validator.
 - **Destinations relaxation** (new in this proposal):
   `destinations` MAY be empty *if and only if* `notify` is set with
   at least one target. See "Notify-only mirrors" above for the full
   matrix of which other fields are then forbidden
   (`format`/`compression`/`compaction`/`flush`/`http-access`) and
   which trigger modes are required (`trigger.on: source-consume`).
-- `notify.targets[].url` parses as a valid URL with http:// or https://.
-- Each target's resolved host must produce ≥1 address at startup,
-  otherwise validation fails (catches typos / missing Services
-  before the mirror runs).
+- `notify.targets[].url` parses as a valid URL with http:// or
+  https:// and a host. Hostname resolution is NOT checked at
+  startup (validation must work without cluster DNS); an
+  unresolvable host surfaces on the first dispatch, where a 0
+  address resolution is a transport error subject to the
+  configured outcome policy.
 
 ## Out-of-scope (future)
 

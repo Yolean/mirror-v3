@@ -255,6 +255,18 @@ impl KafkaCommitHandle {
             .commit_consumer_state(CommitMode::Async)
             .map_err(|e| SourceError::Transport(format!("commit_consumer_state: {e}")))
     }
+
+    /// Like [`Self::commit_pending`] but with `CommitMode::Sync`:
+    /// returns only after the broker has acknowledged the commit.
+    /// Used for the one final commit on graceful shutdown, where an
+    /// async commit would race process exit and usually lose. Blocks
+    /// the calling thread; call under `spawn_blocking` from async
+    /// contexts.
+    pub fn commit_pending_sync(&self) -> Result<(), SourceError> {
+        self.consumer
+            .commit_consumer_state(CommitMode::Sync)
+            .map_err(|e| SourceError::Transport(format!("commit_consumer_state sync: {e}")))
+    }
 }
 
 /// Stage `through` as the offset to commit for `(topic, partition)`,

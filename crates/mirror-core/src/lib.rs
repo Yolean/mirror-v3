@@ -361,6 +361,17 @@ pub trait Sink: Send {
     /// replace earlier ones.
     fn set_flush_observer(&mut self, _observer: Arc<dyn FlushObserver>) {}
 
+    /// Whether this sink ever fires the [`FlushObserver`] installed
+    /// via [`Self::set_flush_observer`]. Blob sinks (FS, S3) return
+    /// true; per-record sinks (Kafka) and mocks keep the default
+    /// false. Coordinators (TeeSink's min-across-destinations for
+    /// `trigger.on: destination-flush`) use this to exclude sinks
+    /// whose flush watermark would otherwise sit at 0 forever and
+    /// pin the min there.
+    fn supports_flush_observer(&self) -> bool {
+        false
+    }
+
     /// Install a [`WriteObserver`] that fires after every successful
     /// `write`. Default no-op for sinks where the per-record signal
     /// is uninteresting or already covered by [`FlushObserver`]

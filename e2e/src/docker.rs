@@ -17,11 +17,14 @@ use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 use crate::{ProvisionedStack, Provisioner};
 
 const REDPANDA_IMAGE: &str = "docker.io/redpandadata/redpanda";
-const REDPANDA_TAG: &str = "latest";
+const REDPANDA_TAG: &str = "v26.1.12";
 const KAFKA_NATIVE_IMAGE: &str = "quay.io/ogunalp/kafka-native";
-const KAFKA_NATIVE_TAG: &str = "latest";
+// No stable release tags exist upstream (only moving main-<sha>
+// builds), so pin the digest that `latest` resolved to at pin time.
+const KAFKA_NATIVE_TAG: &str =
+    "latest@sha256:9ae667c854cd25a86a2d263e0cd7352cd6ffa6395c2dec5f90ab9056cc60b14f";
 const VERSITYGW_IMAGE: &str = "docker.io/versity/versitygw";
-const VERSITYGW_TAG: &str = "latest";
+const VERSITYGW_TAG: &str = "v1.6.0";
 const TOXIPROXY_IMAGE: &str = "ghcr.io/shopify/toxiproxy";
 const TOXIPROXY_TAG: &str = "2.12.0";
 

@@ -32,6 +32,17 @@ use tokio::sync::watch;
 
 const DEFAULT_COMMIT_INTERVAL: Duration = Duration::from_secs(5);
 
+/// How long an unchanged offset may go without a re-commit. The
+/// consumer uses `assign()` (no group membership), so the broker
+/// sees the group as permanently empty and expires its offset after
+/// `offsets.retention.minutes` (default 7 days). An idle mirror that
+/// never re-commits would silently regress to fresh-deploy
+/// HWM suppression on its next restart, reopening the between-pods
+/// notify gap. Re-committing the same value refreshes the broker's
+/// retention clock; hourly is cheap (one broker round-trip) and two
+/// orders of magnitude inside the default retention window.
+const COMMIT_REFRESH_INTERVAL: Duration = Duration::from_secs(3600);
+
 /// Read the commit interval from `MIRROR_V3_OFFSET_COMMIT_INTERVAL_MS`,
 /// falling back to [`DEFAULT_COMMIT_INTERVAL`]. A value of `0`
 /// disables the periodic task (the supervisor then never advances
@@ -197,6 +208,7 @@ pub fn spawn_periodic_commit_task(
         // Consume the immediate tick `tokio::time::interval` fires.
         iv.tick().await;
         let mut last_committed: u64 = 0;
+        let mut last_commit_at = std::time::Instant::now();
         loop {
             tokio::select! {
                 biased;
@@ -211,7 +223,12 @@ pub fn spawn_periodic_commit_task(
                 }
                 _ = iv.tick() => {
                     let off = tracker.commit_offset();
-                    if off == 0 || off == last_committed {
+                    if off == 0 {
+                        continue;
+                    }
+                    if off == last_committed
+                        && last_commit_at.elapsed() < COMMIT_REFRESH_INTERVAL
+                    {
                         continue;
                     }
                     if let Err(e) = handle.commit_through(off) {
@@ -239,10 +256,52 @@ pub fn spawn_periodic_commit_task(
                         "committed source offset"
                     );
                     last_committed = off;
+                    last_commit_at = std::time::Instant::now();
                 }
             }
         }
     })
+}
+
+/// One final synchronous commit after the mirror's run loop has
+/// completed. The periodic task exits on the shutdown signal before
+/// the run loop's final drain acks, so without this the last
+/// interval's worth of acks (plus the shutdown drain batch) would
+/// replay as duplicate webhooks on the next start. Sync commit mode:
+/// an async commit here would race process exit. Best-effort like
+/// the periodic task; on error the offsets simply replay.
+pub async fn final_commit(handle: KafkaCommitHandle, tracker: &AckTracker, mirror_name: &str) {
+    let off = tracker.commit_offset();
+    if off == 0 {
+        return;
+    }
+    if let Err(e) = handle.commit_through(off) {
+        tracing::warn!(
+            mirror = %mirror_name,
+            offset = off,
+            error = %e,
+            "final commit_through failed; offsets will replay on next start"
+        );
+        return;
+    }
+    let mirror = mirror_name.to_string();
+    let result = tokio::task::spawn_blocking(move || handle.commit_pending_sync()).await;
+    match result {
+        Ok(Ok(())) => {
+            tracing::info!(mirror = %mirror, offset = off, "final source offset commit");
+        }
+        Ok(Err(e)) => {
+            tracing::warn!(
+                mirror = %mirror,
+                offset = off,
+                error = %e,
+                "final sync commit failed; offsets will replay on next start"
+            );
+        }
+        Err(e) => {
+            tracing::warn!(mirror = %mirror, error = %e, "final commit task join error");
+        }
+    }
 }
 
 #[cfg(test)]

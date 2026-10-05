@@ -31,7 +31,7 @@ use indexmap::IndexMap;
 use mirror_config::{
     FanOut, FinalAction, NotifyApi, NotifyOutcome, NotifyOutcomes, NotifyRetry, NotifyTarget,
 };
-use mirror_core::{current_labels, AckSink, CacheState, Notifier, NotifyError, Record};
+use mirror_core::{AckSink, CacheState, Notifier, NotifyError, Record};
 use reqwest::Client;
 use serde::Serialize;
 use thiserror::Error;
@@ -146,7 +146,24 @@ struct NotifierState {
     buffer: TokioMutex<Buffer>,
     new_data: TokioNotify,
     shutting_down: AtomicBool,
-    error_state: TokioMutex<Option<NotifyError>>,
+    error_state: Arc<TokioMutex<Option<NotifyError>>>,
+    /// Signalled (`notify_one`) whenever a background task stashes a
+    /// terminal error into `error_state`, so a
+    /// [`TerminalErrorWatch`] can wake without polling. `on_record`
+    /// still surfaces the error on the next call; the watch exists
+    /// for the idle-topic case where no next call ever comes.
+    error_signal: Arc<TokioNotify>,
+    /// Serializes take-dispatch-ack across the inline drain
+    /// (`on_record` max-records path, shutdown) and the background
+    /// timer drain. Without it two batches can be in flight at once
+    /// and a *later* batch's success can ack past an *earlier* batch
+    /// that is still retrying; `AckTracker::note_through` is
+    /// `fetch_max`, so the periodic source commit would then advance
+    /// past undelivered records and a restart would suppress them
+    /// forever. Holding the lock across the whole dispatch also
+    /// gives the documented backpressure: the consume loop blocks on
+    /// the in-flight batch instead of racing it.
+    dispatch_lock: TokioMutex<()>,
     /// Set once, before any record is dispatched, via
     /// [`KkvV1Notifier::with_ack_sink`]. Shared between
     /// `drain_now` (inline path) and the background timer task so
@@ -161,11 +178,12 @@ pub struct KkvV1Notifier {
     state: Arc<NotifierState>,
     timer_task: Option<JoinHandle<()>>,
     max_records: u64,
-    /// Per-mirror readiness handle. `on_record` consults
-    /// `cache_state.is_mirror_ready(&mirror_name)` and drops records
-    /// whose source offset hasn't crossed the mirror's bootstrap
-    /// high-watermark yet. Matches the legacy kkv `KafkaCache` Stage
-    /// gate which suppressed push notifications until `Polling`.
+    /// Per-mirror suppression handle. `on_record` consults
+    /// `cache_state.is_record_suppressed(&mirror_name, offset)` and
+    /// drops records below the mirror's suppression threshold
+    /// (committed offset, or bootstrap high-watermark on a fresh
+    /// deploy). Matches the legacy kkv `KafkaCache` Stage gate which
+    /// suppressed push notifications until `Polling`.
     cache_state: Arc<CacheState>,
     mirror_name: String,
 }
@@ -232,7 +250,9 @@ impl KkvV1Notifier {
             buffer: TokioMutex::new(Buffer::default()),
             new_data: TokioNotify::new(),
             shutting_down: AtomicBool::new(false),
-            error_state: TokioMutex::new(None),
+            error_state: Arc::new(TokioMutex::new(None)),
+            error_signal: Arc::new(TokioNotify::new()),
+            dispatch_lock: TokioMutex::new(()),
             ack_sink: OnceLock::new(),
         });
 
@@ -267,9 +287,30 @@ impl KkvV1Notifier {
         self
     }
 
+    /// Handle for the supervisor to observe a terminal dispatch
+    /// error without owning the notifier. `on_record` surfaces
+    /// timer-task errors on the next record, but an idle topic never
+    /// produces that next record; racing the run loop against this
+    /// watch closes that gap.
+    pub fn terminal_error_watch(&self) -> TerminalErrorWatch {
+        TerminalErrorWatch {
+            error_state: Arc::clone(&self.state.error_state),
+            signal: Arc::clone(&self.state.error_signal),
+        }
+    }
+
     /// Drain the current buffer (if any) and dispatch it. Used from
     /// both the on_record max-records path and shutdown.
     async fn drain_now(&self) -> Result<(), NotifyError> {
+        let _dispatch = self.state.dispatch_lock.lock().await;
+        // The timer task may have failed terminally while we waited
+        // for the lock. Dispatching (and acking) a later batch after
+        // an earlier one is known-undelivered would let the source
+        // commit advance past the failed batch; surface the error
+        // instead and leave the buffer for the post-restart replay.
+        if let Some(err) = self.state.error_state.lock().await.take() {
+            return Err(err);
+        }
         let batch = {
             let mut buf = self.state.buffer.lock().await;
             buf.take(self.inner.partition)
@@ -282,7 +323,8 @@ impl KkvV1Notifier {
         // Successful dispatch through every endpoint => the batch is
         // delivered. Tell the supervisor's ack tracker so the
         // periodic source-commit task can advance the broker-side
-        // committed offset.
+        // committed offset. Still under the dispatch lock, so acks
+        // arrive in batch order.
         if let Some(ack) = self.state.ack_sink.get() {
             ack.note_through(high + 1);
         }
@@ -291,9 +333,32 @@ impl KkvV1Notifier {
 }
 
 impl Inner {
+    /// Metric labels from the construction-time mirror identity.
+    /// The `MIRROR_LABELS` task-local is not available here: the
+    /// timer task and the flush drainer are `tokio::spawn`ed at
+    /// construction time, outside the run loop's scope, so
+    /// `current_labels()` would report `unknown/0` for every drain
+    /// they dispatch.
+    fn labels(&self) -> (String, String) {
+        (self.topic.clone(), self.partition.to_string())
+    }
+
     async fn dispatch_drained(&self, batch: DrainedBatch) -> Result<(), NotifyError> {
+        let high_offset = batch.high_offset();
         let payload = KkvV1Payload::new(&self.topic, batch.offsets, batch.updates);
-        self.dispatch_batch(&payload).await
+        let batch_keys = payload.updates.len();
+        let start = std::time::Instant::now();
+        self.dispatch_batch(&payload).await?;
+        tracing::info!(
+            topic = %self.topic,
+            partition = self.partition,
+            batch_keys,
+            high_offset,
+            targets = self.endpoints.len(),
+            elapsed_ms = start.elapsed().as_millis() as u64,
+            "notify sent"
+        );
+        Ok(())
     }
 
     /// POST a single batch payload to every configured endpoint
@@ -332,61 +397,127 @@ impl Inner {
         }
     }
 
-    /// Fan-out dispatch: resolve, then concurrent POSTs per address.
-    /// First per-address error wins (subsequent results are still
-    /// awaited so we don't leak in-flight requests).
+    /// Fan-out dispatch. The retry loop sits at the endpoint level:
+    /// each attempt resolves the address set fresh (the cache is
+    /// invalidated on any failure), POSTs once per address
+    /// concurrently, and retries the whole set on any retryable
+    /// per-address failure. Retrying a pinned per-address IP instead
+    /// would turn every receiver rolling restart into a mirror
+    /// crash: the dead pod IP eats the full retry budget while the
+    /// replacement pod is one re-resolve away. Addresses that
+    /// already accepted the batch get it again on a retry round;
+    /// kkv invalidations are idempotent and this is within
+    /// at-least-once.
     async fn dispatch_dns_a(
         &self,
         endpoint: &Endpoint,
         state: &DnsAState,
         payload: &KkvV1Payload<'_>,
     ) -> Result<(), NotifyError> {
-        let addrs = state.resolve_or_cached(self.resolver.as_ref()).await?;
-        if addrs.is_empty() {
-            return Err(NotifyError::Transport(format!(
-                "dns-a resolution of {} returned 0 addresses",
-                state.host
-            )));
-        }
-        let futures = addrs.iter().map(|sa| {
-            let mut per_addr_url = endpoint.url.clone();
-            // Set host to the IP literal; set port to the resolved
-            // socket's port (matches the URL's port in production,
-            // but lets test stubs aim at arbitrary axum servers).
-            // Both setters return `Result<(), …>` for malformed
-            // inputs; IPs and small ports never fail here so unwrap
-            // is justified.
-            per_addr_url
-                .set_ip_host(sa.ip())
-                .expect("set_ip_host on a valid URL always succeeds for an IpAddr");
-            per_addr_url
-                .set_port(Some(sa.port()))
-                .expect("set_port on a valid URL with an http(s) scheme succeeds");
-            let host_label = sa.to_string();
-            async move {
-                self.dispatch_to_address(&endpoint.client, per_addr_url, &host_label, payload)
+        let body = serde_json::to_vec(payload)
+            .map_err(|e| NotifyError::Transport(format!("payload serialization failed: {e}")))?;
+        let offsets_header = serde_json::to_string(&payload.offsets).map_err(|e| {
+            NotifyError::Transport(format!("offsets header serialization failed: {e}"))
+        })?;
+
+        let mut attempt: u32 = 1;
+        loop {
+            let addrs = state.resolve_or_cached(self.resolver.as_ref()).await?;
+            if addrs.is_empty() {
+                return Err(NotifyError::Transport(format!(
+                    "dns-a resolution of {} returned 0 addresses",
+                    state.host
+                )));
+            }
+            let futures = addrs.iter().map(|sa| {
+                let mut per_addr_url = endpoint.url.clone();
+                // Set host to the IP literal; set port to the resolved
+                // socket's port (matches the URL's port in production,
+                // but lets test stubs aim at arbitrary axum servers).
+                // Both setters return `Result<(), …>` for malformed
+                // inputs; IPs and small ports never fail here so unwrap
+                // is justified.
+                per_addr_url
+                    .set_ip_host(sa.ip())
+                    .expect("set_ip_host on a valid URL always succeeds for an IpAddr");
+                per_addr_url
+                    .set_port(Some(sa.port()))
+                    .expect("set_port on a valid URL with an http(s) scheme succeeds");
+                let host_label = sa.to_string();
+                let body = &body;
+                let offsets_header = &offsets_header;
+                async move {
+                    let mut last_error = String::new();
+                    let outcome = self
+                        .post_once(
+                            &endpoint.client,
+                            &per_addr_url,
+                            &host_label,
+                            body,
+                            offsets_header,
+                            attempt,
+                            &mut last_error,
+                        )
+                        .await;
+                    (per_addr_url, host_label, outcome, last_error)
+                }
+            });
+            let results = join_all(futures).await;
+
+            let mut want_retry = false;
+            let mut failures: Vec<(Url, String, Outcome, NotifyOutcome, String)> = Vec::new();
+            for (url, host_label, outcome, last_error) in results {
+                if matches!(outcome, Outcome::TwoXx) {
+                    continue;
+                }
+                let policy = self.outcomes.for_outcome(outcome);
+                if policy.retry {
+                    want_retry = true;
+                }
+                failures.push((url, host_label, outcome, policy, last_error));
+            }
+            if failures.is_empty() {
+                return Ok(());
+            }
+
+            // Any failure means the cached set may be stale (K8s
+            // scale-down or rollout mid-batch); the next attempt (or
+            // the next batch) re-resolves.
+            state.invalidate_cache().await;
+
+            if want_retry && attempt < self.retry.max_attempts {
+                let reasons: Vec<String> = failures
+                    .iter()
+                    .map(|(_, host, outcome, _, err)| format!("{host}: {outcome:?} {err}"))
+                    .collect();
+                tracing::warn!(
+                    endpoint = %endpoint.url,
+                    attempt,
+                    max_attempts = self.retry.max_attempts,
+                    failed_addresses = %reasons.join("; "),
+                    "notify dns-a retry with fresh resolution"
+                );
+                let backoff = backoff_for_attempt(self.retry.backoff_ms, attempt);
+                tokio::time::sleep(backoff).await;
+                attempt += 1;
+                continue;
+            }
+
+            // Terminal: apply each failing address's final action;
+            // any `fail` fails the batch.
+            let mut first_err: Option<NotifyError> = None;
+            for (url, host_label, outcome, policy, last_error) in failures {
+                if let Err(e) = self
+                    .apply_final_action(&url, &host_label, outcome, policy, attempt, last_error)
                     .await
+                {
+                    first_err.get_or_insert(e);
+                }
             }
-        });
-        let results = join_all(futures).await;
-        let mut first_err: Option<NotifyError> = None;
-        for r in results {
-            if let Err(e) = r {
-                first_err.get_or_insert(e);
-            }
-        }
-        match first_err {
-            Some(e) => {
-                // Per-spec: "Re-resolve when the cache TTL expires
-                // OR when an address fails repeatedly." Failure
-                // invalidates the cached set immediately so the next
-                // dispatch (after the supervisor restarts the
-                // mirror) picks up any K8s scale-down that happened
-                // mid-batch.
-                state.invalidate_cache().await;
-                Err(e)
-            }
-            None => Ok(()),
+            return match first_err {
+                Some(e) => Err(e),
+                None => Ok(()),
+            };
         }
     }
 
@@ -414,35 +545,17 @@ impl Inner {
         let mut attempt: u32 = 1;
         let mut last_error: String = String::new();
         loop {
-            let (topic_l, partition_l) = current_labels();
-            // Per-attempt retry gauge; spec says 1-based, 0 when idle.
-            metrics::gauge!(
-                "mirror_v3_notify_inflight_retry",
-                "topic" => topic_l.clone(),
-                "partition" => partition_l.clone(),
-                "target_host" => target_host.to_string(),
-            )
-            .set(attempt as f64);
-
-            let start = std::time::Instant::now();
-            let result = client
-                .post(url.clone())
-                .header("content-type", "application/json")
-                .header("x-kkv-topic", &self.topic)
-                .header("x-kkv-offsets", &offsets_header)
-                .body(body.clone())
-                .send()
+            let outcome = self
+                .post_once(
+                    client,
+                    &url,
+                    target_host,
+                    &body,
+                    &offsets_header,
+                    attempt,
+                    &mut last_error,
+                )
                 .await;
-
-            metrics::histogram!(
-                "mirror_v3_notify_post_duration_seconds",
-                "topic" => topic_l.clone(),
-                "partition" => partition_l.clone(),
-                "target_host" => target_host.to_string(),
-            )
-            .record(start.elapsed().as_secs_f64());
-
-            let outcome = classify(result, &mut last_error);
             let policy = self.outcomes.for_outcome(outcome);
 
             tracing::debug!(
@@ -456,21 +569,6 @@ impl Inner {
             );
 
             if matches!(outcome, Outcome::TwoXx) {
-                // Reset retry gauge on success.
-                metrics::gauge!(
-                    "mirror_v3_notify_inflight_retry",
-                    "topic" => topic_l.clone(),
-                    "partition" => partition_l.clone(),
-                    "target_host" => target_host.to_string(),
-                )
-                .set(0.0);
-                metrics::counter!(
-                    "mirror_v3_notify_batches_total",
-                    "topic" => topic_l,
-                    "partition" => partition_l,
-                    "result" => "ok",
-                )
-                .increment(1);
                 return Ok(());
             }
 
@@ -503,6 +601,70 @@ impl Inner {
         }
     }
 
+    /// One POST attempt against one address: emits the per-attempt
+    /// retry gauge and duration histogram, classifies the response,
+    /// and on 2xx resets the gauge and counts the batch as ok.
+    /// Shared by the fan-out: none per-address retry loop and the
+    /// dns-a endpoint-level retry loop.
+    #[allow(clippy::too_many_arguments)]
+    async fn post_once(
+        self: &Inner,
+        client: &Client,
+        url: &Url,
+        target_host: &str,
+        body: &[u8],
+        offsets_header: &str,
+        attempt: u32,
+        last_error: &mut String,
+    ) -> Outcome {
+        let (topic_l, partition_l) = self.labels();
+        // Per-attempt retry gauge; spec says 1-based, 0 when idle.
+        metrics::gauge!(
+            "mirror_v3_notify_inflight_retry",
+            "topic" => topic_l.clone(),
+            "partition" => partition_l.clone(),
+            "target_host" => target_host.to_string(),
+        )
+        .set(attempt as f64);
+
+        let start = std::time::Instant::now();
+        let result = client
+            .post(url.clone())
+            .header("content-type", "application/json")
+            .header("x-kkv-topic", &self.topic)
+            .header("x-kkv-offsets", offsets_header)
+            .body(body.to_vec())
+            .send()
+            .await;
+
+        metrics::histogram!(
+            "mirror_v3_notify_post_duration_seconds",
+            "topic" => topic_l.clone(),
+            "partition" => partition_l.clone(),
+            "target_host" => target_host.to_string(),
+        )
+        .record(start.elapsed().as_secs_f64());
+
+        let outcome = classify(result, last_error);
+        if matches!(outcome, Outcome::TwoXx) {
+            metrics::gauge!(
+                "mirror_v3_notify_inflight_retry",
+                "topic" => topic_l.clone(),
+                "partition" => partition_l.clone(),
+                "target_host" => target_host.to_string(),
+            )
+            .set(0.0);
+            metrics::counter!(
+                "mirror_v3_notify_batches_total",
+                "topic" => topic_l,
+                "partition" => partition_l,
+                "result" => "ok",
+            )
+            .increment(1);
+        }
+        outcome
+    }
+
     async fn apply_final_action(
         self: &Inner,
         url: &Url,
@@ -512,7 +674,7 @@ impl Inner {
         attempts: u32,
         last_error: String,
     ) -> Result<(), NotifyError> {
-        let (topic_l, partition_l) = current_labels();
+        let (topic_l, partition_l) = self.labels();
         // Reset retry gauge regardless of outcome; the request is
         // no longer in flight.
         metrics::gauge!(
@@ -615,10 +777,8 @@ impl DnsAState {
 impl Notifier for KkvV1Notifier {
     async fn on_record(&mut self, record: &Record) -> Result<(), NotifyError> {
         // First: surface any terminal error the timer task accumulated
-        // since the last call. Once an error is observed we still let
-        // the run loop hand us further records; they'll just keep
-        // returning the same error until the loop aborts. Take() so
-        // we only return it once.
+        // since the last call. Take() so it surfaces exactly once;
+        // the run loop aborts the mirror on the first Err.
         if let Some(err) = self.state.error_state.lock().await.take() {
             return Err(err);
         }
@@ -640,7 +800,7 @@ impl Notifier for KkvV1Notifier {
             .cache_state
             .is_record_suppressed(&self.mirror_name, record.source_offset)
         {
-            let (topic_l, partition_l) = current_labels();
+            let (topic_l, partition_l) = self.inner.labels();
             metrics::counter!(
                 "mirror_v3_notify_suppressed_records_total",
                 "topic" => topic_l,
@@ -657,7 +817,7 @@ impl Notifier for KkvV1Notifier {
         // on edge cases instead of crashing.
         let key_str = render_key(record.key.as_deref());
 
-        let (topic_l, partition_l) = current_labels();
+        let (topic_l, partition_l) = self.inner.labels();
         metrics::counter!(
             "mirror_v3_notify_records_total",
             "topic" => topic_l.clone(),
@@ -751,6 +911,11 @@ async fn timer_loop(inner: Arc<Inner>, state: Arc<NotifierState>, max_time: Dura
         if state.shutting_down.load(Ordering::SeqCst) {
             return;
         }
+        // Serialize with the inline drain path; see the
+        // `dispatch_lock` field docs. Taken before the buffer take so
+        // batches dispatch, and therefore ack, in source-offset
+        // order.
+        let _dispatch = state.dispatch_lock.lock().await;
         let batch = {
             let mut buf = state.buffer.lock().await;
             buf.take(inner.partition)
@@ -760,8 +925,11 @@ async fn timer_loop(inner: Arc<Inner>, state: Arc<NotifierState>, max_time: Dura
             if let Err(e) = inner.dispatch_drained(batch).await {
                 // Stash for the next on_record / shutdown to surface;
                 // exit so the buffer doesn't grow further behind a
-                // broken receiver.
+                // broken receiver. The signal wakes any
+                // TerminalErrorWatch, which covers the idle-topic
+                // case where no next on_record ever comes.
                 *state.error_state.lock().await = Some(e);
+                state.error_signal.notify_one();
                 return;
             }
             // Same ack semantics as `drain_now`: successful POST
@@ -828,12 +996,23 @@ pub struct FlushDispatcher {
     #[allow(dead_code)]
     inner: Arc<Inner>,
     tx: tokio::sync::mpsc::UnboundedSender<FlushEvent>,
-    drainer: Option<JoinHandle<()>>,
+    /// Behind a mutex so [`Self::drain_and_stop`] can join the task
+    /// through `&self`: in production the dispatcher lives inside
+    /// the tee as an `Arc<dyn FlushObserver>`, and the supervisor
+    /// holds a second `Arc` clone for the shutdown drain.
+    drainer: TokioMutex<Option<JoinHandle<()>>>,
     error_state: Arc<TokioMutex<Option<NotifyError>>>,
-    /// Per-mirror readiness handle. `on_flushed` consults
-    /// `cache_state.is_mirror_ready(&mirror_name)` and drops events
-    /// arriving before the mirror's bootstrap high-watermark is
-    /// crossed. Matches the source-consume gate on [`KkvV1Notifier`].
+    /// Signalled when the drainer stashes a terminal error; see
+    /// [`TerminalErrorWatch`]. Without a watcher a drainer death is
+    /// otherwise invisible in production: nothing calls
+    /// `last_error`/`shutdown`, later `on_flushed` sends fail
+    /// silently, and flush events (unlike source records) are not
+    /// regenerated by a restart.
+    error_signal: Arc<TokioNotify>,
+    /// Per-mirror suppression handle. `on_flushed` consults
+    /// `cache_state.is_record_suppressed(&mirror_name, to)` and
+    /// drops events below the mirror's suppression threshold.
+    /// Matches the source-consume gate on [`KkvV1Notifier`].
     cache_state: Arc<CacheState>,
     mirror_name: String,
     topic: String,
@@ -848,6 +1027,37 @@ pub struct FlushDispatcher {
 enum FlushEvent {
     Flushed { to: u64 },
     Shutdown,
+}
+
+/// Awaitable handle onto a notifier's / dispatcher's terminal
+/// dispatch error. The supervisor races this against the mirror run
+/// loop so a dead webhook pipeline errors the mirror (and thereby
+/// the process) instead of going silent: the orchestrator restarts,
+/// and the post-restart replay-from-committed-offset re-delivers
+/// what the dead pipeline dropped.
+pub struct TerminalErrorWatch {
+    error_state: Arc<TokioMutex<Option<NotifyError>>>,
+    signal: Arc<TokioNotify>,
+}
+
+impl TerminalErrorWatch {
+    /// Resolve once a terminal error is stashed, consuming it.
+    /// Pending forever if dispatch never fails terminally. If the
+    /// run loop consumes the error first (the `on_record` path),
+    /// this stays pending; the run loop's own error wins the race,
+    /// which is fine because either way the mirror errors exactly
+    /// once.
+    pub async fn wait(self) -> NotifyError {
+        loop {
+            if let Some(err) = self.error_state.lock().await.take() {
+                return err;
+            }
+            // notify_one stores a permit when there's no waiter yet,
+            // so a stash happening between the check above and this
+            // await cannot be missed.
+            self.signal.notified().await;
+        }
+    }
 }
 
 impl FlushDispatcher {
@@ -879,18 +1089,21 @@ impl FlushDispatcher {
         let inner = Arc::new(build_inner(notify, topic.clone(), partition, resolver)?);
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let error_state = Arc::new(TokioMutex::new(None));
+        let error_signal = Arc::new(TokioNotify::new());
         let ack_sink: Arc<OnceLock<Arc<dyn AckSink>>> = Arc::new(OnceLock::new());
         let drainer = tokio::spawn(flush_drainer_loop(
             Arc::clone(&inner),
             rx,
             Arc::clone(&error_state),
+            Arc::clone(&error_signal),
             Arc::clone(&ack_sink),
         ));
         Ok(Self {
             inner,
             tx,
-            drainer: Some(drainer),
+            drainer: TokioMutex::new(Some(drainer)),
             error_state,
+            error_signal,
             cache_state,
             mirror_name,
             topic,
@@ -912,10 +1125,25 @@ impl FlushDispatcher {
     /// Drain pending events and stop the background task. Returns
     /// any error the drainer accumulated before exit. Idempotent -
     /// calling twice is safe (the second call is a no-op).
+    ///
+    /// The channel is FIFO, so awaiting the drainer after queueing
+    /// the Shutdown marker lets every already-queued flush event
+    /// dispatch first - aborting instead would silently drop the
+    /// final flush notification of a graceful shutdown, and flush
+    /// events are not regenerated on restart. A dispatch stuck in
+    /// retries holds this up for at most the retry budget
+    /// (max-attempts x (timeout + backoff)); beyond that the
+    /// orchestrator's termination grace period is the backstop.
     pub async fn shutdown(&mut self) -> Result<(), NotifyError> {
+        self.drain_and_stop().await
+    }
+
+    /// `&self` version of [`Self::shutdown`] for the supervisor,
+    /// which holds the dispatcher behind an `Arc` (the tee owns it
+    /// as its `FlushObserver`). Idempotent.
+    pub async fn drain_and_stop(&self) -> Result<(), NotifyError> {
         let _ = self.tx.send(FlushEvent::Shutdown);
-        if let Some(handle) = self.drainer.take() {
-            handle.abort();
+        if let Some(handle) = self.drainer.lock().await.take() {
             let _ = handle.await;
         }
         if let Some(err) = self.error_state.lock().await.take() {
@@ -925,11 +1153,21 @@ impl FlushDispatcher {
     }
 
     /// Snapshot the drainer's latest error without consuming the
-    /// dispatcher. Used by `mirror-bin`'s status / supervision loop
-    /// to detect a fatal dispatch failure without waiting for
-    /// shutdown.
+    /// dispatcher. Prefer [`Self::terminal_error_watch`] for
+    /// supervision; this polling accessor remains for tests and
+    /// one-shot status checks.
     pub async fn last_error(&self) -> Option<NotifyError> {
         self.error_state.lock().await.take()
+    }
+
+    /// Handle for the supervisor to observe the drainer's terminal
+    /// error while the dispatcher itself is owned by the sink as a
+    /// `FlushObserver`. See [`TerminalErrorWatch`].
+    pub fn terminal_error_watch(&self) -> TerminalErrorWatch {
+        TerminalErrorWatch {
+            error_state: Arc::clone(&self.error_state),
+            signal: Arc::clone(&self.error_signal),
+        }
     }
 }
 
@@ -970,6 +1208,7 @@ async fn flush_drainer_loop(
     inner: Arc<Inner>,
     mut rx: tokio::sync::mpsc::UnboundedReceiver<FlushEvent>,
     error_state: Arc<TokioMutex<Option<NotifyError>>>,
+    error_signal: Arc<TokioNotify>,
     ack_sink: Arc<OnceLock<Arc<dyn AckSink>>>,
 ) {
     while let Some(event) = rx.recv().await {
@@ -986,6 +1225,7 @@ async fn flush_drainer_loop(
         let payload = KkvV1Payload::new(&inner.topic, offsets, IndexMap::new());
         if let Err(e) = inner.dispatch_batch(&payload).await {
             *error_state.lock().await = Some(e);
+            error_signal.notify_one();
             return;
         }
         // Successful POST => the batch is delivered. The flush event

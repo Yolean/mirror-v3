@@ -9,8 +9,8 @@ use mirror_config::{Destination, HttpAccess, Mirror};
 mod ack_tracker;
 mod readiness_poller;
 use ack_tracker::{
-    commit_interval_from_env, spawn_periodic_commit_task, AckTracker, DestAckSlot, FlushAckShim,
-    WriteAckShim,
+    commit_interval_from_env, final_commit, spawn_periodic_commit_task, AckTracker, DestAckSlot,
+    FlushAckShim, WriteAckShim,
 };
 use mirror_core::{
     heartbeat_interval_from_env, run_mirror_with_notifier, MetricLabels, NoOpNotifier, Record,
@@ -685,6 +685,30 @@ async fn fetch_committed_offset_for_mirror(mirror: &Mirror) -> Result<Option<u64
     Ok(committed)
 }
 
+/// Broker low watermark for a mirror's source partition, used to
+/// clamp the notify resume floor: a committed offset that has aged
+/// past retention cannot be re-read, so the replay starts at the
+/// earliest available offset instead of erroring the append-mode
+/// bootstrap gate.
+async fn fetch_low_watermark_for_mirror(mirror: &Mirror) -> Result<u64> {
+    let bootstrap = mirror.source.bootstrap_servers.clone();
+    let topic = mirror.topic.clone();
+    let partition = mirror.partition as i32;
+    let mirror_name = mirror.name.clone();
+    let low = tokio::task::spawn_blocking(move || {
+        mirror_kafka::fetch_low_watermark(
+            &bootstrap,
+            &topic,
+            partition,
+            std::time::Duration::from_secs(5),
+        )
+    })
+    .await
+    .with_context(|| format!("mirror {mirror_name}: low watermark task join"))?
+    .with_context(|| format!("mirror {mirror_name}: fetch low watermark"))?;
+    Ok(low.max(0) as u64)
+}
+
 async fn shutdown_signal(mut rx: tokio::sync::watch::Receiver<bool>) {
     if *rx.borrow() {
         return;
@@ -733,12 +757,14 @@ async fn spawn_mirror(
     );
     let source = KafkaSource::open(source_cfg)
         .with_context(|| format!("opening source for mirror {}", mirror.name))?;
-    // Snapshot two commit handles before the run loop takes
+    // Snapshot three commit handles before the run loop takes
     // ownership of the source. Each `KafkaCommitHandle` clones the
     // underlying `Arc<StreamConsumer>` (cheap); the periodic commit
-    // task and the readiness poller each get their own.
+    // task, the readiness poller and the final shutdown commit each
+    // get their own.
     let commit_handle = source.commit_handle();
     let commit_handle_for_poller = source.commit_handle();
+    let commit_handle_final = source.commit_handle();
 
     let name = mirror.name.clone();
     let labels = MetricLabels {
@@ -829,6 +855,7 @@ async fn spawn_mirror(
     // contribute (commit 9 wires `affects-readiness` to filter).
     let notify_present = mirror.notify.is_some();
     let ack_tracker = Arc::new(AckTracker::new(notify_present, dest_ack_slots));
+    let ack_tracker_final = Arc::clone(&ack_tracker);
 
     // Branch on the notify trigger mode (validated upstream in
     // mirror-config; see WEBHOOKS.md § Trigger):
@@ -844,6 +871,23 @@ async fn spawn_mirror(
     let trigger_mode = mirror.notify.as_ref().map(|n| n.trigger.on);
     let ack_sink_for_notifier: Arc<dyn mirror_core::AckSink> =
         Arc::clone(&ack_tracker) as Arc<dyn mirror_core::AckSink>;
+    // Notify re-delivery across restarts: the destinations' durable
+    // heads can be ahead of the broker-committed (= notify-acked)
+    // offset, e.g. when the webhook receiver was down at shutdown.
+    // The destination state alone would resume above those records
+    // and their invalidations would never fire. `[committed,
+    // min(heads))` is that gap; each trigger mode closes it below.
+    let notify_committed = if trigger_mode.is_some() {
+        fetch_committed_offset_for_mirror(&mirror).await?
+    } else {
+        None
+    };
+    let min_head = tee
+        .heads()
+        .iter()
+        .map(|(_, h)| *h)
+        .min()
+        .expect("tee is non-empty by construction");
     let notifier_opt = match trigger_mode {
         Some(mirror_config::TriggerOn::SourceConsume) => {
             build_source_consume_notifier(&mirror, cache.as_ref())?
@@ -851,13 +895,73 @@ async fn spawn_mirror(
         }
         _ => None,
     };
+    if notifier_opt.is_some() {
+        if let Some(committed) = notify_committed {
+            if committed < min_head {
+                // Re-read the gap from the source; the tee skips the
+                // destination writes and the notifier's suppression
+                // threshold (== committed) lets exactly these
+                // records fire.
+                let low = fetch_low_watermark_for_mirror(&mirror).await?;
+                if committed < low {
+                    tracing::warn!(
+                        mirror = %name,
+                        committed,
+                        low_watermark = low,
+                        "committed offset is below the broker low watermark; notify re-delivery starts at the earliest available offset and the records below it are lost"
+                    );
+                }
+                let floor = committed.max(low);
+                tracing::info!(
+                    mirror = %name,
+                    committed,
+                    destination_min_head = min_head,
+                    resume_floor = floor,
+                    "re-reading un-acked notify window from the source"
+                );
+                tee.set_resume_floor(floor);
+            }
+        }
+    }
+    // The run loop races this watch so a terminal dispatch failure
+    // errors the mirror even when nothing else would surface it:
+    // the flush drainer's death is otherwise invisible (its events
+    // are not regenerated on restart), and the notifier's timer
+    // error only surfaces on the next record, which an idle topic
+    // never delivers.
+    let mut dispatch_error_watch = notifier_opt.as_ref().map(|n| n.terminal_error_watch());
+    let mut flush_dispatcher_shutdown: Option<Arc<mirror_notify_kkv::FlushDispatcher>> = None;
     if matches!(
         trigger_mode,
         Some(mirror_config::TriggerOn::DestinationFlush)
     ) {
         let dispatcher = build_flush_dispatcher(&mirror, cache.as_ref())?
             .with_ack_sink(Arc::clone(&ack_sink_for_notifier));
-        tee.set_flush_observer(std::sync::Arc::new(dispatcher));
+        dispatch_error_watch = Some(dispatcher.terminal_error_watch());
+        // Destination-flush variant of the un-acked window: a replay
+        // cannot regenerate flush events for data that is already
+        // durable, so synthesize one catch-up event covering
+        // `[committed, min_head)`. Suppression (threshold ==
+        // committed) admits it; a fresh deploy (no commit) skips it.
+        if let Some(committed) = notify_committed {
+            if committed < min_head {
+                tracing::info!(
+                    mirror = %name,
+                    committed,
+                    destination_min_head = min_head,
+                    "dispatching synthetic flush notification for the un-acked window"
+                );
+                use mirror_core::FlushObserver;
+                dispatcher.on_flushed(committed, min_head - 1);
+            }
+        }
+        // The tee owns the dispatcher as its FlushObserver; the
+        // supervisor keeps a second handle so the graceful-shutdown
+        // path can drain queued flush events before the process
+        // exits (they are not regenerated on restart).
+        let dispatcher = Arc::new(dispatcher);
+        flush_dispatcher_shutdown = Some(Arc::clone(&dispatcher));
+        tee.set_flush_observer(dispatcher);
     }
 
     // Spawn the periodic source-commit task. It reads
@@ -934,7 +1038,10 @@ async fn spawn_mirror(
                     MIRROR_LABELS
                         .scope(
                             labels,
-                            run_mirror_with_notifier(source, tee, n, shutdown, heartbeat),
+                            run_racing_dispatch_error(
+                                run_mirror_with_notifier(source, tee, n, shutdown, heartbeat),
+                                dispatch_error_watch,
+                            ),
                         )
                         .await
                 }
@@ -942,24 +1049,72 @@ async fn spawn_mirror(
                     MIRROR_LABELS
                         .scope(
                             labels,
-                            run_mirror_with_notifier(
-                                source,
-                                tee,
-                                NoOpNotifier,
-                                shutdown,
-                                heartbeat,
+                            run_racing_dispatch_error(
+                                run_mirror_with_notifier(
+                                    source,
+                                    tee,
+                                    NoOpNotifier,
+                                    shutdown,
+                                    heartbeat,
+                                ),
+                                dispatch_error_watch,
                             ),
                         )
                         .await
                 }
             };
-            match result {
-                Ok(()) => Ok(()),
-                Err(e) => Err(anyhow::anyhow!("mirror {name}: {e}")),
+            // Drain the flush dispatcher before committing: the run
+            // loop's final sink.flush() may have queued flush events
+            // that are not regenerated on restart, and their acks
+            // belong in the final commit below.
+            let flush_drain = match flush_dispatcher_shutdown {
+                Some(d) => d.drain_and_stop().await,
+                None => Ok(()),
+            };
+            // One final sync commit of whatever the notifier acked:
+            // the periodic commit task exits on the shutdown signal
+            // before the run loop's final drain acks, and its async
+            // commit mode would race process exit anyway. Runs on
+            // the error path too - acked offsets are delivered
+            // regardless of why the loop stopped, and committing
+            // them shrinks the duplicate-webhook replay on restart.
+            final_commit(commit_handle_final, &ack_tracker_final, &name).await;
+            match (result, flush_drain) {
+                (Ok(()), Ok(())) => Ok(()),
+                (Err(e), _) => Err(anyhow::anyhow!("mirror {name}: {e}")),
+                (Ok(()), Err(e)) => Err(anyhow::anyhow!(
+                    "mirror {name}: flush notify drain on shutdown: {e}"
+                )),
             }
         }
         .instrument(span),
     ))
+}
+
+/// Race the mirror run loop against the notify pipeline's terminal
+/// dispatch error. Whichever resolves first errors (or completes)
+/// the mirror; the loser is dropped. With no watch installed the
+/// second branch is pending forever and this is exactly the run
+/// loop.
+async fn run_racing_dispatch_error<Fut>(
+    run: Fut,
+    watch: Option<mirror_notify_kkv::TerminalErrorWatch>,
+) -> Result<(), anyhow::Error>
+where
+    Fut: std::future::Future<Output = Result<(), mirror_core::MirrorError>>,
+{
+    let watch_error = async move {
+        match watch {
+            Some(w) => w.wait().await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::select! {
+        r = run => r.map_err(anyhow::Error::from),
+        e = watch_error => Err(anyhow::anyhow!(
+            "notify dispatch failed terminally: {e}"
+        )),
+    }
 }
 
 /// Construct the `KkvV1Notifier` for a mirror with

@@ -500,6 +500,10 @@ impl Sink for S3Sink {
     fn set_flush_observer(&mut self, observer: Arc<dyn mirror_core::FlushObserver>) {
         self.flush_observer = Some(observer);
     }
+
+    fn supports_flush_observer(&self) -> bool {
+        true
+    }
 }
 
 fn record_byte_size(record: &Record) -> u64 {
