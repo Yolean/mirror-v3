@@ -195,6 +195,22 @@ impl Sink for TeeSink {
         })
     }
 
+    async fn furthest_next_offset(&mut self) -> Result<Option<u64>, SinkError> {
+        // The heads as the last next_expected_offset refreshed them. The
+        // resume cursor only lowers where the tee resumes; it says
+        // nothing about where the destinations are.
+        let mut furthest = 0;
+        for inner in self.inners.iter_mut() {
+            let head = inner
+                .sink
+                .furthest_next_offset()
+                .await?
+                .unwrap_or(inner.head);
+            furthest = furthest.max(head);
+        }
+        Ok(Some(furthest))
+    }
+
     async fn write(&mut self, record: Record) -> Result<(), SinkError> {
         // Cache fanout happens once, before per-sink writes. The
         // CacheState is monotonic so this is the natural place to

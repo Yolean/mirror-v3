@@ -292,6 +292,18 @@ pub trait Sink: Send {
     /// else wrote to it.
     async fn next_expected_offset(&mut self) -> Result<u64, SinkError>;
 
+    /// The highest next offset any part of the destination holds, when
+    /// that is not [`Self::next_expected_offset`]: a tee reports its
+    /// furthest inner sink, which neither the minimum over its inner
+    /// sinks nor a replay floor below them shows. The run loop requires
+    /// it not to exceed the source's high watermark at startup, right
+    /// after `next_expected_offset`. `None` (the default) means
+    /// `next_expected_offset` is the furthest; it is not queried again,
+    /// as a query may flush or check for drift.
+    async fn furthest_next_offset(&mut self) -> Result<Option<u64>, SinkError> {
+        Ok(None)
+    }
+
     /// Atomically commit `record` at exactly `record.source_offset`.
     /// MUST fail if the destination is not at that offset at the
     /// moment of write.
@@ -670,13 +682,18 @@ where
     let sink_start = sink.next_expected_offset().await?;
     let low_watermark = source.low_watermark().await?;
     let high_watermark = source.high_watermark().await?;
-    if sink_start > high_watermark {
-        // Without this, a recreated topic either
-        // delivered offset 0 (SourceWentBackwards, a misleading crash
-        // loop) or, once refilled past the destination, got appended
-        // to the old topic's chain with no error at all.
+    // Checked on the furthest destination, not on `sink_start`: a tee
+    // resumes from its slowest inner sink, or from a replay floor below
+    // all of them (a cache read from the low watermark, notify
+    // re-delivery), and skips each inner sink up to its own position.
+    // Without this, a recreated topic either delivered offset 0
+    // (SourceWentBackwards, a misleading crash loop) or, once refilled
+    // past the destination, got appended to the old topic's chain with
+    // no error at all.
+    let sink_furthest = sink.furthest_next_offset().await?.unwrap_or(sink_start);
+    if sink_furthest > high_watermark {
         return Err(MirrorError::SinkAheadOfSource {
-            sink_offset: sink_start,
+            sink_offset: sink_furthest,
             source_hwm: high_watermark,
         });
     }
