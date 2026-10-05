@@ -167,7 +167,7 @@
           "type": "string"
         },
         "group-id": {
-          "description": "Optional consumer group id used for monitoring/back-pressure\nonly. Restart correctness derives from the destination, never\nfrom committed group offsets.",
+          "description": "The consumer group the mirror commits its progress to (default\n`mirror-v3-<mirror name>`): consumer-group lag for monitoring,\nand for a notify mirror the point re-delivery resumes from after\na restart. Destination positions never come from it. Two mirrors\nmay not commit one group for the same topic and partition.",
           "type": [
             "string",
             "null"

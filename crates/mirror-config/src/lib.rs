@@ -330,6 +330,15 @@ impl Mirror {
     pub fn is_enabled(&self) -> bool {
         self.enabled.unwrap_or(true)
     }
+
+    /// The consumer group this mirror commits its progress to:
+    /// `source.group-id`, or `mirror-v3-<name>`.
+    pub fn effective_group_id(&self) -> String {
+        self.source
+            .group_id
+            .clone()
+            .unwrap_or_else(|| format!("mirror-v3-{}", self.name))
+    }
 }
 
 // ============================================================
@@ -632,9 +641,11 @@ impl HttpAccess {
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct KafkaSource {
     pub bootstrap_servers: String,
-    /// Optional consumer group id used for monitoring/back-pressure
-    /// only. Restart correctness derives from the destination, never
-    /// from committed group offsets.
+    /// The consumer group the mirror commits its progress to (default
+    /// `mirror-v3-<mirror name>`): consumer-group lag for monitoring,
+    /// and for a notify mirror the point re-delivery resumes from after
+    /// a restart. Destination positions never come from it. Two mirrors
+    /// may not commit one group for the same topic and partition.
     #[serde(default)]
     pub group_id: Option<String>,
 }
@@ -981,6 +992,22 @@ fn validate(cfg: &Config) -> Result<(), LoadError> {
                     m.name
                 )));
             }
+        }
+    }
+    // Cross-mirror: commits are kept per (group, topic, partition), so
+    // two mirrors of one partition with one group overwrite each other's
+    // committed offset: lag monitoring shows either, and a notify
+    // mirror's re-delivery after a restart resumes from the other's.
+    let mut groups: std::collections::HashMap<(String, &str, u32), &str> =
+        std::collections::HashMap::new();
+    for m in &cfg.mirrors {
+        let group = m.effective_group_id();
+        if let Some(other) = groups.insert((group.clone(), &m.topic, m.partition), &m.name) {
+            return Err(LoadError::Validation(format!(
+                "mirrors {other:?} and {:?} both commit consumer group {group:?} for {}/{}; \
+                 give one of them a `source.group-id` of its own",
+                m.name, m.topic, m.partition
+            )));
         }
     }
     // Cross-mirror: `cache-v1-main` mounts the unprefixed

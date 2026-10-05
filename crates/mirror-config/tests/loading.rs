@@ -987,6 +987,37 @@ mirrors:
     );
 }
 
+#[test]
+fn two_mirrors_committing_one_group_for_one_partition_are_rejected() {
+    let mirror = |name: &str, topic: &str, group: &str| {
+        format!(
+            r#"
+  - name: {name}
+    source: {{ bootstrap-servers: k:9092, group-id: {group} }}
+    topic: {topic}
+    partition: 0
+    destinations: [{{ type: kafka, bootstrap-servers: r:9092 }}]
+"#
+        )
+    };
+    let same = format!(
+        "mirrors:{}{}",
+        mirror("a", "ops", "g"),
+        mirror("b", "ops", "g")
+    );
+    let err = load_from_str(&same).expect_err("one group, one partition, two mirrors");
+    assert!(
+        format!("{err}").contains("both commit consumer group \"g\" for ops/0"),
+        "{err}"
+    );
+    let other_topic = format!(
+        "mirrors:{}{}",
+        mirror("a", "ops", "g"),
+        mirror("b", "users", "g")
+    );
+    load_from_str(&other_topic).expect("a group commits per topic and partition");
+}
+
 fn s3_mirror_yaml(encryption: &str, format: &str) -> String {
     format!(
         r#"

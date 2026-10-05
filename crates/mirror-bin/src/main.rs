@@ -769,11 +769,7 @@ async fn fetch_hwm_for_mirror(mirror: &Mirror) -> Result<u64> {
 /// this hits `BaseConsumer` synchronously under `spawn_blocking`.
 async fn fetch_committed_offset_for_mirror(mirror: &Mirror) -> Result<Option<u64>> {
     let bootstrap = mirror.source.bootstrap_servers.clone();
-    let group_id = mirror
-        .source
-        .group_id
-        .clone()
-        .unwrap_or_else(|| format!("mirror-v3-{}", mirror.name));
+    let group_id = mirror.effective_group_id();
     let topic = mirror.topic.clone();
     let partition = mirror.partition as i32;
     let mirror_name = mirror.name.clone();
@@ -843,11 +839,7 @@ async fn spawn_mirror(
 ) -> Result<tokio::task::JoinHandle<Result<()>>> {
     let source_cfg = KafkaSourceConfig::new(
         mirror.source.bootstrap_servers.clone(),
-        mirror
-            .source
-            .group_id
-            .clone()
-            .unwrap_or_else(|| format!("mirror-v3-{}", mirror.name)),
+        mirror.effective_group_id(),
         mirror.topic.clone(),
         mirror.partition as i32,
     );
