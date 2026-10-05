@@ -84,7 +84,7 @@ Also exposed on the same port:
 - `GET /openapi.json` and `GET /openapi.yaml` — auto-generated OpenAPI 3.1 spec; the committed copy is at [`schemas/mirror-v3.cache.openapi.json`](./schemas/mirror-v3.cache.openapi.json) (gated by `cargo run -p xtask -- check-openapi`).
 - `GET /docs` — Scalar UI rendering the spec.
 
-Bootstrap: a cache is built by reading the source topic from its low watermark, as kafka-keyvalue does, never from a destination. A cache does not need S3 to start and is not stalled by a slow destination when it is the only thing its mirror does, and a blob destination's startup reads object names only. On a mirror that has destinations too, the source is read from the low watermark and the destinations skip what they already hold. Put a cache in its own mirror when its availability must not depend on a destination (a failing destination ends its mirror).
+Bootstrap: a cache is built by reading the source topic from its low watermark, as kafka-keyvalue does, never from a destination. A cache does not need S3 to start and is not stalled by a slow destination when it is the only thing its mirror does, and a blob destination's startup reads object names only. On a mirror that has destinations too, the source is read from the low watermark and the destinations skip what they already hold. Put a cache in its own mirror when its availability must not depend on a destination: a cache mirror's failure ends the process, a destination's failure included. Whether a cache should share a mirror with destinations at all is open; see [Open design questions](#open-design-questions).
 
 ## Observability
 
@@ -253,3 +253,16 @@ destinations:
 ```
 
 A destination with `affects-readiness: false` still records its `flushed_through` for observability but is skipped when computing `DestinationLagging`. Use it for observability replicas or archival sinks that must not flip consumer-pod readiness when they fall behind.
+
+## Open design questions
+
+### `http-access` on a mirror with destinations
+
+The config accepts a cache (`http-access`) and destinations in one mirror. Such a mirror reads the source from its low watermark for the cache, and lowers the tee's resume position to it, so every record below each destination's own position is read and skipped for that destination (a *resume floor*; notify re-delivery after a restart uses the same mechanism from the committed offset). What stands out:
+
+- **The destinations no longer set the source position.** Restart correctness still derives from them: each is listed or queried at open, skips what it holds, and only accepts the record at exactly its next offset. But the guard against a destination that is ahead of its source (a recreated or truncated topic) has to look past the floor, at the furthest destination (`Sink::furthest_next_offset`); compared with the floor it would never fire for this shape.
+- **The cache and the destinations fail together.** A cache mirror ends the process on any failure, so an S3 outage on its backup takes `/cache/v1` and its notifications down with it, and the pod cannot start while the destination is unreachable. A destination-only mirror is reopened in the process instead.
+- **The cache is only as complete as the topic.** It holds what the source still retains, not what the destination archived (before 0309bc8 a cache was bootstrapped from the destination's compaction-mode snapshot instead).
+
+The alternative is the split shape in [`examples/kkv-and-encrypted-backup.yaml`](examples/kkv-and-encrypted-backup.yaml): a cache (and notify) mirror without destinations, and a backup mirror of the same partition with its own consumer group, whose only startup input is its destination. The validator could then reject `http-access` on a mirror with destinations. That is not done, because notify on a mirror with destinations requires `cache-v1-main` on the same mirror, so it would also make `trigger.on: destination-flush` impossible to configure and remove notify re-delivery through the tee, and whether those are wanted is the other half of the question.
+
