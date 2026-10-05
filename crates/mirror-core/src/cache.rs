@@ -395,7 +395,7 @@ impl CacheState {
                 }
             }
             if let Some(view) = data.view.as_mut() {
-                Self::apply_value(view, record);
+                Self::apply_value(mirror_name, view, record);
             }
             data.offsets.insert(tp, record.source_offset);
         }
@@ -408,7 +408,7 @@ impl CacheState {
         Self::recompute_status_locked(slot, self.readiness_lag_tolerance);
     }
 
-    fn apply_value(view: &mut IndexMap<String, Entry>, record: &Record) {
+    fn apply_value(mirror_name: &str, view: &mut IndexMap<String, Entry>, record: &Record) {
         // kafka-keyvalue skips a record without a key with a warning;
         // so does a cache here, and one whose key is not UTF-8 (it
         // cannot be a /raw/{key} path). Counted, so it is not silent.
@@ -431,6 +431,7 @@ impl CacheState {
             "mirror_v3_cache_skipped_records_total",
             "topic" => record.topic.clone(),
             "partition" => record.partition.to_string(),
+            "mirror" => mirror_name.to_string(),
             "reason" => reason,
         )
         .increment(1);

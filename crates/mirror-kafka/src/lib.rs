@@ -675,11 +675,12 @@ impl Sink for KafkaSink {
         // source offset the destination will accept is
         // `delivery.offset + 1`, which equals the destination's high
         // watermark — i.e. the verified-durable boundary.
-        let (topic, partition) = mirror_core::current_labels();
+        let (topic, partition, mirror) = mirror_core::current_labels();
         metrics::gauge!(
             "mirror_v3_destination_offset_verified",
             "topic" => topic,
             "partition" => partition,
+            "mirror" => mirror,
         )
         .set((delivery.offset as u64 + 1) as f64);
         // Per-write ack signal. The supervisor's installed observer

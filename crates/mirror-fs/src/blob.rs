@@ -286,11 +286,12 @@ fn record_byte_size(record: &Record) -> u64 {
 }
 
 fn report_compaction_keys(n: usize) {
-    let (topic, partition) = mirror_core::current_labels();
+    let (topic, partition, mirror) = mirror_core::current_labels();
     metrics::gauge!(
         "mirror_v3_destination_compaction_keys",
         "topic" => topic,
         "partition" => partition,
+        "mirror" => mirror,
     )
     .set(n as f64);
 }
@@ -542,29 +543,33 @@ impl<S: BlobStore> BlobSink<S> {
             .unwrap_or(0);
         self.last_flush_at = Some(Instant::now());
 
-        let (topic, partition) = mirror_core::current_labels();
+        let (topic, partition, mirror) = mirror_core::current_labels();
         metrics::gauge!(
             "mirror_v3_destination_offset_verified",
             "topic" => topic.clone(),
             "partition" => partition.clone(),
+            "mirror" => mirror.clone(),
         )
         .set(self.durable_position as f64);
         metrics::gauge!(
             "mirror_v3_destination_last_flush_timestamp_seconds",
             "topic" => topic.clone(),
             "partition" => partition.clone(),
+            "mirror" => mirror.clone(),
         )
         .set((self.clock)() as f64);
         metrics::counter!(
             "mirror_v3_destination_bytes_total",
             "topic" => topic.clone(),
             "partition" => partition.clone(),
+            "mirror" => mirror.clone(),
         )
         .increment(encoded_bytes);
         metrics::counter!(
             "mirror_v3_destination_flushes_total",
             "topic" => topic,
             "partition" => partition,
+            "mirror" => mirror,
         )
         .increment(1);
 

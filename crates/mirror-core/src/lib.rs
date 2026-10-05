@@ -28,33 +28,35 @@ pub mod testing;
 pub use cache::{CacheBinding, CacheState, MirrorStatus, MirrorStatusSnapshot};
 pub use tee::TeeSink;
 
-/// Per-mirror Prometheus labels. `topic` and `partition` together
-/// uniquely identify the data stream and join cleanly with broker-
-/// side exporters (kafka_exporter, etc.) - the mirror's operator-
-/// chosen `name` is *not* a metric label, it lives in `tracing`
-/// logs only.
+/// Per-mirror Prometheus labels. `topic` and `partition` identify the
+/// data stream and join with broker-side exporters (kafka_exporter,
+/// etc.); `mirror` is the mirror's name, because one process may run
+/// two mirrors of one partition (a cache and a backup of the same
+/// topic), whose series would otherwise overwrite each other.
 #[derive(Debug, Clone)]
 pub struct MetricLabels {
     pub topic: String,
     pub partition: u32,
+    pub mirror: String,
 }
 
 tokio::task_local! {
     /// Set by the supervisor (mirror-bin) inside the spawn closure so
     /// every metric emitted from this mirror's loop and sink is
-    /// automatically labeled with `topic` and `partition`. If unset
-    /// (e.g. inside `cargo test` outside the supervisor), the labels
-    /// fall back to `unknown` / `0` via [`current_labels`].
+    /// automatically labeled with `topic`, `partition` and `mirror`. If
+    /// unset (e.g. inside `cargo test` outside the supervisor), the
+    /// labels fall back to `unknown` / `0` / `unknown` via
+    /// [`current_labels`].
     pub static MIRROR_LABELS: MetricLabels;
 }
 
 /// Resolve the current mirror's labels from the task-local as
-/// `(topic, partition_as_string)`, falling back to
-/// `("unknown", "0")` when no scope is set.
-pub fn current_labels() -> (String, String) {
+/// `(topic, partition_as_string, mirror)`, falling back to
+/// `("unknown", "0", "unknown")` when no scope is set.
+pub fn current_labels() -> (String, String, String) {
     MIRROR_LABELS
-        .try_with(|l| (l.topic.clone(), l.partition.to_string()))
-        .unwrap_or_else(|_| ("unknown".into(), "0".into()))
+        .try_with(|l| (l.topic.clone(), l.partition.to_string(), l.mirror.clone()))
+        .unwrap_or_else(|_| ("unknown".into(), "0".into(), "unknown".into()))
 }
 
 /// A record in transit. `source_offset` is the partition offset on
@@ -797,11 +799,12 @@ where
     let mut last_heartbeat_offset = expected;
     // `_offset_verified` carries the destination's startup position so
     // an idle mirror is visible to Prometheus.
-    let (topic, partition) = current_labels();
+    let (topic, partition, mirror) = current_labels();
     metrics::gauge!(
         "mirror_v3_destination_offset_verified",
         "topic" => topic.clone(),
         "partition" => partition.clone(),
+        "mirror" => mirror.clone(),
     )
     .set(expected as f64);
 
@@ -872,11 +875,12 @@ where
                                 // scales with millions of lines per
                                 // restart. The counter below is the
                                 // signal.
-                                let (topic_l, partition_l) = current_labels();
+                                let (topic_l, partition_l, mirror_l) = current_labels();
                                 metrics::counter!(
                                     "mirror_v3_source_offset_gap_records_total",
                                     "topic" => topic_l,
                                     "partition" => partition_l,
+                                    "mirror" => mirror_l,
                                 )
                                 .increment(1);
                                 expected = record.source_offset;
@@ -901,6 +905,7 @@ where
                             "mirror_v3_destination_records_total",
                             "topic" => topic.clone(),
                             "partition" => partition.clone(),
+                            "mirror" => mirror.clone(),
                         )
                         .increment(1);
                         // Notifier observes only after the destination

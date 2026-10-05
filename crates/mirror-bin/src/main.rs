@@ -711,6 +711,7 @@ async fn supervise_in_process(
             "mirror_v3_mirror_restarts_total",
             "topic" => mirror.topic.clone(),
             "partition" => mirror.partition.to_string(),
+            "mirror" => mirror.name.clone(),
         )
         .increment(1);
         tokio::select! {
@@ -865,6 +866,7 @@ async fn spawn_mirror(
     let labels = MetricLabels {
         topic: mirror.topic.clone(),
         partition: mirror.partition,
+        mirror: mirror.name.clone(),
     };
     let compaction = compaction_label(mirror.compaction);
 

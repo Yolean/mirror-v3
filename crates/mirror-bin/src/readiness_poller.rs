@@ -95,6 +95,7 @@ pub fn spawn_readiness_poller(
                                     "mirror_v3_source_lag_offsets",
                                     "topic" => spec.topic.clone(),
                                     "partition" => spec.partition.to_string(),
+                                    "mirror" => spec.mirror_name.clone(),
                                 )
                                 .set(s.broker_end_offset.saturating_sub(s.last_applied_offset) as f64);
                             }
