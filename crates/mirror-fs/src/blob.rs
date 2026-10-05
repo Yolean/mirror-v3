@@ -513,16 +513,16 @@ impl<S: BlobStore> BlobSink<S> {
                     .expect("the active key was checked at open"),
             ),
         }
-        .map_err(|e| SinkError::Transport(format!("encode: {e}")))?;
+        .map_err(|e| SinkError::Rejected(format!("encode: {e}")))?;
         let encoded_bytes = bytes.len() as u64;
 
         match self.store.put_new(&name, bytes).await {
             Ok(()) => {}
             Err(BlobError::AlreadyExists(_)) => {
-                return Err(SinkError::UnexpectedPosition {
-                    expected: from,
-                    actual: from,
-                });
+                return Err(SinkError::Inconsistent(format!(
+                    "{location} already exists (a second writer, or a write that landed after \
+                     it was reported failed)"
+                )));
             }
             Err(e) => return Err(SinkError::Transport(format!("write {location}: {e}"))),
         }
@@ -604,14 +604,14 @@ impl<S: BlobStore> BlobSink<S> {
             .map_err(|e| SinkError::Transport(e.to_string()))?;
         if let Some(last) = expected {
             if !listed.iter().any(|n| n == last) {
-                return Err(SinkError::Transport(format!(
+                return Err(SinkError::Inconsistent(format!(
                     "destination drift: {} is gone; it is the end of this mirror's chain",
                     self.store.location(last)
                 )));
             }
         }
         if let Some(foreign) = listed.iter().find(|n| Some(n.as_str()) != expected) {
-            return Err(SinkError::Transport(format!(
+            return Err(SinkError::Inconsistent(format!(
                 "destination drift: {} was not written by this process (a second writer, \
                  or a manual change); this mirror's chain ends before it, at next offset {}",
                 self.store.location(foreign),
@@ -652,7 +652,7 @@ impl<S: BlobStore> Sink for BlobSink<S> {
         if matches!(self.spec.compaction, Some(CompactionMode::Log)) {
             match &record.key {
                 None => {
-                    return Err(SinkError::Transport(format!(
+                    return Err(SinkError::Rejected(format!(
                         "this mirror requires a non-null key; \
                          record at source offset {} has key=null",
                         record.source_offset
@@ -660,7 +660,7 @@ impl<S: BlobStore> Sink for BlobSink<S> {
                 }
                 Some(k) => {
                     if std::str::from_utf8(k).is_err() {
-                        return Err(SinkError::Transport(format!(
+                        return Err(SinkError::Rejected(format!(
                             "this mirror requires a UTF-8 key; \
                              record at source offset {} has non-UTF-8 key",
                             record.source_offset
@@ -708,12 +708,12 @@ impl<S: BlobStore> Sink for BlobSink<S> {
         // Only called when `allows_compacted_source` (compaction mode),
         // whose chain allows the gap from the previous position.
         if !matches!(self.spec.compaction, Some(CompactionMode::Log)) {
-            return Err(SinkError::Transport(
+            return Err(SinkError::Inconsistent(
                 "align_to_source_low_watermark called on non-compaction sink".into(),
             ));
         }
         if !self.buffer.is_empty() || low_watermark < self.durable_position {
-            return Err(SinkError::Transport(format!(
+            return Err(SinkError::Inconsistent(format!(
                 "align_to_source_low_watermark called in inconsistent state: buffer={} durable={} low_watermark={}",
                 self.buffer.len(),
                 self.durable_position,

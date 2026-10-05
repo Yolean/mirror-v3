@@ -18,6 +18,7 @@ use mirror_core::{
 };
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{BaseConsumer, CommitMode, Consumer, StreamConsumer};
+use rdkafka::error::RDKafkaErrorCode;
 use rdkafka::message::{Header as RdHeader, Headers, Message, OwnedHeaders};
 use rdkafka::producer::{FutureProducer, FutureRecord};
 use rdkafka::topic_partition_list::Offset;
@@ -347,7 +348,14 @@ impl Source for KafkaSource {
     async fn poll_one(&mut self) -> Result<Option<Record>, SourceError> {
         match tokio::time::timeout(self.poll_timeout, self.consumer.recv()).await {
             Ok(Ok(borrowed)) => Ok(Some(borrowed_to_record(&borrowed))),
-            Ok(Err(e)) => Err(SourceError::Transport(e.to_string())),
+            // `auto.offset.reset=error` reports a position the broker
+            // no longer has as AutoOffsetReset.
+            Ok(Err(e)) => Err(match e.rdkafka_error_code() {
+                Some(RDKafkaErrorCode::AutoOffsetReset | RDKafkaErrorCode::OffsetOutOfRange) => {
+                    SourceError::PositionLost(e.to_string())
+                }
+                _ => SourceError::Transport(e.to_string()),
+            }),
             Err(_elapsed) => Ok(None),
         }
     }

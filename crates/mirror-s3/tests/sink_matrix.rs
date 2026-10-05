@@ -99,7 +99,7 @@ enum Outcome {
     Ok,
     NextExpectedIs(u64),
     UnexpectedPosition { expected: u64, actual: u64 },
-    TransportContains(&'static str),
+    InconsistentContains(&'static str),
 }
 
 struct Case {
@@ -196,10 +196,10 @@ async fn run_case(case: &Case) {
                 case.name
             );
         }
-        (Outcome::TransportContains(needle), Err(SinkError::Transport(msg))) => {
+        (Outcome::InconsistentContains(needle), Err(SinkError::Inconsistent(msg))) => {
             assert!(
                 msg.contains(needle),
-                "[{}] Transport({msg:?}) should contain {needle:?}",
+                "[{}] Inconsistent({msg:?}) should contain {needle:?}",
                 case.name
             );
         }
@@ -364,7 +364,7 @@ fn matrix_cases() -> Vec<Case> {
             preload: &[0, 1, 2],
             buffer_state: BufferState::NonEmpty,
             action: Action::Align { low_watermark: 461 },
-            expected: Outcome::TransportContains("inconsistent state"),
+            expected: Outcome::InconsistentContains("inconsistent state"),
         },
         Case {
             name: "append/empty/align/rejects_on_non_compaction_sink",
@@ -372,7 +372,7 @@ fn matrix_cases() -> Vec<Case> {
             preload: &[],
             buffer_state: BufferState::Empty,
             action: Action::Align { low_watermark: 461 },
-            expected: Outcome::TransportContains("non-compaction sink"),
+            expected: Outcome::InconsistentContains("non-compaction sink"),
         },
         // ============================================================
         //  FLUSH

@@ -628,25 +628,52 @@ fn serves_cache(mirror: &Mirror) -> bool {
 }
 
 /// Whether a failed mirror is restarted inside the process instead of
-/// ending it. A mirror with neither a cache nor notify holds no state but
-/// its destinations, and opening it again re-derives its position from
-/// them, exactly as a process restart would. Restarting it alone keeps a
-/// destination outage (S3 down, a full disk) from taking the process,
-/// and with it the caches and notifications other mirrors serve, down
-/// with it. A cache or notify mirror ends the process: its in-memory
+/// ending it, when its failure is transient ([`is_transient`]). A mirror
+/// with neither a cache nor notify holds no state but its destinations,
+/// and opening it again re-derives its position from them, exactly as a
+/// process restart would. Restarting it alone keeps a destination outage
+/// (S3 down, a full disk) from taking the process, and with it the caches
+/// and notifications other mirrors serve, down with it. A cache or notify mirror ends the process: its in-memory
 /// state belongs to the process and is rebuilt by the orchestrator's
 /// restart.
 fn restarts_in_process(mirror: &Mirror) -> bool {
     !serves_cache(mirror) && mirror.notify.is_none()
 }
 
+/// Whether a failed run of a mirror can succeed when it is opened again:
+/// the source or a destination could not be reached. Anything else, a
+/// destination that contradicts the source (an offset mismatch, a foreign
+/// object, a corrupt chain), a lost source position, or data or
+/// configuration that cannot work, repeats on every attempt; it ends the
+/// process so that it shows as a crash loop, as it does for a cache or
+/// notify mirror.
+fn is_transient(err: &anyhow::Error) -> bool {
+    for cause in err.chain() {
+        if let Some(e) = cause.downcast_ref::<mirror_core::MirrorError>() {
+            return e.is_transient();
+        }
+        if let Some(e) = cause.downcast_ref::<SinkError>() {
+            return e.is_transient();
+        }
+        if let Some(e) = cause.downcast_ref::<mirror_core::SourceError>() {
+            return e.is_transient();
+        }
+        if let Some(e) = cause.downcast_ref::<mirror_fs::BlobError>() {
+            return matches!(e, mirror_fs::BlobError::Store(_));
+        }
+    }
+    false
+}
+
 const RESTART_BACKOFF_MIN: std::time::Duration = std::time::Duration::from_secs(1);
 const RESTART_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Run a mirror and, while the process is not shutting down, open and run
-/// it again after each failure, with a backoff from 1 s doubling to 60 s
-/// (reset after a run that lasted longer than the cap). Every failure is
-/// logged as an error and counted in `mirror_v3_mirror_restarts_total`.
+/// it again after each transient failure, with a backoff from 1 s doubling
+/// to 60 s (reset after a run that lasted longer than the cap). Every such
+/// failure is logged as an error and counted in
+/// `mirror_v3_mirror_restarts_total`; any other failure is returned and
+/// ends the process.
 async fn supervise_in_process(
     mirror: Mirror,
     knobs: Knobs,
@@ -668,7 +695,7 @@ async fn supervise_in_process(
             Ok(()) => return Ok(()),
             Err(e) => e,
         };
-        if *shutdown_rx.borrow() {
+        if *shutdown_rx.borrow() || !is_transient(&err) {
             return Err(err);
         }
         if started.elapsed() > RESTART_BACKOFF_MAX {
@@ -914,7 +941,7 @@ async fn spawn_mirror(
     }
     let mut tee = mirror_core::TeeSink::open(inners, cache.clone())
         .await
-        .map_err(|e| anyhow::anyhow!("opening tee for mirror {name}: {e}"))?;
+        .with_context(|| format!("opening tee for mirror {name}"))?;
 
     // Build the per-mirror ack tracker. Notify-side slot exists iff
     // the mirror has a `notify:` block; destinations always
@@ -1171,7 +1198,7 @@ async fn spawn_mirror(
             }
             match (result, flush_drain) {
                 (Ok(()), Ok(())) => Ok(()),
-                (Err(e), _) => Err(anyhow::anyhow!("mirror {name}: {e}")),
+                (Err(e), _) => Err(e.context(format!("mirror {name}"))),
                 (Ok(()), Err(e)) => Err(anyhow::anyhow!(
                     "mirror {name}: flush notify drain on shutdown: {e}"
                 )),
@@ -1535,5 +1562,41 @@ mirrors:
 "#,
         );
         assert!(!restarts_in_process(&cache));
+    }
+
+    #[test]
+    fn only_unreachable_sources_and_destinations_are_transient() {
+        use mirror_core::{MirrorError, SourceError};
+        use mirror_fs::BlobError;
+        let transient = [
+            anyhow::Error::from(MirrorError::Sink(SinkError::Transport("503".into())))
+                .context("mirror ops"),
+            anyhow::Error::from(MirrorError::Source(SourceError::Transport("down".into()))),
+            anyhow::Error::from(BlobError::Store("timeout".into())).context("opening s3 sink"),
+            anyhow::Error::from(SinkError::Transport("503".into())).context("opening tee"),
+        ];
+        for e in &transient {
+            assert!(is_transient(e), "{e:#}");
+        }
+        let fatal = [
+            anyhow::Error::from(MirrorError::SinkAheadOfSource {
+                sink_offset: 150,
+                source_hwm: 100,
+            }),
+            anyhow::Error::from(MirrorError::Sink(SinkError::UnexpectedPosition {
+                expected: 5,
+                actual: 6,
+            })),
+            anyhow::Error::from(MirrorError::Sink(SinkError::Inconsistent("foreign".into())))
+                .context("mirror ops"),
+            anyhow::Error::from(MirrorError::Source(SourceError::PositionLost(
+                "gone".into(),
+            ))),
+            anyhow::Error::from(BlobError::CorruptChain("overlap".into())).context("opening"),
+            anyhow::anyhow!("environment variable S3_KEY is not set"),
+        ];
+        for e in &fatal {
+            assert!(!is_transient(e), "{e:#}");
+        }
     }
 }

@@ -521,14 +521,59 @@ impl Notifier for NoOpNotifier {}
 pub enum SourceError {
     #[error("source transport: {0}")]
     Transport(String),
+    /// The position to read from is gone from the broker: retention
+    /// deleted records the mirror never read. Reading on would skip
+    /// them, so it is not retried.
+    #[error("source position lost: {0}")]
+    PositionLost(String),
+}
+
+impl SourceError {
+    /// Whether trying again (reopening the mirror) can succeed.
+    pub fn is_transient(&self) -> bool {
+        matches!(self, SourceError::Transport(_))
+    }
 }
 
 #[derive(Debug, Error)]
 pub enum SinkError {
     #[error("destination advanced: expected next-offset {expected}, found {actual}")]
     UnexpectedPosition { expected: u64, actual: u64 },
+    /// The destination could not be reached or answered with an
+    /// error; trying again can succeed.
     #[error("sink transport: {0}")]
     Transport(String),
+    /// The destination contradicts what this mirror wrote or expects:
+    /// an object it did not write, a missing one, a position that went
+    /// back. Trying again cannot fix it.
+    #[error("destination inconsistent: {0}")]
+    Inconsistent(String),
+    /// A record this destination cannot take (a compaction-mode mirror
+    /// and a record without a UTF-8 key). It is read again after any
+    /// restart, so trying again cannot fix it.
+    #[error("record not accepted: {0}")]
+    Rejected(String),
+}
+
+impl SinkError {
+    /// Whether trying again (reopening the mirror) can succeed.
+    pub fn is_transient(&self) -> bool {
+        matches!(self, SinkError::Transport(_))
+    }
+
+    /// The same kind of error, its message prefixed with `context` (an
+    /// inner sink's name). A position mismatch becomes `Inconsistent`,
+    /// which carries a message.
+    pub fn context(self, context: &str) -> SinkError {
+        match self {
+            SinkError::Transport(m) => SinkError::Transport(format!("{context}: {m}")),
+            SinkError::Rejected(m) => SinkError::Rejected(format!("{context}: {m}")),
+            SinkError::Inconsistent(m) => SinkError::Inconsistent(format!("{context}: {m}")),
+            e @ SinkError::UnexpectedPosition { .. } => {
+                SinkError::Inconsistent(format!("{context}: {e}"))
+            }
+        }
+    }
 }
 
 /// Error produced by a [`Notifier`]. `Transport` carries a single
@@ -603,6 +648,21 @@ pub enum MirrorError {
         low_watermark: u64,
         low_watermark_minus_one: u64,
     },
+}
+
+impl MirrorError {
+    /// Whether trying again (reopening the mirror) can succeed: the
+    /// source or a destination could not be reached. Every other error
+    /// says that the source and the destination disagree, or that the
+    /// configuration or the data cannot work, and repeats on every
+    /// attempt.
+    pub fn is_transient(&self) -> bool {
+        match self {
+            MirrorError::Source(e) => e.is_transient(),
+            MirrorError::Sink(e) => e.is_transient(),
+            _ => false,
+        }
+    }
 }
 
 /// How often the loop emits an INFO-level "heartbeat" log line. This

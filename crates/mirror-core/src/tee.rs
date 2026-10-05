@@ -173,7 +173,7 @@ impl Sink for TeeSink {
             // transient (the blob sinks keep their position in memory
             // and check the destination themselves).
             if head < inner.head {
-                return Err(SinkError::Transport(format!(
+                return Err(SinkError::Inconsistent(format!(
                     "inner sink {}: destination went back from next offset {} to {head}",
                     inner.name, inner.head
                 )));
@@ -282,7 +282,7 @@ impl Sink for TeeSink {
             }
         }
         if let Some((name, e)) = first_err {
-            return Err(SinkError::Transport(format!("inner sink {name}: {e}")));
+            return Err(e.context(&format!("inner sink {name}")));
         }
         self.advance_resume_cursor(record_offset);
         Ok(())
@@ -318,9 +318,7 @@ impl Sink for TeeSink {
             }
         }
         if let Some((name, e)) = first_err {
-            return Err(SinkError::Transport(format!(
-                "inner sink {name} flush: {e}"
-            )));
+            return Err(e.context(&format!("inner sink {name} flush")));
         }
         Ok(())
     }
@@ -366,9 +364,7 @@ impl Sink for TeeSink {
             }
         }
         if let Some((name, e)) = first_err {
-            return Err(SinkError::Transport(format!(
-                "inner sink {name} align: {e}"
-            )));
+            return Err(e.context(&format!("inner sink {name} align")));
         }
         // After alignment every inner sink's head advances to
         // `low_watermark`.
@@ -662,6 +658,27 @@ mod tests {
 
     fn boxed(s: Recording) -> Box<dyn Sink> {
         Box::new(s) as Box<dyn Sink>
+    }
+
+    /// An inner sink's offset mismatch is not a transport failure: the
+    /// tee names the inner sink and keeps it fatal, so a destination-only
+    /// mirror is not reopened in process over a mismatch.
+    #[tokio::test]
+    async fn an_inner_position_mismatch_stays_fatal_through_the_tee() {
+        let mut tee = TeeSink::from_inners_for_test(
+            vec![(
+                "kafka-v3".into(),
+                Box::new(crate::mock::MockSink::starting_at(5)) as Box<dyn Sink>,
+                3,
+            )],
+            None,
+        );
+        let err = tee.write(rec(3)).await.expect_err("mismatch");
+        assert!(!err.is_transient(), "{err}");
+        assert!(
+            matches!(&err, SinkError::Inconsistent(m) if m.starts_with("inner sink kafka-v3: ")),
+            "{err}"
+        );
     }
 
     #[tokio::test]

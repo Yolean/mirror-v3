@@ -122,11 +122,11 @@ enum Outcome {
     NextExpectedIs(u64),
     /// `SinkError::UnexpectedPosition { expected, actual }`.
     UnexpectedPosition { expected: u64, actual: u64 },
-    /// `SinkError::Transport(message)` where the message contains
+    /// `SinkError::Inconsistent(message)` where the message contains
     /// this substring. Used for the align preconditions, which fail
-    /// with descriptive transport errors rather than the structured
+    /// with a descriptive message rather than the structured
     /// `UnexpectedPosition` variant.
-    TransportContains(&'static str),
+    InconsistentContains(&'static str),
 }
 
 struct Case {
@@ -232,10 +232,10 @@ async fn run_case(case: &Case) {
                 case.name
             );
         }
-        (Outcome::TransportContains(needle), Err(SinkError::Transport(msg))) => {
+        (Outcome::InconsistentContains(needle), Err(SinkError::Inconsistent(msg))) => {
             assert!(
                 msg.contains(needle),
-                "[{}] Transport({msg:?}) should contain {needle:?}",
+                "[{}] Inconsistent({msg:?}) should contain {needle:?}",
                 case.name
             );
         }
@@ -407,7 +407,7 @@ fn matrix_cases() -> Vec<Case> {
             preload: &[0, 1, 2],
             buffer_state: BufferState::NonEmpty,
             action: Action::Align { low_watermark: 461 },
-            expected: Outcome::TransportContains("inconsistent state"),
+            expected: Outcome::InconsistentContains("inconsistent state"),
         },
         // append × empty × align → reject (compaction-mode precondition)
         Case {
@@ -416,7 +416,7 @@ fn matrix_cases() -> Vec<Case> {
             preload: &[],
             buffer_state: BufferState::Empty,
             action: Action::Align { low_watermark: 461 },
-            expected: Outcome::TransportContains("non-compaction sink"),
+            expected: Outcome::InconsistentContains("non-compaction sink"),
         },
         // ============================================================
         //  FLUSH; filename encodes the offset range correctly
