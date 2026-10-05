@@ -59,7 +59,8 @@ pub fn fetch_low_watermark(
 /// Read the broker's `__consumer_offsets` entry for the
 /// `(group_id, topic, partition)` tuple. `Ok(None)` is the
 /// "no committed value yet" sentinel (a fresh group, or a group
-/// that hasn't committed for this partition). Sync; wrap in
+/// that hasn't committed for this partition); a committed value that
+/// is not a position is an error. Sync; wrap in
 /// `spawn_blocking` for async contexts. Mirrors the `fetch_*_watermark`
 /// pattern so the supervisor can read the per-mirror committed
 /// offset at startup without instantiating a full `KafkaSource`.
@@ -86,12 +87,27 @@ pub fn fetch_committed_offset(
             "committed_offsets returned no entry for {topic}/{partition}"
         ))
     })?;
-    match elem.offset() {
+    committed_position(elem.offset(), group_id, topic, partition)
+}
+
+/// A committed offset as a position: `Invalid` is librdkafka's "no
+/// committed offset for this group" (`None`). Anything else that is not
+/// a position (a logical offset, a negative number) is an error: reading
+/// it as "no commit" would turn a returning deploy into a fresh one
+/// (notify suppression from the high watermark).
+fn committed_position(
+    offset: Offset,
+    group_id: &str,
+    topic: &str,
+    partition: i32,
+) -> Result<Option<u64>, KafkaError> {
+    match offset {
         Offset::Offset(n) if n >= 0 => Ok(Some(n as u64)),
-        // `Invalid` is librdkafka's "no committed offset for this
-        // group". The other `Offset::*` variants don't appear in a
-        // `committed_offsets` result; treat them as `None`.
-        _ => Ok(None),
+        Offset::Invalid => Ok(None),
+        other => Err(KafkaError::Init(format!(
+            "group {group_id} has committed offset {other:?} for {topic}/{partition}, \
+             which is not a position"
+        ))),
     }
 }
 
@@ -718,6 +734,27 @@ pub enum KafkaError {
 #[cfg(test)]
 mod tests {
     use rdkafka::config::ClientConfig;
+
+    #[test]
+    fn a_committed_offset_is_a_position_or_no_commit() {
+        use rdkafka::topic_partition_list::Offset;
+        let pos = |o| super::committed_position(o, "g", "ops", 0);
+        assert_eq!(pos(Offset::Offset(42)).unwrap(), Some(42));
+        assert_eq!(pos(Offset::Offset(0)).unwrap(), Some(0));
+        assert_eq!(pos(Offset::Invalid).unwrap(), None);
+        for odd in [
+            Offset::Offset(-5),
+            Offset::End,
+            Offset::Beginning,
+            Offset::Stored,
+        ] {
+            let err = pos(odd).expect_err("not a position");
+            assert!(
+                err.to_string().contains("group g has committed offset"),
+                "{err}"
+            );
+        }
+    }
 
     #[test]
     fn source_fails_on_a_lost_position_instead_of_jumping() {
