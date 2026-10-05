@@ -7,7 +7,7 @@ mod common;
 
 use std::time::Duration;
 
-use common::{notify_pointing_at, ready_cache, terminal_error, wait_until, Reply, TestServer};
+use common::{notify_pointing_at, ready_cache, Reply, TestServer};
 use mirror_config::{NotifyOutcomes, NotifyRetry};
 use mirror_core::{Notifier, Record, TimestampType};
 use mirror_notify_kkv::{KkvV1Notifier, KKV_V1_DEFAULT_PATH};
@@ -25,8 +25,6 @@ fn rec(offset: u64, key: &str, value: &str) -> Record {
         headers: vec![],
     }
 }
-
-const WAIT: Duration = Duration::from_secs(5);
 
 fn fast_retry() -> NotifyRetry {
     NotifyRetry {
@@ -46,7 +44,6 @@ async fn posts_to_default_kkv_path_with_canonical_body() {
         .on_record(&rec(42, "user-7", "ignored"))
         .await
         .unwrap();
-    wait_until("one POST", WAIT, || server.request_count() == 1).await;
 
     let captured = server.captured().await;
     assert_eq!(
@@ -102,11 +99,11 @@ async fn a_record_without_a_key_is_not_notified() {
     record.key = None;
     notifier.on_record(&record).await.unwrap();
     notifier.on_record(&rec(8, "k8", "v")).await.unwrap();
-    wait_until("one POST", WAIT, || server.request_count() == 1).await;
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    let body: Value = serde_json::from_slice(&server.captured().await[0].body).unwrap();
+
+    let captured = server.captured().await;
+    assert_eq!(captured.len(), 1);
+    let body: Value = serde_json::from_slice(&captured[0].body).unwrap();
     assert_eq!(body["updates"], serde_json::json!({"k8": null}));
-    assert_eq!(server.request_count(), 1);
 }
 
 #[tokio::test]
@@ -127,8 +124,10 @@ async fn timeout_classification_uses_timeout_outcome() {
     let mut notifier =
         KkvV1Notifier::from_config(&cfg, "t".into(), 0, ready_cache("m"), "m".into()).unwrap();
 
-    notifier.on_record(&rec(1, "k", "v")).await.unwrap();
-    let err = terminal_error(&notifier, WAIT).await;
+    let err = notifier
+        .on_record(&rec(1, "k", "v"))
+        .await
+        .expect_err("timeout outcome with final:fail must surface");
     let msg = format!("{err}");
     assert!(
         msg.to_lowercase().contains("timed out") || msg.to_lowercase().contains("timeout"),
@@ -155,8 +154,10 @@ async fn connection_refused_classification_uses_connrefused_outcome() {
     let mut notifier =
         KkvV1Notifier::from_config(&cfg, "t".into(), 0, ready_cache("m"), "m".into()).unwrap();
 
-    notifier.on_record(&rec(1, "k", "v")).await.unwrap();
-    let err = terminal_error(&notifier, WAIT).await;
+    let err = notifier
+        .on_record(&rec(1, "k", "v"))
+        .await
+        .expect_err("connrefused outcome with final:fail must surface");
     let msg = format!("{err}").to_lowercase();
     assert!(
         msg.contains("refused") || msg.contains("connect"),

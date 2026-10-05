@@ -66,22 +66,6 @@ impl TestServer {
     /// every request, plus an optional per-request `Reply` queue
     /// applied before the default takes over.
     pub async fn start(default_reply: Reply, scripted: Vec<Reply>) -> Self {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        Self::serve(listener, default_reply, scripted)
-    }
-
-    /// Like [`Self::start`] on a given address (a consumer that starts
-    /// listening late).
-    pub async fn start_on(addr: SocketAddr, default_reply: Reply) -> Self {
-        let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-        Self::serve(listener, default_reply, vec![])
-    }
-
-    fn serve(
-        listener: tokio::net::TcpListener,
-        default_reply: Reply,
-        scripted: Vec<Reply>,
-    ) -> Self {
         let state = Arc::new(ServerState {
             requests: Mutex::new(Vec::new()),
             replies: Mutex::new(scripted),
@@ -92,6 +76,7 @@ impl TestServer {
             .route("/{*path}", post(handle_post))
             .route("/", post(handle_post))
             .with_state(Arc::clone(&state));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
         let join = tokio::spawn(async move {
@@ -212,45 +197,4 @@ pub fn notify_pointing_at(
         retry,
         outcomes,
     }
-}
-
-/// Records the highest `note_through` the notifier reports.
-#[derive(Default)]
-pub struct AckRecorder {
-    pub through: std::sync::atomic::AtomicU64,
-    pub calls: AtomicUsize,
-}
-
-impl mirror_core::AckSink for AckRecorder {
-    fn note_through(&self, through: u64) {
-        self.through.fetch_max(through, Ordering::SeqCst);
-        self.calls.fetch_add(1, Ordering::SeqCst);
-    }
-}
-
-impl AckRecorder {
-    pub fn get(&self) -> u64 {
-        self.through.load(Ordering::SeqCst)
-    }
-}
-
-/// Wait until `cond` holds, polling every 5 ms; panic after `deadline`.
-pub async fn wait_until(what: &str, deadline: Duration, mut cond: impl FnMut() -> bool) {
-    let start = std::time::Instant::now();
-    while !cond() {
-        if start.elapsed() > deadline {
-            panic!("timed out after {deadline:?} waiting for {what}");
-        }
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
-}
-
-/// The terminal delivery error, or a panic after `deadline`.
-pub async fn terminal_error(
-    n: &mirror_notify_kkv::KkvV1Notifier,
-    deadline: Duration,
-) -> mirror_core::NotifyError {
-    tokio::time::timeout(deadline, n.terminal_error_watch().wait())
-        .await
-        .expect("a terminal delivery error")
 }

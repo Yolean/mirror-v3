@@ -857,7 +857,7 @@
           "const": "accept"
         },
         {
-          "description": "Source-consume: keep the batch for the target address and\nretry it until the address accepts it or leaves discovery;\nnever fails the mirror. Destination-flush: log WARN, drop the\nbatch, advance.",
+          "description": "Log WARN, drop the batch, advance.",
           "type": "string",
           "const": "skip"
         },

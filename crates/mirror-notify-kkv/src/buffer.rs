@@ -17,9 +17,7 @@
 
 use std::time::Instant;
 
-use indexmap::IndexSet;
-
-use crate::delivery::Batch;
+use indexmap::{IndexMap, IndexSet};
 
 /// Mutable buffer that on_record / the timer task share via a
 /// `tokio::sync::Mutex`. Not directly exposed.
@@ -71,20 +69,41 @@ impl Buffer {
         self.first_at
     }
 
-    /// Drain the buffer into a batch; `None` when empty. The buffer is
-    /// empty afterwards.
-    pub fn take(&mut self) -> Option<Batch> {
+    /// Drain the buffer and return a payload-ready batch. Empty
+    /// buffer returns `None`. After this call, the buffer is
+    /// guaranteed empty.
+    pub fn take(&mut self, partition: i32) -> Option<DrainedBatch> {
         if self.is_empty() {
             return None;
         }
-        let batch = Batch {
-            keys: std::mem::take(&mut self.keys),
-            high: self.max_offset,
-        };
+        let mut offsets = IndexMap::with_capacity(1);
+        offsets.insert(partition.to_string(), self.max_offset);
+        let updates: IndexMap<String, serde_json::Value> = self
+            .keys
+            .drain(..)
+            .map(|k| (k, serde_json::Value::Null))
+            .collect();
         self.max_offset = 0;
         self.seen_records = 0;
         self.first_at = None;
-        Some(batch)
+        Some(DrainedBatch { offsets, updates })
+    }
+}
+
+/// Owned payload-ready batch handed off to the dispatcher.
+#[derive(Debug)]
+pub(crate) struct DrainedBatch {
+    pub offsets: IndexMap<String, u64>,
+    pub updates: IndexMap<String, serde_json::Value>,
+}
+
+impl DrainedBatch {
+    /// The highest source offset across every partition in the batch.
+    /// Mirrors are pinned to one `(topic, partition)` today so the
+    /// map holds one entry; the iteration generalises cleanly if a
+    /// future multi-partition mirror is added.
+    pub fn high_offset(&self) -> u64 {
+        self.offsets.values().copied().max().unwrap_or(0)
     }
 }
 
@@ -95,7 +114,7 @@ mod tests {
     #[test]
     fn empty_take_returns_none() {
         let mut b = Buffer::default();
-        assert!(b.take().is_none());
+        assert!(b.take(0).is_none());
     }
 
     #[test]
@@ -104,9 +123,9 @@ mod tests {
         b.append("a".into(), 10);
         b.append("b".into(), 11);
         b.append("c".into(), 12);
-        let batch = b.take().unwrap();
-        assert_eq!(batch.high, 12);
-        assert_eq!(batch.keys.len(), 3);
+        let batch = b.take(3).unwrap();
+        assert_eq!(batch.offsets.get("3"), Some(&12));
+        assert_eq!(batch.updates.len(), 3);
         assert!(b.is_empty(), "take must reset");
     }
 
@@ -117,9 +136,9 @@ mod tests {
         b.append("hot".into(), 2);
         b.append("hot".into(), 3);
         assert_eq!(b.seen_records(), 3, "max-records must count appends");
-        let batch = b.take().unwrap();
-        assert_eq!(batch.keys.len(), 1, "key set must dedup");
-        assert_eq!(batch.high, 3, "max offset must be 3");
+        let batch = b.take(0).unwrap();
+        assert_eq!(batch.updates.len(), 1, "key set must dedup");
+        assert_eq!(batch.offsets["0"], 3, "max offset must be 3");
     }
 
     #[test]
@@ -128,8 +147,8 @@ mod tests {
         b.append("a".into(), 5);
         b.append("b".into(), 9);
         b.append("c".into(), 7);
-        let batch = b.take().unwrap();
-        assert_eq!(batch.high, 9);
+        let batch = b.take(0).unwrap();
+        assert_eq!(batch.offsets["0"], 9);
     }
 
     #[test]
@@ -144,7 +163,7 @@ mod tests {
             Some(t),
             "later appends must NOT shift first_at; the debounce window measures from the first record"
         );
-        b.take();
+        b.take(0);
         assert!(b.first_at().is_none(), "drain resets first_at");
     }
 }

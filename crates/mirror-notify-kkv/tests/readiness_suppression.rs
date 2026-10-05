@@ -13,7 +13,7 @@ mod common;
 use std::sync::Arc;
 use std::time::Duration;
 
-use common::{notify_pointing_at, wait_until, Reply, TestServer};
+use common::{notify_pointing_at, Reply, TestServer};
 use mirror_config::{
     FanOut, Notify, NotifyApi, NotifyOutcomes, NotifyRetry, NotifyTarget, NotifyTrigger, TriggerOn,
 };
@@ -32,19 +32,6 @@ fn rec(offset: u64, key: &str) -> Record {
         value: Some(b"v".to_vec()),
         headers: vec![],
     }
-}
-
-const WAIT: Duration = Duration::from_secs(5);
-
-async fn keys_received(server: &TestServer) -> Vec<String> {
-    let mut keys = Vec::new();
-    for r in server.captured().await {
-        let body: Value = serde_json::from_slice(&r.body).unwrap();
-        for k in body["updates"].as_object().unwrap().keys() {
-            keys.push(k.clone());
-        }
-    }
-    keys
 }
 
 fn fast_retry() -> NotifyRetry {
@@ -84,35 +71,30 @@ async fn source_consume_suppresses_below_threshold_fresh_deploy() {
     // Offset 101 == threshold; first record that fires.
     let r101 = rec(101, "k101");
     cache.apply_record("m", &r101);
-    notifier.on_record(&r101).await.unwrap();
+    notifier
+        .on_record(&r101)
+        .await
+        .expect("at threshold dispatch");
+
     let r102 = rec(102, "k102");
     cache.apply_record("m", &r102);
-    notifier.on_record(&r102).await.unwrap();
+    notifier
+        .on_record(&r102)
+        .await
+        .expect("above threshold dispatch");
 
-    wait_until("k102 delivered", WAIT, || {
-        keys_now(&server).contains(&"k102".to_string())
-    })
-    .await;
-    assert_eq!(keys_now(&server), vec!["k101", "k102"]);
-}
-
-/// The keys every captured POST named, in order (blocking read of the
-/// server's capture, for `wait_until`).
-fn keys_now(server: &TestServer) -> Vec<String> {
-    let captured = server
-        .state
-        .requests
-        .try_lock()
-        .map(|g| g.clone())
-        .unwrap_or_default();
-    let mut keys = Vec::new();
-    for r in captured {
-        let body: Value = serde_json::from_slice(&r.body).unwrap();
-        for k in body["updates"].as_object().unwrap().keys() {
-            keys.push(k.clone());
-        }
-    }
-    keys
+    let captured = server.captured().await;
+    assert_eq!(
+        captured.len(),
+        2,
+        "exactly the two at-or-above-threshold records must POST"
+    );
+    let body0: Value = serde_json::from_slice(&captured[0].body).unwrap();
+    assert_eq!(body0["updates"], serde_json::json!({"k101": null}));
+    assert_eq!(body0["offsets"], serde_json::json!({"0": 101}));
+    let body1: Value = serde_json::from_slice(&captured[1].body).unwrap();
+    assert_eq!(body1["updates"], serde_json::json!({"k102": null}));
+    assert_eq!(body1["offsets"], serde_json::json!({"0": 102}));
 }
 
 #[tokio::test]
@@ -142,27 +124,16 @@ async fn source_consume_suppresses_below_threshold_returning_deploy() {
         "offsets below committed 5 must suppress"
     );
 
-    // The between-pods gap: 5..19 fires, but only once the mirror
-    // has caught up to its bootstrap watermark (20): a notified
-    // consumer re-reads the key at once, and the cache answers 503
-    // until then.
+    // The between-pods gap: 5..19. All must fire.
     for offset in 5..10 {
         let r = rec(offset, &format!("k{offset}"));
         cache.apply_record("m", &r);
         notifier.on_record(&r).await.unwrap();
     }
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert_eq!(server.request_count(), 0, "nothing is sent while warming");
-    for offset in 10..20 {
-        cache.apply_record("m", &rec(offset, &format!("k{offset}")));
-    }
-    wait_until("the gap is delivered", WAIT, || {
-        keys_now(&server).len() >= 5
-    })
-    .await;
     assert_eq!(
-        keys_received(&server).await,
-        vec!["k5", "k6", "k7", "k8", "k9"]
+        server.request_count(),
+        5,
+        "the between-pods gap (5..10) must fire one POST per record"
     );
 }
 

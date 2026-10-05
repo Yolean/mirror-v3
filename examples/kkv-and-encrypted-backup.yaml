@@ -45,8 +45,9 @@ mirrors:
       max-attempts: 5
       backoff-ms: 500
     # A consumer that is restarting, not listening yet, or answering an
-    # error keeps its keys and gets them when it accepts (`skip` keeps
-    # the batch for that address); a redirect is a misconfiguration.
+    # error is retried with the rest of the fan-out, re-resolved each
+    # round, and then skipped (logged, the batch counts as delivered) so
+    # one pod cannot stop the cache; a redirect is a misconfiguration.
     outcomes:
       timeout:     { retry: true,  final: skip }
       connrefused: { retry: true,  final: skip }

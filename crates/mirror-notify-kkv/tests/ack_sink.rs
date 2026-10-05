@@ -1,7 +1,6 @@
 //! Pin the ack contract of `KkvV1Notifier` and `FlushDispatcher`:
-//!   * once every target address has a batch, the installed `AckSink`
-//!     receives `note_through(high_offset + 1)` (the notifier may
-//!     report several batches at once; values only grow),
+//!   * after a successful drain/POST, the installed `AckSink`
+//!     receives `note_through(high_offset + 1)`,
 //!   * after a retry-then-fail dispatch, no ack is recorded,
 //!   * records suppressed by the per-mirror readiness gate don't
 //!     buffer and therefore don't ack.
@@ -11,7 +10,7 @@ mod common;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use common::{notify_pointing_at, terminal_error, wait_until, Reply, TestServer};
+use common::{notify_pointing_at, Reply, TestServer};
 use mirror_config::{NotifyOutcomes, NotifyRetry};
 use mirror_core::{AckSink, CacheState, FlushObserver, Notifier, Record, TimestampType};
 use mirror_notify_kkv::{FlushDispatcher, KkvV1Notifier};
@@ -76,14 +75,10 @@ async fn kkv_v1_notifier_acks_through_high_offset_plus_one_on_success() {
     notifier.on_record(&rec(1, "k1")).await.unwrap();
     notifier.on_record(&rec(7, "k7")).await.unwrap();
 
-    wait_until("ack through 8", Duration::from_secs(5), || {
-        ack.values.lock().unwrap().last() == Some(&8)
-    })
-    .await;
-    let values = ack.values.lock().unwrap().clone();
-    assert!(
-        values.windows(2).all(|w| w[0] < w[1]),
-        "acks only grow: {values:?}"
+    assert_eq!(
+        ack.values.lock().unwrap().clone(),
+        vec![1, 2, 8],
+        "ack must be high_offset + 1 per successful drain"
     );
 }
 
@@ -100,8 +95,7 @@ async fn kkv_v1_notifier_does_not_ack_when_dispatch_exhausts() {
             .unwrap()
             .with_ack_sink(ack.clone() as Arc<dyn AckSink>);
 
-    notifier.on_record(&rec(0, "k0")).await.unwrap();
-    let err = terminal_error(&notifier, Duration::from_secs(5)).await;
+    let err = notifier.on_record(&rec(0, "k0")).await.unwrap_err();
     let msg = format!("{err}");
     assert!(
         msg.contains("exhausted") || msg.contains("Exhausted"),

@@ -1,57 +1,41 @@
-//! `fan-out: dns-a`: one target, every address its name resolves to,
-//! each with its own undelivered key set.
+//! Tests for `fan-out: dns-a`.
 //!
-//! The servers listen on distinct `127.0.0.1` ports and a stub
-//! [`DnsAResolver`] returns their addresses; tests change what it
-//! returns to model pods coming, going, and DNS failing.
+//! Each test stands up two axum servers on `127.0.0.1` with distinct
+//! ports, then injects a stub [`DnsAResolver`] that returns those
+//! servers' `SocketAddr`s. The dispatcher rewrites the URL host+port
+//! per resolved address and POSTs to each concurrently. This exercises
+//! the multi-address path without depending on the system resolver or
+//! `/etc/hosts`.
 
 mod common;
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::Arc;
 
 use async_trait::async_trait;
-use common::{ready_cache, terminal_error, wait_until, AckRecorder, Reply, TestServer};
+use common::{ready_cache, Reply, TestServer};
 use mirror_config::{
-    FanOut, FinalAction, Notify, NotifyApi, NotifyDebounce, NotifyOutcome, NotifyOutcomes,
-    NotifyRetry, NotifyTarget, NotifyTrigger, TriggerOn,
+    FanOut, Notify, NotifyApi, NotifyDebounce, NotifyOutcomes, NotifyRetry, NotifyTarget,
+    NotifyTrigger, TriggerOn,
 };
 use mirror_core::{Notifier, NotifyError, Record, TimestampType};
 use mirror_notify_kkv::{DnsAResolver, KkvV1Notifier};
-use serde_json::Value;
 
-const WAIT: Duration = Duration::from_secs(5);
-
-/// Returns whatever the test last set; `None` is a resolution failure.
+/// Stub resolver that returns a fixed set of addresses every call,
+/// counting how many times `resolve` was invoked so cache-TTL tests
+/// can assert "second dispatch hit the cache".
+#[derive(Debug)]
 struct StubResolver {
-    addrs: Mutex<Option<Vec<SocketAddr>>>,
-    calls: AtomicUsize,
-}
-
-impl StubResolver {
-    fn new(addrs: Vec<SocketAddr>) -> Arc<Self> {
-        Arc::new(Self {
-            addrs: Mutex::new(Some(addrs)),
-            calls: AtomicUsize::new(0),
-        })
-    }
-
-    fn set(&self, addrs: Option<Vec<SocketAddr>>) {
-        *self.addrs.lock().unwrap() = addrs;
-    }
+    addrs: Vec<SocketAddr>,
+    calls: Arc<AtomicUsize>,
 }
 
 #[async_trait]
 impl DnsAResolver for StubResolver {
     async fn resolve(&self, _host: &str, _port: u16) -> std::io::Result<Vec<SocketAddr>> {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        self.addrs
-            .lock()
-            .unwrap()
-            .clone()
-            .ok_or_else(|| std::io::Error::other("stub: resolution failed"))
+        Ok(self.addrs.clone())
     }
 }
 
@@ -62,33 +46,22 @@ fn rec(offset: u64) -> Record {
         source_offset: offset,
         timestamp_ms: Some(1_700_000_000_000),
         timestamp_type: TimestampType::CreateTime,
-        key: Some(format!("k{offset}").into_bytes()),
+        key: Some(b"k".to_vec()),
         value: Some(b"v".to_vec()),
         headers: vec![],
     }
 }
 
-fn keep() -> NotifyOutcome {
-    NotifyOutcome {
-        retry: true,
-        final_: FinalAction::Skip,
-    }
-}
-
-/// `fan-out: dns-a` at a stand-in name; `max_records: 1` makes every
-/// record its own batch. `keep_failures` maps every failure outcome
-/// to `skip` (kept and retried), as a deployment may configure it.
-fn notify_dns_a(keep_failures: bool) -> Notify {
-    let mut outcomes = NotifyOutcomes::default();
-    if keep_failures {
-        outcomes.timeout = keep();
-        outcomes.connrefused = keep();
-        outcomes.four_xx = keep();
-        outcomes.five_xx = keep();
-    }
+/// Build a `Notify` config with `fan-out: dns-a` aimed at a stand-in
+/// hostname (the resolver stub returns the real addresses). `max_records: 1`
+/// keeps dispatch synchronous from `on_record`.
+fn notify_dns_a() -> Notify {
     Notify {
         api: NotifyApi::KkvV1,
         targets: vec![NotifyTarget {
+            // Hostname is irrelevant; the stub resolver doesn't read
+            // it. Port 80 is the default; the dispatcher rewrites
+            // both host and port per resolved SocketAddr.
             url: "http://stub-host.invalid".into(),
             fan_out: FanOut::DnsA,
         }],
@@ -102,162 +75,285 @@ fn notify_dns_a(keep_failures: bool) -> Notify {
         timeout_ms: 1000,
         retry: NotifyRetry {
             max_attempts: 3,
-            backoff_ms: 5,
+            backoff_ms: 1,
         },
-        outcomes,
+        outcomes: NotifyOutcomes::default(),
     }
 }
 
-fn notifier(cfg: &Notify, resolver: Arc<StubResolver>) -> (KkvV1Notifier, Arc<AckRecorder>) {
-    let ack = Arc::new(AckRecorder::default());
-    let n = KkvV1Notifier::from_config_with_resolver(
-        cfg,
+#[tokio::test]
+async fn posts_to_every_resolved_address() {
+    // Two test servers on distinct ports; both should receive the
+    // POST when fan-out resolves the host to both.
+    let server_a = TestServer::start(Reply::Status(200), vec![]).await;
+    let server_b = TestServer::start(Reply::Status(200), vec![]).await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let resolver = Arc::new(StubResolver {
+        addrs: vec![server_a.addr, server_b.addr],
+        calls: Arc::clone(&calls),
+    });
+
+    let cfg = notify_dns_a();
+    let mut n = KkvV1Notifier::from_config_with_resolver(
+        &cfg,
         "t".into(),
         0,
         ready_cache("m"),
         "m".into(),
         resolver,
     )
-    .unwrap()
-    .with_ack_sink(ack.clone());
-    (n, ack)
-}
-
-async fn keys_received(server: &TestServer) -> Vec<String> {
-    let mut keys = Vec::new();
-    for r in server.captured().await {
-        let body: Value = serde_json::from_slice(&r.body).unwrap();
-        for k in body["updates"].as_object().unwrap().keys() {
-            keys.push(k.clone());
-        }
-    }
-    keys
-}
-
-#[tokio::test]
-async fn posts_to_every_resolved_address() {
-    let a = TestServer::start(Reply::Status(200), vec![]).await;
-    let b = TestServer::start(Reply::Status(200), vec![]).await;
-    let resolver = StubResolver::new(vec![a.addr, b.addr]);
-    let (mut n, ack) = notifier(&notify_dns_a(false), resolver);
+    .unwrap();
 
     n.on_record(&rec(1)).await.unwrap();
-    wait_until("ack through 2", WAIT, || ack.get() == 2).await;
-    assert_eq!(a.request_count(), 1);
-    assert_eq!(b.request_count(), 1);
+
+    assert_eq!(
+        server_a.request_count(),
+        1,
+        "address A must have received exactly one POST"
+    );
+    assert_eq!(
+        server_b.request_count(),
+        1,
+        "address B must have received exactly one POST"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "first dispatch must call the resolver exactly once"
+    );
 }
 
-/// A target Service scaled to zero (no address) made
-/// the first batch exit the mirror, and the restart crash-looped on
-/// it. No address now means nothing to deliver.
+/// A headless Service with no ready pods (the consumers scaled to zero)
+/// resolves to no address: there is no one to notify, not a failure
+/// (a4240f9), so the batch counts as delivered.
 #[tokio::test]
-async fn no_address_means_nothing_to_deliver() {
-    let resolver = StubResolver::new(vec![]);
-    let (mut n, ack) = notifier(&notify_dns_a(false), resolver);
-    n.on_record(&rec(4)).await.unwrap();
-    wait_until("ack through 5", WAIT, || ack.get() == 5).await;
-    n.shutdown().await.unwrap();
+async fn empty_address_set_is_no_target() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let resolver = Arc::new(StubResolver {
+        addrs: vec![],
+        calls: Arc::clone(&calls),
+    });
+    let cfg = notify_dns_a();
+    let mut n = KkvV1Notifier::from_config_with_resolver(
+        &cfg,
+        "t".into(),
+        0,
+        ready_cache("m"),
+        "m".into(),
+        resolver,
+    )
+    .unwrap();
+
+    n.on_record(&rec(1)).await.expect("no address is no target");
+    assert!(calls.load(Ordering::SeqCst) >= 1, "the target was resolved");
 }
 
-/// A failed resolution (DNS down, timeout) keeps the addresses known
-/// from the last good one; it neither fails the mirror nor drops keys.
 #[tokio::test]
-async fn resolution_failure_keeps_the_known_addresses() {
-    let a = TestServer::start(Reply::Status(200), vec![]).await;
-    let resolver = StubResolver::new(vec![a.addr]);
-    let (mut n, ack) = notifier(&notify_dns_a(false), Arc::clone(&resolver));
+async fn one_address_failure_fails_the_whole_batch() {
+    // Address A returns 5xx (default outcome retries then fails);
+    // address B returns 200. Whole-batch outcome must be Err.
+    let server_a = TestServer::start(Reply::Status(500), vec![]).await;
+    let server_b = TestServer::start(Reply::Status(200), vec![]).await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let resolver = Arc::new(StubResolver {
+        addrs: vec![server_a.addr, server_b.addr],
+        calls: Arc::clone(&calls),
+    });
+
+    let mut cfg = notify_dns_a();
+    cfg.retry.max_attempts = 2;
+    let mut n = KkvV1Notifier::from_config_with_resolver(
+        &cfg,
+        "t".into(),
+        0,
+        ready_cache("m"),
+        "m".into(),
+        resolver,
+    )
+    .unwrap();
+
+    let err = n.on_record(&rec(1)).await.unwrap_err();
+    assert!(matches!(err, NotifyError::Exhausted { .. }), "got {err:?}");
+    // Retries happen at the endpoint level with a fresh resolution
+    // per round, so B receives the (idempotent) batch once per
+    // round alongside A's failing attempts. The important thing is
+    // the whole batch surfaced as failure.
+    assert_eq!(server_a.request_count(), 2);
+    assert_eq!(server_b.request_count(), 2);
+}
+
+#[tokio::test]
+async fn cached_addresses_reused_within_ttl_then_re_resolved_on_failure() {
+    // First dispatch succeeds → resolver called once, addrs cached.
+    // Second dispatch succeeds → resolver NOT called (within TTL).
+    // Then make the receiver fail; the dispatcher invalidates the
+    // cache; a third dispatch re-resolves.
+    let server = TestServer::start(Reply::Status(200), vec![]).await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let resolver = Arc::new(StubResolver {
+        addrs: vec![server.addr],
+        calls: Arc::clone(&calls),
+    });
+    let cfg = notify_dns_a();
+    let mut n = KkvV1Notifier::from_config_with_resolver(
+        &cfg,
+        "t".into(),
+        0,
+        ready_cache("m"),
+        "m".into(),
+        resolver,
+    )
+    .unwrap();
+
     n.on_record(&rec(1)).await.unwrap();
-    wait_until("first ack", WAIT, || ack.get() == 2).await;
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "first call");
 
-    resolver.set(None);
-    tokio::time::sleep(Duration::from_millis(1100)).await;
     n.on_record(&rec(2)).await.unwrap();
-    wait_until("second ack", WAIT, || ack.get() == 3).await;
-    assert_eq!(keys_received(&a).await, vec!["k1", "k2"]);
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "second call must reuse the cached resolution (still within TTL)"
+    );
+
+    // Force a failure path so the cache invalidates.
+    let failing_server = TestServer::start(Reply::Status(500), vec![]).await;
+    // Swap the resolver to point at the failing server. We can't
+    // mutate the existing Arc; just construct a new notifier with a
+    // new stub. The salient assertion in this segment is just that
+    // failure paths invalidate the cache; checked via the per-fail
+    // resolver-call count.
+    drop(n);
+
+    let calls2 = Arc::new(AtomicUsize::new(0));
+    let resolver2 = Arc::new(StubResolver {
+        addrs: vec![failing_server.addr],
+        calls: Arc::clone(&calls2),
+    });
+    let mut cfg2 = notify_dns_a();
+    cfg2.retry.max_attempts = 1;
+    let mut n2 = KkvV1Notifier::from_config_with_resolver(
+        &cfg2,
+        "t".into(),
+        0,
+        ready_cache("m"),
+        "m".into(),
+        resolver2,
+    )
+    .unwrap();
+
+    let _ = n2.on_record(&rec(3)).await; // expected err
+    assert_eq!(calls2.load(Ordering::SeqCst), 1);
+    // Next dispatch must re-resolve because the previous one
+    // invalidated the cache on failure.
+    let _ = n2.on_record(&rec(4)).await;
+    assert_eq!(
+        calls2.load(Ordering::SeqCst),
+        2,
+        "post-failure dispatch must re-resolve"
+    );
 }
 
-/// M1: an address that fails keeps its keys and gets them, merged with
-/// newer ones, once it accepts; the other addresses are not held up,
-/// and the committed offset waits for the slow one.
 #[tokio::test]
-async fn a_failing_address_keeps_its_keys_without_holding_up_the_others() {
-    let a = TestServer::start(Reply::Status(200), vec![]).await;
-    let b = TestServer::start(Reply::Status(200), vec![Reply::Status(503); 6]).await;
-    let resolver = StubResolver::new(vec![a.addr, b.addr]);
-    let (mut n, ack) = notifier(&notify_dns_a(true), resolver);
+async fn dispatches_concurrently_to_all_addresses() {
+    // Both servers sleep 200ms before responding 200. If dispatch is
+    // serial, total time is ~400ms+; if concurrent, ~200ms+. Use
+    // 500ms as the upper bound; comfortably above 200ms, well below
+    // 400ms.
+    use std::time::{Duration, Instant};
+    let server_a = TestServer::start(Reply::SlowOk(Duration::from_millis(200)), vec![]).await;
+    let server_b = TestServer::start(Reply::SlowOk(Duration::from_millis(200)), vec![]).await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let resolver = Arc::new(StubResolver {
+        addrs: vec![server_a.addr, server_b.addr],
+        calls: Arc::clone(&calls),
+    });
+    let cfg = notify_dns_a();
+    let mut n = KkvV1Notifier::from_config_with_resolver(
+        &cfg,
+        "t".into(),
+        0,
+        ready_cache("m"),
+        "m".into(),
+        resolver,
+    )
+    .unwrap();
 
+    let start = Instant::now();
     n.on_record(&rec(1)).await.unwrap();
-    n.on_record(&rec(2)).await.unwrap();
-    n.on_record(&rec(3)).await.unwrap();
-    wait_until("A has all three keys", WAIT, || a.request_count() >= 1).await;
-    wait_until("ack through 4", WAIT, || ack.get() == 4).await;
-    let mut a_keys = keys_received(&a).await;
-    a_keys.sort();
-    assert_eq!(a_keys, vec!["k1", "k2", "k3"]);
-    let b_keys = keys_received(&b).await;
-    for k in ["k1", "k2", "k3"] {
-        assert!(b_keys.contains(&k.to_string()), "B lacks {k}: {b_keys:?}");
-    }
-    assert!(b.request_count() >= 7, "six failures, then a success");
+    let elapsed = start.elapsed();
+
+    assert!(
+        elapsed < Duration::from_millis(500),
+        "fan-out must dispatch concurrently; took {elapsed:?}, expected ~200ms"
+    );
+    assert_eq!(server_a.request_count(), 1);
+    assert_eq!(server_b.request_count(), 1);
 }
 
-/// M2: an address that resolves before its server listens (a starting
-/// consumer behind a Service that publishes not-ready addresses) gets
-/// every batch from its first resolution on, once it listens.
+/// Rolling-restart resolver: returns a dead address on the first
+/// resolve and the live server afterwards, modelling a K8s headless
+/// service whose pod was replaced between the resolve and the POST.
+#[derive(Debug)]
+struct RollingResolver {
+    first: Vec<SocketAddr>,
+    then: Vec<SocketAddr>,
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl DnsAResolver for RollingResolver {
+    async fn resolve(&self, _host: &str, _port: u16) -> std::io::Result<Vec<SocketAddr>> {
+        let n = self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(if n == 0 {
+            self.first.clone()
+        } else {
+            self.then.clone()
+        })
+    }
+}
+
+/// The receiver-rollout regression: the first resolution points at a
+/// dead pod IP. Retries must re-resolve (the failure invalidates the
+/// cache) and deliver to the replacement pod instead of burning the
+/// whole retry budget against the dead IP and crashing the mirror.
 #[tokio::test]
-async fn an_address_that_is_not_listening_yet_gets_every_batch_once_it_listens() {
-    let a = TestServer::start(Reply::Status(200), vec![]).await;
-    let late = {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+async fn retry_re_resolves_instead_of_pinning_the_dead_address() {
+    let live = TestServer::start(Reply::Status(200), vec![]).await;
+    // A bound-then-dropped listener yields a port that refuses
+    // connections.
+    let dead_addr = {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         l.local_addr().unwrap()
     };
-    let resolver = StubResolver::new(vec![a.addr, late]);
-    let (mut n, ack) = notifier(&notify_dns_a(true), resolver);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let resolver = Arc::new(RollingResolver {
+        first: vec![dead_addr],
+        then: vec![live.addr],
+        calls: Arc::clone(&calls),
+    });
 
-    n.on_record(&rec(1)).await.unwrap();
-    n.on_record(&rec(2)).await.unwrap();
-    wait_until("A got both", WAIT, || a.request_count() >= 2).await;
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    assert_eq!(ack.get(), 0, "the late address holds the committed offset");
+    let cfg = notify_dns_a();
+    let mut n = KkvV1Notifier::from_config_with_resolver(
+        &cfg,
+        "t".into(),
+        0,
+        ready_cache("m"),
+        "m".into(),
+        resolver,
+    )
+    .unwrap();
 
-    let late_server = TestServer::start_on(late, Reply::Status(200)).await;
-    wait_until("ack through 3", Duration::from_secs(40), || ack.get() == 3).await;
-    let mut keys = keys_received(&late_server).await;
-    keys.sort();
-    assert_eq!(keys, vec!["k1", "k2"]);
-}
+    n.on_record(&rec(1))
+        .await
+        .expect("batch must succeed via the re-resolved address");
 
-/// A consumer that appears later (scale-up) gets the batches from its
-/// first resolution on, not the ones before it existed.
-#[tokio::test]
-async fn a_new_address_gets_batches_from_its_first_resolution() {
-    let a = TestServer::start(Reply::Status(200), vec![]).await;
-    let b = TestServer::start(Reply::Status(200), vec![]).await;
-    let resolver = StubResolver::new(vec![a.addr]);
-    let (mut n, ack) = notifier(&notify_dns_a(false), Arc::clone(&resolver));
-
-    n.on_record(&rec(1)).await.unwrap();
-    wait_until("first ack", WAIT, || ack.get() == 2).await;
-    resolver.set(Some(vec![a.addr, b.addr]));
-    tokio::time::sleep(Duration::from_millis(1100)).await;
-    n.on_record(&rec(2)).await.unwrap();
-    wait_until("second ack", WAIT, || ack.get() == 3).await;
-    assert_eq!(keys_received(&a).await, vec!["k1", "k2"]);
-    assert_eq!(keys_received(&b).await, vec!["k2"]);
-}
-
-/// With the default outcomes (`5xx: retry, fail`) one address that
-/// keeps failing still ends the mirror after the retry budget.
-#[tokio::test]
-async fn default_outcomes_still_fail_the_mirror() {
-    let a = TestServer::start(Reply::Status(200), vec![]).await;
-    let b = TestServer::start(Reply::Status(503), vec![]).await;
-    let resolver = StubResolver::new(vec![a.addr, b.addr]);
-    let (mut n, _ack) = notifier(&notify_dns_a(false), resolver);
-    n.on_record(&rec(1)).await.unwrap();
-    match terminal_error(&n, WAIT).await {
-        NotifyError::Exhausted { attempts, .. } => assert_eq!(attempts, 3),
-        other => panic!("expected Exhausted, got {other:?}"),
-    }
-    assert_eq!(a.request_count(), 1);
+    assert_eq!(
+        live.request_count(),
+        1,
+        "the replacement pod must receive the batch"
+    );
+    assert!(
+        calls.load(Ordering::SeqCst) >= 2,
+        "a retry must have re-resolved instead of reusing the dead address"
+    );
 }
