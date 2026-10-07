@@ -120,7 +120,7 @@ records: 25000
 holes: 0
 ```
 
-`holes` are positions of the chain without a record (see [Offset holes](#operational-invariants)): records compaction removed before they were backed up, and transaction markers. Any failed check exits non-zero with the reason, and so does `--verify-only` when the backup cannot be restored with the `--offsets` given; `--verify-only` is the scheduled "is the backup complete" check.
+`holes` are positions of the chain without a record (see [Offset holes](#operational-invariants)): records compaction removed before they were backed up, and transaction markers. Where markers land depends on the broker: Apache Kafka writes one after each transaction, Redpanda also one before it, so a topic written in transactions on Redpanda has a hole at offset 0 and can only be restored with `renumber`. Any failed check exits non-zero with the reason, and so does `--verify-only` when the backup cannot be restored with the `--offsets` given; `--verify-only` is the scheduled "is the backup complete" check.
 
 Then the records are produced in order, each with its key, value (tombstones included), headers and timestamp, through the Kafka destination: the target's high watermark is read before every produce and must equal the record's target offset, the producer never retries, and the broker must report that offset back. The target must be empty (high watermark 0) before the first record, and its high watermark must equal the records produced after the last; otherwise restore exits non-zero. One record at a time with a watermark read each is slow: about 140 records/s against a local broker (librdkafka's `linger.ms` and two round trips per record), so a million records take about two hours.
 
