@@ -39,8 +39,14 @@ pub enum RestoreError {
          topic only (delete and create it again, with the configuration it needs)"
     )]
     TargetNotEmpty(u64),
-    /// The target refused a record, could not be reached, or does not
-    /// hold what was produced.
+    /// The target could not be read before anything was produced.
     #[error("target: {0}")]
     Target(String),
+    /// Producing failed, or the target does not hold what was produced.
+    /// Records sent before the failure may still be stored.
+    #[error(
+        "target: {0}. Records sent before this may still be stored: delete the topic and create \
+         it again before restoring again"
+    )]
+    Produce(String),
 }

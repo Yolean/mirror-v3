@@ -205,6 +205,8 @@ impl Backup<'_> {
             target.bootstrap_servers.clone(),
             target.topic.clone(),
             self.source.partition,
+            super::column_type_to_envelope(self.mirror.keys.unwrap_or_default().kind),
+            super::column_type_to_envelope(self.mirror.values.unwrap_or_default().kind),
         )
         .context("opening the target topic's producer")?;
         tracing::info!(

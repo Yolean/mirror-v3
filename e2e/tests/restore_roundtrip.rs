@@ -271,7 +271,14 @@ async fn restore_from<S: BlobStore>(
         source: &source,
     };
     let summary = reader.verify(&chain).await?;
-    let mut producer = RestoreProducer::open(target, target_topic, 0).expect("producer");
+    let mut producer = RestoreProducer::open(
+        target,
+        target_topic,
+        0,
+        mirror_core::ColumnType::Utf8,
+        mirror_core::ColumnType::Utf8,
+    )
+    .expect("producer");
     produce(&reader, &chain, &summary, mode, &mut producer).await
 }
 

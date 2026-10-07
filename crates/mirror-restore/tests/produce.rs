@@ -224,8 +224,17 @@ async fn a_produce_the_target_refuses_ends_the_restore() {
         .restore(0, OffsetMode::Preserve, &mut target)
         .await
         .unwrap_err();
-    assert!(matches!(err, RestoreError::Target(_)), "{err}");
-    assert!(err.to_string().contains("producing offset 2"), "{err}");
+    assert!(matches!(err, RestoreError::Produce(_)), "{err}");
+    assert!(
+        err.to_string()
+            .contains("sent for offset 2, the broker stored it at 7"),
+        "{err}"
+    );
+    assert!(
+        err.to_string()
+            .contains("delete the topic and create it again"),
+        "{err}"
+    );
     assert_eq!(target.sent.len(), 2);
 }
 

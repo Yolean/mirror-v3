@@ -135,10 +135,12 @@ pub async fn produce<S: BlobStore>(
                 }
                 OffsetMode::Renumber => record.source_offset = next,
             }
+            // The error names its own offset: a delivery that failed is
+            // reported for a record sent earlier.
             target
                 .send(&record, next)
                 .await
-                .map_err(|e| RestoreError::Target(format!("producing offset {next}: {e}")))?;
+                .map_err(RestoreError::Produce)?;
             next += 1;
         }
         tracing::info!(
@@ -151,13 +153,13 @@ pub async fn produce<S: BlobStore>(
     target
         .finish()
         .await
-        .map_err(|e| RestoreError::Target(format!("waiting for the last records: {e}")))?;
+        .map_err(|e| RestoreError::Produce(format!("waiting for the last records: {e}")))?;
     let high_watermark = target
         .high_watermark()
         .await
-        .map_err(|e| RestoreError::Target(format!("reading its high watermark: {e}")))?;
+        .map_err(|e| RestoreError::Produce(format!("reading its high watermark: {e}")))?;
     if high_watermark != next || next != summary.records {
-        return Err(RestoreError::Target(format!(
+        return Err(RestoreError::Produce(format!(
             "produced {next} of the backup's {} records, and the target's high watermark is \
              {high_watermark}",
             summary.records
