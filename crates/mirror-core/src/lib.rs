@@ -546,6 +546,11 @@ pub enum SourceError {
     /// them, so it is not retried.
     #[error("source position lost: {0}")]
     PositionLost(String),
+    /// The source contradicts what the mirror requires of it (a backup
+    /// read back as a source, with a gap or a hole the destination
+    /// cannot take). Trying again cannot fix it.
+    #[error("source inconsistent: {0}")]
+    Inconsistent(String),
 }
 
 impl SourceError {

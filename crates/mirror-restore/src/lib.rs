@@ -8,13 +8,16 @@
 //! verify pass, which is also the "is the backup complete" check), and
 //! [`produce`] writes the records to a [`RestoreTarget`] (in production
 //! a Kafka producer with many records in flight, each checked to land
-//! at its offset).
+//! at its offset). [`follow`] reads a backup as a mirror's source, for
+//! a restore that keeps up with the backup.
 
 pub mod chain;
+pub mod follow;
 pub mod produce;
 pub mod read;
 
 pub use chain::{plan_chain, ChainObject};
+pub use follow::{ChainSource, ChainSourceConfig};
 pub use mirror_core::RestoreTarget;
 pub use produce::{produce, OffsetMode, RestoreReport};
 pub use read::{BackupSource, BackupSummary, ObjectSummary, Reader};

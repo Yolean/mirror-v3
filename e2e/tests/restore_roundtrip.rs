@@ -14,6 +14,9 @@
 //!   bucket through a read-only store, on kafka-native and VersityGW,
 //!   and, `#[ignore]`d, on the broker and S3 endpoint the environment
 //!   names (see its test).
+//! - follow: a backup read as a mirror's source while its own mirror
+//!   writes it, into a topic that keeps up; stopped, and resumed at the
+//!   topic's high watermark.
 //!
 //! The others run against the Docker stack (kafka-native source,
 //! Redpanda target), and, `#[ignore]`d, against any broker named by
@@ -35,14 +38,17 @@ use mirror_e2e::docker::{
 };
 use mirror_e2e::kafka_helpers::create_topic;
 use mirror_e2e::mirror_runner::{
-    spawn_kafka_to_filesystem, spawn_kafka_to_s3, FsMirrorSpec, S3MirrorSpec,
+    spawn_kafka_to_filesystem, spawn_kafka_to_s3, FsMirrorSpec, MirrorHandle, S3MirrorSpec,
 };
 use mirror_e2e::ProvisionedStack;
 use mirror_envelope::{ColumnType, Format, Keyring, ParquetCompression};
 use mirror_fs::blob::BlobStore;
 use mirror_fs::{read_all_records, BlobEncryption, FlushTriggers, FsStore};
-use mirror_kafka::RestoreProducer;
-use mirror_restore::{plan_chain, produce, BackupSource, OffsetMode, Reader, RestoreError};
+use mirror_kafka::{KafkaSink, KafkaSinkConfig, RestoreProducer};
+use mirror_restore::{
+    plan_chain, produce, BackupSource, ChainSource, ChainSourceConfig, OffsetMode, Reader,
+    RestoreError,
+};
 use mirror_s3::S3Store;
 use object_store::aws::AmazonS3Builder;
 use object_store::ObjectStore;
@@ -195,10 +201,9 @@ fn record<'a>(
     r
 }
 
-/// Back `topic` up to `root/ops/0` with the mirror and wait until the
-/// backup holds `records` records.
-async fn back_up(source: &str, topic: &str, root: &Path, records: usize) -> Result<()> {
-    let mirror = spawn_kafka_to_filesystem(FsMirrorSpec {
+/// Start the mirror that backs `topic` up to `root/ops/0`.
+fn spawn_backup(source: &str, topic: &str, root: &Path) -> Result<MirrorHandle> {
+    spawn_kafka_to_filesystem(FsMirrorSpec {
         source_bootstrap: source.to_string(),
         source_topic: topic.to_string(),
         partition: 0,
@@ -217,7 +222,13 @@ async fn back_up(source: &str, topic: &str, root: &Path, records: usize) -> Resu
             max_offsets: 10,
             daily_at_utc_seconds: None,
         },
-    })?;
+    })
+}
+
+/// Back `topic` up to `root/ops/0` with the mirror and wait until the
+/// backup holds `records` records.
+async fn back_up(source: &str, topic: &str, root: &Path, records: usize) -> Result<()> {
+    let mirror = spawn_backup(source, topic, root)?;
     let dir = root.join("ops").join("0");
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
     loop {
@@ -235,6 +246,127 @@ async fn back_up(source: &str, topic: &str, root: &Path, records: usize) -> Resu
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
     mirror.shutdown().await
+}
+
+async fn wait_for_high_watermark(bootstrap: &str, topic: &str, records: i64) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let held = high_watermark(bootstrap, topic).unwrap();
+        if held == records {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{topic} holds {held} of {records} records"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// `run_mirror` from the backup in `root/ops/0` into `target_topic`,
+/// through the Kafka destination, until the returned sender fires.
+async fn start_follow(
+    root: &Path,
+    source_topic: &str,
+    target: &str,
+    target_topic: &str,
+) -> (
+    tokio::sync::oneshot::Sender<()>,
+    tokio::task::JoinHandle<Result<(), mirror_core::MirrorError>>,
+) {
+    let source = ChainSource::open(ChainSourceConfig {
+        store: Arc::new(FsStore::new(root.join("ops").join("0"))),
+        format: Format::Parquet,
+        keyring: None,
+        source: BackupSource {
+            topic: source_topic.to_string(),
+            partition: 0,
+        },
+        mode: OffsetMode::Preserve,
+        chain_start: 0,
+        poll_interval: Duration::from_millis(100),
+    })
+    .await
+    .unwrap();
+    let sink = KafkaSink::open(KafkaSinkConfig::new(target, target_topic, 0)).unwrap();
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let run = tokio::spawn(mirror_core::run_mirror(source, sink, async move {
+        let _ = stopped.await;
+    }));
+    (stop, run)
+}
+
+/// Follow a backup while its mirror writes it, stop, and resume.
+async fn follow(brokers: &Brokers) {
+    install_tracing();
+    let source_topic = unique("restore-follow-src");
+    create_topic(&brokers.source, &source_topic, 1)
+        .await
+        .unwrap();
+    let target_topic = unique("restore-follow-dst");
+    create_topic(&brokers.target, &target_topic, 1)
+        .await
+        .unwrap();
+    let root = tempfile::tempdir().unwrap();
+    // Nothing backed up yet: the follower waits for the first object.
+    let backup = spawn_backup(&brokers.source, &source_topic, root.path()).unwrap();
+    let (stop, run) =
+        start_follow(root.path(), &source_topic, &brokers.target, &target_topic).await;
+    produce_numbered(&brokers.source, &source_topic, 0, 30).await;
+    wait_for_high_watermark(&brokers.target, &target_topic, 30).await;
+    produce_numbered(&brokers.source, &source_topic, 30, 20).await;
+    wait_for_high_watermark(&brokers.target, &target_topic, 50).await;
+    stop.send(()).unwrap();
+    run.await.unwrap().unwrap();
+
+    // Records backed up while no follower runs; then one resumes, at
+    // the target's high watermark, after the check the CLI makes.
+    produce_numbered(&brokers.source, &source_topic, 50, 15).await;
+    let mut probe = ChainSource::open(ChainSourceConfig {
+        store: Arc::new(FsStore::new(root.path().join("ops").join("0"))),
+        format: Format::Parquet,
+        keyring: None,
+        source: BackupSource {
+            topic: source_topic.clone(),
+            partition: 0,
+        },
+        mode: OffsetMode::Preserve,
+        chain_start: 0,
+        poll_interval: Duration::from_millis(100),
+    })
+    .await
+    .unwrap();
+    let ours = probe.record_at(49).await.unwrap().unwrap();
+    let theirs = mirror_kafka::read_record_at(
+        &brokers.target,
+        &target_topic,
+        0,
+        49,
+        Duration::from_secs(10),
+    )
+    .unwrap();
+    assert_eq!(
+        (ours.key, ours.value, ours.headers, ours.timestamp_ms),
+        (
+            theirs.key,
+            theirs.value,
+            theirs.headers,
+            theirs.timestamp_ms
+        )
+    );
+    let (stop, run) =
+        start_follow(root.path(), &source_topic, &brokers.target, &target_topic).await;
+    wait_for_high_watermark(&brokers.target, &target_topic, 65).await;
+    stop.send(()).unwrap();
+    run.await.unwrap().unwrap();
+    backup.shutdown().await.unwrap();
+
+    let original = consume_all(&brokers.source, &source_topic).unwrap();
+    assert_eq!(original.len(), 65);
+    assert_eq!(
+        consume_all(&brokers.target, &target_topic).unwrap(),
+        original
+    );
 }
 
 /// Verify the backup in `root/ops/0` and restore it to `target_topic`.
@@ -659,6 +791,17 @@ async fn produce_numbered(bootstrap: &str, topic: &str, first: u64, count: u64) 
             .map_err(|(e, _)| e)
             .unwrap();
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn follow_keeps_a_topic_restored_while_the_backup_grows_and_resumes() {
+    follow(&docker().await).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs MIRROR_E2E_EXTERNAL_KAFKA=<bootstrap>"]
+async fn external_follow_keeps_a_topic_restored_while_the_backup_grows_and_resumes() {
+    follow(&external()).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

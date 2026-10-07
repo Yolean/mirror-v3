@@ -65,7 +65,9 @@ enum Cmd {
     /// records, holes) without a target. Exits non-zero if the backup
     /// is incomplete, cannot be restored with the chosen offsets, the
     /// target topic is not empty, or the target's high watermark does
-    /// not match what was produced.
+    /// not match what was produced. With --follow, keep the target
+    /// restored as the backup grows, resuming where it is, until
+    /// SIGTERM or SIGINT.
     Restore {
         #[arg(short, long)]
         config: PathBuf,
@@ -103,6 +105,16 @@ enum Cmd {
             conflicts_with = "verify_only"
         )]
         topic: Option<String>,
+        /// Keep restoring: start at the target's high watermark (its
+        /// last record must be the backup's record there), produce each
+        /// object the backup's mirror adds, through the Kafka
+        /// destination's per-record gate, until SIGTERM or SIGINT.
+        #[arg(long, requires = "topic")]
+        follow: bool,
+        /// With --follow: how often to list the backup once every
+        /// object is restored.
+        #[arg(long, default_value_t = 5000, requires = "follow")]
+        poll_interval_ms: u64,
     },
 }
 
@@ -157,6 +169,8 @@ fn main() -> ExitCode {
             verify_only,
             bootstrap_servers,
             topic,
+            follow,
+            poll_interval_ms,
         } => {
             let target = match (verify_only, bootstrap_servers, topic) {
                 (true, None, None) => None,
@@ -176,6 +190,7 @@ fn main() -> ExitCode {
                 offsets,
                 chain_start,
                 target,
+                follow: follow.then(|| std::time::Duration::from_millis(poll_interval_ms)),
             };
             let rt = match tokio::runtime::Builder::new_multi_thread()
                 .enable_all()

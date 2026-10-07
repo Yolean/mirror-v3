@@ -7,15 +7,25 @@
 //! destination's own. The verify pass always runs first and reads every
 //! object, so a restore that cannot complete fails before it produces
 //! anything.
+//!
+//! With `--follow` the backup is a mirror's source instead: the records
+//! are produced through the Kafka destination, gate and all, from the
+//! target's high watermark on, and objects the backup's mirror adds are
+//! produced as they appear, until SIGTERM or SIGINT.
 
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use mirror_config::{Destination, Encryption, Mirror};
+use mirror_core::Sink;
 use mirror_envelope::Keyring;
 use mirror_fs::blob::BlobStore;
-use mirror_kafka::RestoreProducer;
-use mirror_restore::{plan_chain, BackupSource, BackupSummary, OffsetMode, Reader};
+use mirror_kafka::{KafkaSink, KafkaSinkConfig, RestoreProducer, TimestampMode};
+use mirror_restore::{
+    plan_chain, BackupSource, BackupSummary, ChainSource, ChainSourceConfig, OffsetMode, Reader,
+};
 
 /// `--offsets`: required, so that the choice is written out.
 #[derive(Copy, Clone, Debug, clap::ValueEnum)]
@@ -44,6 +54,8 @@ pub struct RestoreArgs {
     pub chain_start: u64,
     /// `None`: verify only.
     pub target: Option<Target>,
+    /// `Some(poll interval)`: follow the backup into the target.
+    pub follow: Option<Duration>,
 }
 
 pub struct Target {
@@ -92,12 +104,15 @@ pub async fn run_restore(args: RestoreArgs) -> Result<()> {
     match destination {
         Destination::Filesystem(fs) => {
             let dir = mirror_fs::naming::partition_dir(&fs.root, &dest_name, mirror.partition);
-            if !dir.is_dir() {
+            // Followed, a backup whose mirror has written nothing yet is waited for.
+            if args.follow.is_none() && !dir.is_dir() {
                 bail!("the backup directory {} does not exist", dir.display());
             }
             let location = dir.display().to_string();
             let store = mirror_fs::FsStore::new(dir);
-            backup.run(&store, &location, None, args.target).await
+            backup
+                .dispatch(store, &location, None, args.target, args.follow)
+                .await
         }
         Destination::S3(s3) => {
             let read = super::s3_store(s3, &s3.credentials.read)?;
@@ -113,7 +128,7 @@ pub async fn run_restore(args: RestoreArgs) -> Result<()> {
             };
             let store = mirror_s3::S3Store::read_only(read, prefix);
             backup
-                .run(&store, &location, keyring.as_ref(), args.target)
+                .dispatch(store, &location, keyring, args.target, args.follow)
                 .await
         }
         Destination::Kafka(_) => unreachable!("pick_destination returns blob destinations"),
@@ -174,6 +189,134 @@ struct Backup<'a> {
 }
 
 impl Backup<'_> {
+    async fn dispatch<S: BlobStore + Send + Sync + 'static>(
+        &self,
+        store: S,
+        location: &str,
+        keyring: Option<Keyring>,
+        target: Option<Target>,
+        follow: Option<Duration>,
+    ) -> Result<()> {
+        match (follow, target) {
+            (Some(poll_interval), Some(target)) => {
+                self.follow(
+                    Arc::new(store),
+                    location,
+                    keyring.map(Arc::new),
+                    target,
+                    poll_interval,
+                )
+                .await
+            }
+            (Some(_), None) => unreachable!("clap requires --topic with --follow"),
+            (None, target) => self.run(&store, location, keyring.as_ref(), target).await,
+        }
+    }
+
+    async fn follow<S: BlobStore + Send + Sync + 'static>(
+        &self,
+        store: Arc<S>,
+        location: &str,
+        keyring: Option<Arc<Keyring>>,
+        target: Target,
+        poll_interval: Duration,
+    ) -> Result<()> {
+        let mut source = ChainSource::open(ChainSourceConfig {
+            store,
+            format: self.format,
+            keyring,
+            source: self.source.clone(),
+            mode: self.mode,
+            chain_start: self.chain_start,
+            poll_interval,
+        })
+        .await
+        .with_context(|| location.to_string())?;
+        let mut sink_cfg = KafkaSinkConfig::new(
+            target.bootstrap_servers.clone(),
+            target.topic.clone(),
+            self.source.partition,
+        );
+        sink_cfg.timestamp_mode = TimestampMode::Source;
+        sink_cfg.keys = super::column_type_to_envelope(self.mirror.keys.unwrap_or_default().kind);
+        sink_cfg.values =
+            super::column_type_to_envelope(self.mirror.values.unwrap_or_default().kind);
+        let mut sink = KafkaSink::open(sink_cfg).context("opening the target topic's producer")?;
+        let at = sink
+            .next_expected_offset()
+            .await
+            .context("reading the target's high watermark")?;
+        if at > 0 {
+            self.check_resume(&mut source, &target, at).await?;
+        }
+        println!(
+            "following: {location} into {}/{} from offset {at}",
+            target.topic, self.source.partition
+        );
+        mirror_core::run_mirror(source, sink, shutdown_requested())
+            .await
+            .with_context(|| {
+                format!(
+                    "following into {}/{} at {}",
+                    target.topic, self.source.partition, target.bootstrap_servers
+                )
+            })?;
+        println!("stopped");
+        Ok(())
+    }
+
+    /// A target that is not empty is resumed only if its last record is
+    /// the backup's record at that position: the target holds this
+    /// backup's first records, not another topic's.
+    async fn check_resume<S: BlobStore + Send + Sync + 'static>(
+        &self,
+        source: &mut ChainSource<S>,
+        target: &Target,
+        at: u64,
+    ) -> Result<()> {
+        let last = at - 1;
+        let Some(ours) = source.record_at(last).await? else {
+            bail!(
+                "the target holds {at} records, and the backup has no record at offset {last}: \
+                 it holds more than this backup, or is another topic"
+            );
+        };
+        let (bootstrap, topic, partition) = (
+            target.bootstrap_servers.clone(),
+            target.topic.clone(),
+            self.source.partition,
+        );
+        let theirs = tokio::task::spawn_blocking(move || {
+            mirror_kafka::read_record_at(
+                &bootstrap,
+                &topic,
+                partition,
+                last,
+                Duration::from_secs(10),
+            )
+        })
+        .await?
+        .context("reading the target's last record")?;
+        let same_time = ours.timestamp_ms.is_none() || ours.timestamp_ms == theirs.timestamp_ms;
+        if ours.key != theirs.key
+            || ours.value != theirs.value
+            || ours.headers != theirs.headers
+            || !same_time
+        {
+            bail!(
+                "the target's record at offset {last} is not the backup's record there (key, \
+                 value, headers or timestamp differ): the target holds another topic's records; \
+                 follow into an empty topic, or one this backup was restored into with the same \
+                 --offsets"
+            );
+        }
+        tracing::info!(
+            offset = last,
+            "the target's last record is the backup's; resuming"
+        );
+        Ok(())
+    }
+
     async fn run<S: BlobStore>(
         &self,
         store: &S,
@@ -245,4 +388,22 @@ impl Backup<'_> {
             Some(first) => println!("holes: {}, the first at offset {first}", summary.holes),
         }
     }
+}
+
+/// SIGTERM or SIGINT: the loop then stops after the record in hand.
+async fn shutdown_requested() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        if let Ok(mut term) = signal(SignalKind::terminate()) {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = term.recv() => {}
+            }
+            tracing::info!("shutdown requested");
+            return;
+        }
+    }
+    let _ = tokio::signal::ctrl_c().await;
+    tracing::info!("shutdown requested");
 }

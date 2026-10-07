@@ -107,7 +107,9 @@ mirror-v3 restore --config mirror-v3.yaml --mirror operations-backup --offsets p
 | `--offsets` | `preserve` or `renumber`, required: see below. |
 | `--chain-start` | The offset the backup starts at, default 0. A chain that starts anywhere else is an error unless this says so, so objects removed from its head are never missed silently. |
 | `--verify-only` | Stop after the verify pass. |
-| `--bootstrap-servers`, `--topic` | The target: partition `partition` (the mirror's) of an existing, empty topic. |
+| `--bootstrap-servers`, `--topic` | The target: partition `partition` (the mirror's) of an existing, empty topic (with `--follow`, empty or followed before). |
+| `--follow` | Keep the target restored as the backup grows, until SIGTERM or SIGINT: see [Continuous restore](#continuous-restore). |
+| `--poll-interval-ms` | With `--follow`: how often to list the backup once every object is restored, default 5000. |
 
 Every run first lists the backup and validates the chain of object names (sorted, no gap, no overlap, starting at `--chain-start`, every key id it names present in `keys-dir`), then reads every object and checks it against its name (records in increasing offset order inside `<from>-<to>`, the last at `to`) and the mirror's topic and partition. It prints the summary to stdout:
 
@@ -132,6 +134,13 @@ The two offset modes:
 In both modes a record's timestamp is produced as its CreateTime, also for a record whose source topic stamped LogAppendTime; a target topic with `message.timestamp.type=LogAppendTime` restamps every record at restore time. A record without a timestamp gets the producer's clock. Time-based retention counts from these timestamps: a target topic whose `retention.ms` is shorter than the age of the oldest restored records deletes them soon after the restore, as their segments roll and expire. Give the target a retention that covers the backup's age (`retention.ms=-1`, or longer than the oldest record) before restoring, and lower it later if it should apply from now on.
 
 Restore does not create the target topic (its partitions, `cleanup.policy` and retention are the operator's decision) and does not resume: a restore that fails part way leaves a topic that the next run refuses as not empty, so delete and create it again and rerun.
+
+### Continuous restore
+
+`--follow` reads the backup as a mirror's source: `run_mirror` with the Kafka destination, its per-record gate (the high watermark read before every produce, no retries, the offset the broker reports checked) and its idle drift check, so nothing else may write the target. It starts at the target's high watermark, and after every object listed so far it lists the backup again every `--poll-interval-ms`, producing the objects the backup's mirror has added, so the target trails the source by about the backup mirror's flush interval: a standby, or a topic moved between clusters through the bucket. It runs until SIGTERM or SIGINT and can be stopped and started again at any time; it is not a replacement for the one-shot restore when the backup is all there is, since the gate makes it slow (about 150 records/s against a local broker), so restore the bulk with the one-shot restore and follow from there.
+
+- **Resume**: a target that is not empty holds the backup's first records, in both offset modes (with `renumber`, the n-th record of the chain is at offset n), so a follower continues at its high watermark without any state of its own. Before it does, it reads the target's last record and requires it to be the backup's record at that position (key, value, headers, timestamp); a topic holding anything else is refused. A one-shot restore and a follower can therefore hand over: follow a topic that a one-shot restore filled, with the same `--offsets`.
+- **Checks**: every object is read and checked as in the verify pass before its records are produced, and new objects must continue the chain. There is no verify pass of the whole backup up front, so with `preserve` a hole stops the follower when it is reached, with the records before it restored; `--verify-only` checks a backup before following it. A gap, a hole, a target past the backup's end or another topic's records end the follower with an error that trying again cannot fix; an unreachable store or broker ends it with an error a restart can.
 
 What disaster recovery needs besides the bucket:
 

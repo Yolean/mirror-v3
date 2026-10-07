@@ -47,6 +47,41 @@ pub fn fetch_high_watermark(
     Ok(high)
 }
 
+/// Read the record at `offset` of `(topic, partition)`: what a resumed
+/// restore compares with the record it would have produced there.
+/// Sync call: wrap in spawn_blocking for async contexts.
+pub fn read_record_at(
+    bootstrap: &str,
+    topic: &str,
+    partition: i32,
+    offset: u64,
+    timeout: Duration,
+) -> Result<Record, KafkaError> {
+    let consumer: BaseConsumer = ClientConfig::new()
+        .set("bootstrap.servers", bootstrap)
+        .set("group.id", "mirror-v3-read-record-noop")
+        .set("enable.auto.commit", "false")
+        .create()
+        .map_err(|e| KafkaError::Init(e.to_string()))?;
+    let mut tpl = TopicPartitionList::new();
+    tpl.add_partition_offset(topic, partition, Offset::Offset(offset as i64))
+        .map_err(|e| KafkaError::Init(e.to_string()))?;
+    consumer
+        .assign(&tpl)
+        .map_err(|e| KafkaError::Init(format!("assign: {e}")))?;
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        match consumer.poll(Timeout::After(Duration::from_millis(200))) {
+            Some(Ok(msg)) if msg.offset() == offset as i64 => return Ok(borrowed_to_record(&msg)),
+            Some(Ok(_)) | None => {}
+            Some(Err(e)) => return Err(KafkaError::Init(format!("reading offset {offset}: {e}"))),
+        }
+    }
+    Err(KafkaError::Init(format!(
+        "no record at {topic}/{partition} offset {offset} within {timeout:?}"
+    )))
+}
+
 /// Fetch the low watermark for `(topic, partition)` against
 /// `bootstrap` — the earliest offset still retained by the broker.
 /// Greater than zero on compacted or `delete-records`-trimmed
