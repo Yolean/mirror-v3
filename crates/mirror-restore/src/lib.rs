@@ -10,12 +10,21 @@
 //! destination, with its high-watermark gate before every produce).
 
 pub mod chain;
+pub mod read;
 
 pub use chain::{plan_chain, ChainObject};
+pub use read::{BackupSource, BackupSummary, ObjectSummary, Reader};
 
 #[derive(Debug, thiserror::Error)]
 pub enum RestoreError {
     /// The object names do not form a chain this restore can read.
     #[error("backup chain: {0}")]
     Chain(String),
+    /// The backup's store could not be listed or read.
+    #[error("backup store: {0}")]
+    Store(String),
+    /// An object does not decode, or contradicts its name or the
+    /// backup's source.
+    #[error("backup object: {0}")]
+    Object(String),
 }
