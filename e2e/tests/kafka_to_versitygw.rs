@@ -87,6 +87,7 @@ async fn mirrors_to_versitygw_with_offset_named_objects() {
         compaction: None,
         cache: None,
         flush,
+        encryption: None,
     })
     .await
     .expect("spawn mirror");

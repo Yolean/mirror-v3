@@ -1,5 +1,6 @@
-//! E2e: a topic backed up by the mirror to a filesystem destination and
-//! restored from it into another topic, against real brokers.
+//! E2e: a topic backed up by the mirror to a filesystem or S3
+//! destination and restored from it into another topic, against real
+//! brokers.
 //!
 //! - `preserve`: every record lands at its original offset with its
 //!   key, value (tombstones too), headers and timestamp; a second
@@ -9,8 +10,11 @@
 //!   commit marker, which the backup keeps. `preserve` refuses it
 //!   before producing anything; `renumber` restores every record in
 //!   order at 0, 1, 2, ...
+//! - S3: a backup encrypted across a key rotation, restored from the
+//!   bucket through a read-only store. Docker only (kafka-native and
+//!   VersityGW).
 //!
-//! Each scenario runs against the Docker stack (kafka-native source,
+//! The first two run against the Docker stack (kafka-native source,
 //! Redpanda target), and, `#[ignore]`d, against any broker named by
 //! `MIRROR_E2E_EXTERNAL_KAFKA=<bootstrap>` (one cluster for source and
 //! target, as on a host without Docker):
@@ -22,15 +26,25 @@ use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
-use mirror_e2e::docker::KafkaNativeToRedpandaStack;
+use std::sync::Arc;
+
+use mirror_e2e::docker::{
+    KafkaNativeToRedpandaStack, KafkaNativeToVersityGWStack, VERSITYGW_ACCESS_KEY,
+    VERSITYGW_SECRET_KEY,
+};
 use mirror_e2e::kafka_helpers::create_topic;
-use mirror_e2e::mirror_runner::{spawn_kafka_to_filesystem, FsMirrorSpec};
+use mirror_e2e::mirror_runner::{
+    spawn_kafka_to_filesystem, spawn_kafka_to_s3, FsMirrorSpec, S3MirrorSpec,
+};
 use mirror_e2e::ProvisionedStack;
-use mirror_envelope::{ColumnType, Format, ParquetCompression};
+use mirror_envelope::{ColumnType, Format, Keyring, ParquetCompression};
 use mirror_fs::blob::BlobStore;
-use mirror_fs::{read_all_records, FlushTriggers, FsStore};
+use mirror_fs::{read_all_records, BlobEncryption, FlushTriggers, FsStore};
 use mirror_kafka::{KafkaSink, KafkaSinkConfig};
 use mirror_restore::{plan_chain, produce, BackupSource, OffsetMode, Reader, RestoreError};
+use mirror_s3::S3Store;
+use object_store::aws::AmazonS3Builder;
+use object_store::ObjectStore;
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{BaseConsumer, Consumer};
 use rdkafka::message::{Header, Headers, Message, OwnedHeaders};
@@ -231,16 +245,28 @@ async fn restore(
     mode: OffsetMode,
 ) -> Result<mirror_restore::RestoreReport, RestoreError> {
     let store = FsStore::new(root.join("ops").join("0"));
+    restore_from(&store, None, source_topic, target, target_topic, mode).await
+}
+
+/// Verify the backup in `store` and restore it to `target_topic`.
+async fn restore_from<S: BlobStore>(
+    store: &S,
+    keyring: Option<&Keyring>,
+    source_topic: &str,
+    target: &str,
+    target_topic: &str,
+    mode: OffsetMode,
+) -> Result<mirror_restore::RestoreReport, RestoreError> {
     let names = store.list().await.expect("list");
-    let chain = plan_chain(&names, Format::Parquet, 0, None)?;
+    let chain = plan_chain(&names, Format::Parquet, 0, keyring)?;
     let source = BackupSource {
         topic: source_topic.to_string(),
         partition: 0,
     };
     let reader = Reader {
-        store: &store,
+        store,
         format: Format::Parquet,
-        keyring: None,
+        keyring,
         source: &source,
     };
     let summary = reader.verify(&chain).await?;
@@ -432,6 +458,154 @@ async fn holes(brokers: &Brokers) {
         })
         .collect();
     assert_eq!(restored, renumbered);
+}
+
+/// A topic backed up to S3 by the mirror, encrypted with k1 and, after a
+/// restart with another active key, k2, restored from the bucket through
+/// a store that may only read: the disaster-recovery path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_encrypted_s3_backup_restores_across_a_key_rotation() {
+    install_tracing();
+    const BUCKET: &str = "mirror-v3";
+    let stack = KafkaNativeToVersityGWStack::start(BUCKET)
+        .await
+        .expect("provision the Docker stack");
+    let broker = stack.source_bootstrap();
+    let s3: Arc<dyn ObjectStore> = Arc::new(
+        AmazonS3Builder::new()
+            .with_endpoint(stack.s3_endpoint())
+            .with_allow_http(true)
+            .with_region("us-east-1")
+            .with_bucket_name(BUCKET)
+            .with_access_key_id(VERSITYGW_ACCESS_KEY)
+            .with_secret_access_key(VERSITYGW_SECRET_KEY)
+            .build()
+            .expect("S3 client"),
+    );
+    let keys_dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        keys_dir.path().join("k1"),
+        "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+    )
+    .unwrap();
+    std::fs::write(
+        keys_dir.path().join("k2"),
+        "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=",
+    )
+    .unwrap();
+    let keyring = Arc::new(Keyring::load(keys_dir.path()).unwrap());
+    let prefix = object_store::path::Path::from("sites/e2e");
+    let dir = mirror_s3::partition_prefix(Some(&prefix), "ops", 0);
+    let backup = S3Store::read_only(Arc::clone(&s3), dir);
+
+    let source_topic = unique("restore-s3-src");
+    create_topic(&broker, &source_topic, 1).await.unwrap();
+    let mut written = 0;
+    for (key_id, count) in [("k1", 25), ("k2", 15)] {
+        produce_numbered(&broker, &source_topic, written, count).await;
+        written += count;
+        let mirror = spawn_kafka_to_s3(S3MirrorSpec {
+            source_bootstrap: broker.clone(),
+            source_topic: source_topic.clone(),
+            partition: 0,
+            group_id: unique("mirror-e2e-restore-s3"),
+            store: Arc::clone(&s3),
+            prefix: Some(prefix.clone()),
+            destination_name: "ops".into(),
+            format: Format::Parquet,
+            compression: ParquetCompression::Zstd1,
+            keys: ColumnType::Utf8,
+            values: ColumnType::Utf8,
+            compaction: None,
+            cache: None,
+            flush: FlushTriggers {
+                max_time: Duration::from_millis(500),
+                max_bytes: u64::MAX,
+                max_offsets: 10,
+                daily_at_utc_seconds: None,
+            },
+            encryption: Some(BlobEncryption {
+                key_id: key_id.into(),
+                keyring: Arc::clone(&keyring),
+            }),
+        })
+        .await
+        .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            let names = backup.list().await.unwrap();
+            let held = plan_chain(&names, Format::Parquet, 0, Some(&keyring))
+                .ok()
+                .and_then(|c| c.last().map(|o| o.to + 1))
+                .unwrap_or(0);
+            if held == written {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the backup holds {held} of {written} records"
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        mirror.shutdown().await.unwrap();
+    }
+    let names = backup.list().await.unwrap();
+    for id in ["k1", "k2"] {
+        assert!(
+            names.iter().any(|n| n.contains(&format!(".k-{id}."))),
+            "{names:?}"
+        );
+    }
+
+    // Without k2 the chain is refused before any object is read.
+    let only_k1 = tempfile::tempdir().unwrap();
+    std::fs::copy(keys_dir.path().join("k1"), only_k1.path().join("k1")).unwrap();
+    let only_k1 = Keyring::load(only_k1.path()).unwrap();
+    let err = plan_chain(&names, Format::Parquet, 0, Some(&only_k1)).unwrap_err();
+    assert!(err.to_string().contains("k2"), "{err}");
+
+    let target_topic = unique("restore-s3-dst");
+    create_topic(&broker, &target_topic, 1).await.unwrap();
+    let report = restore_from(
+        &backup,
+        Some(&keyring),
+        &source_topic,
+        &broker,
+        &target_topic,
+        OffsetMode::Preserve,
+    )
+    .await
+    .unwrap();
+    assert_eq!((report.records, report.high_watermark), (40, 40));
+    let original = consume_all(&broker, &source_topic).unwrap();
+    assert_eq!(original.len(), 40);
+    assert_eq!(consume_all(&broker, &target_topic).unwrap(), original);
+}
+
+/// Produce records `first..first + count` to partition 0, a tombstone
+/// on every fourth.
+async fn produce_numbered(bootstrap: &str, topic: &str, first: u64, count: u64) {
+    let producer: FutureProducer = ClientConfig::new()
+        .set("bootstrap.servers", bootstrap)
+        .set("acks", "all")
+        .create()
+        .unwrap();
+    for i in first..first + count {
+        let key = format!("k{}", i % 7);
+        let value = (i % 4 != 0).then(|| format!("{{\"n\":{i}}}"));
+        let headers = OwnedHeaders::new().insert(Header {
+            key: "trace",
+            value: Some(format!("t{i}").as_bytes()),
+        });
+        producer
+            .send(
+                record(topic, i as usize, &key, value.as_deref(), headers),
+                Timeout::After(Duration::from_secs(10)),
+            )
+            .await
+            .map_err(|(e, _)| e)
+            .unwrap();
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
