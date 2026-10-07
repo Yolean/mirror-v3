@@ -342,8 +342,11 @@ async fn holes(brokers: &Brokers) {
     create_topic(&brokers.txn_source, &source_topic, 1)
         .await
         .unwrap();
-    // Four transactions of three records: a commit marker after each
-    // takes an offset (3, 7, 11, 15), a hole for every consumer.
+    // Four transactions of three records. Every transaction marker
+    // takes an offset, a hole for every consumer; where they land is the
+    // broker's: Apache Kafka writes a commit marker after each
+    // transaction (3, 7, 11, 15), Redpanda also a control batch before
+    // each (0, 4, 5, 9, ...).
     let producer: FutureProducer = ClientConfig::new()
         .set("bootstrap.servers", &brokers.txn_source)
         .set("transactional.id", unique("restore-e2e"))
@@ -376,7 +379,12 @@ async fn holes(brokers: &Brokers) {
     }
     let original = consume_all(&brokers.txn_source, &source_topic).unwrap();
     let offsets: Vec<i64> = original.iter().map(|r| r.offset).collect();
-    assert_eq!(offsets, [0, 1, 2, 4, 5, 6, 8, 9, 10, 12, 13, 14]);
+    assert_eq!(offsets.len(), 12);
+    // The backup's chain covers 0 to the last record's offset.
+    let last = *offsets.last().unwrap();
+    let holes = last + 1 - 12;
+    let first_hole = (0..).find(|o| !offsets.contains(o)).unwrap();
+    assert!(holes >= 3, "a marker between each transaction: {offsets:?}");
 
     let root = tempfile::tempdir().unwrap();
     back_up(&brokers.txn_source, &source_topic, root.path(), 12)
@@ -397,8 +405,9 @@ async fn holes(brokers: &Brokers) {
     .await
     .unwrap_err();
     assert!(
-        err.to_string()
-            .contains("3 offset hole(s), the first at offset 3"),
+        err.to_string().contains(&format!(
+            "{holes} offset hole(s), the first at offset {first_hole}"
+        )),
         "{err}"
     );
     assert_eq!(high_watermark(&brokers.target, &target_topic).unwrap(), 0);
