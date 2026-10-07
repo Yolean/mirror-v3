@@ -6,15 +6,16 @@
 //! consumer positions. Restore reads that chain back: [`chain`]
 //! validates the names, [`read`] decodes and checks every object (the
 //! verify pass, which is also the "is the backup complete" check), and
-//! [`produce`] writes the records to a [`mirror_core::Sink`] (the Kafka
-//! destination, with its high-watermark gate before every produce).
+//! [`produce`] writes the records to a [`RestoreTarget`] (in production
+//! a Kafka producer with many records in flight, each checked to land
+//! at its offset).
 
 pub mod chain;
 pub mod produce;
 pub mod read;
 
 pub use chain::{plan_chain, ChainObject};
-pub use produce::{produce, OffsetMode, RestoreReport};
+pub use produce::{produce, OffsetMode, RestoreReport, RestoreTarget};
 pub use read::{BackupSource, BackupSummary, ObjectSummary, Reader};
 
 #[derive(Debug, thiserror::Error)]

@@ -11,9 +11,12 @@ description = "Restore a mirror-v3 blob backup (filesystem or S3) into a Kafka t
 mirror-core = { workspace = true }
 mirror-envelope = { workspace = true }
 mirror-fs = { workspace = true }
+mirror-kafka = { workspace = true }
+async-trait = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+async-trait = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros"] }

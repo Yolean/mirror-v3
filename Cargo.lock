@@ -1940,9 +1940,11 @@ dependencies = [
 name = "mirror-restore"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "mirror-core",
  "mirror-envelope",
  "mirror-fs",
+ "mirror-kafka",
  "tempfile",
  "thiserror",
  "tokio",

@@ -38,6 +38,9 @@ pub struct ObjectSummary {
     /// Positions of the object's range without a record.
     pub holes: u64,
     pub first_hole: Option<u64>,
+    /// The object's bytes, hashed: the produce pass reads the object
+    /// again and requires the same bytes.
+    pub digest: u64,
 }
 
 /// The verify pass's result: the "is the backup complete" answer.
@@ -59,6 +62,16 @@ impl<S: BlobStore> Reader<'_, S> {
     /// offset order inside `from..=to`, the last at `to`, every one of
     /// the backup's source.
     pub async fn read_object(&self, object: &ChainObject) -> Result<Vec<Record>, RestoreError> {
+        self.read_object_with_digest(object)
+            .await
+            .map(|(records, _)| records)
+    }
+
+    /// [`Self::read_object`], and the digest of the object's bytes.
+    pub async fn read_object_with_digest(
+        &self,
+        object: &ChainObject,
+    ) -> Result<(Vec<Record>, u64), RestoreError> {
         let location = self.store.location(&object.name);
         let bytes = self
             .store
@@ -100,7 +113,7 @@ impl<S: BlobStore> Reader<'_, S> {
             }
             previous = Some(r.source_offset);
         }
-        Ok(records)
+        Ok((records, digest(&bytes)))
     }
 
     /// The verify pass: read every object of `chain` and sum it up.
@@ -110,8 +123,8 @@ impl<S: BlobStore> Reader<'_, S> {
         };
         let mut objects = Vec::with_capacity(chain.len());
         for object in chain {
-            let records = self.read_object(object).await?;
-            let summary = summarize(object, &records);
+            let (records, digest) = self.read_object_with_digest(object).await?;
+            let summary = summarize(object, &records, digest);
             tracing::debug!(
                 object = %summary.name,
                 records = summary.records,
@@ -131,7 +144,17 @@ impl<S: BlobStore> Reader<'_, S> {
     }
 }
 
-fn summarize(object: &ChainObject, records: &[Record]) -> ObjectSummary {
+/// Not a cryptographic digest: it tells the produce pass that an object
+/// was replaced after the verify pass read it. Whoever can replace
+/// objects on purpose can do so before the verify pass as well.
+fn digest(bytes: &[u8]) -> u64 {
+    use std::hash::Hasher;
+    let mut h = std::hash::DefaultHasher::new();
+    h.write(bytes);
+    h.finish()
+}
+
+fn summarize(object: &ChainObject, records: &[Record], digest: u64) -> ObjectSummary {
     let positions = object.to - object.from + 1;
     let mut next = object.from;
     let mut first_hole = None;
@@ -146,5 +169,6 @@ fn summarize(object: &ChainObject, records: &[Record]) -> ObjectSummary {
         records: records.len() as u64,
         holes: positions - records.len() as u64,
         first_hole,
+        digest,
     }
 }

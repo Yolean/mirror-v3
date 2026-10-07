@@ -14,7 +14,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use mirror_config::{Destination, Encryption, Mirror};
 use mirror_envelope::Keyring;
 use mirror_fs::blob::BlobStore;
-use mirror_kafka::{KafkaSink, KafkaSinkConfig, TimestampMode};
+use mirror_kafka::RestoreProducer;
 use mirror_restore::{plan_chain, BackupSource, BackupSummary, OffsetMode, Reader};
 
 /// `--offsets`: required, so that the choice is written out.
@@ -201,16 +201,12 @@ impl Backup<'_> {
             println!("verified: the backup can be restored with these offsets");
             return Ok(());
         };
-        let mut sink_cfg = KafkaSinkConfig::new(
+        let mut producer = RestoreProducer::open(
             target.bootstrap_servers.clone(),
             target.topic.clone(),
             self.source.partition,
-        );
-        sink_cfg.timestamp_mode = TimestampMode::Source;
-        sink_cfg.keys = super::column_type_to_envelope(self.mirror.keys.unwrap_or_default().kind);
-        sink_cfg.values =
-            super::column_type_to_envelope(self.mirror.values.unwrap_or_default().kind);
-        let mut sink = KafkaSink::open(sink_cfg).context("opening the target topic's producer")?;
+        )
+        .context("opening the target topic's producer")?;
         tracing::info!(
             topic = %target.topic,
             partition = self.source.partition,
@@ -218,7 +214,7 @@ impl Backup<'_> {
             records = summary.records,
             "producing"
         );
-        let report = mirror_restore::produce(&reader, &chain, &summary, self.mode, &mut sink)
+        let report = mirror_restore::produce(&reader, &chain, &summary, self.mode, &mut producer)
             .await
             .with_context(|| {
                 format!(

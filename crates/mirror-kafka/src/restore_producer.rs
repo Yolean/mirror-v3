@@ -1,0 +1,170 @@
+//! A producer that writes records to one partition in order, many in
+//! flight, and requires every one to land at the offset it is sent for.
+//!
+//! This is restore's target, not the mirror's: the mirror's
+//! [`crate::KafkaSink`] reads the high watermark before every produce
+//! and never retries, so that a restart can always resume. A restore
+//! does not resume (it requires an empty topic, and a failed one is
+//! deleted and run again), so it can trade that per-record gate for
+//! throughput: the idempotent producer retries without duplicating or
+//! reordering, and every delivery report is checked against the offset
+//! the record was sent for, so another writer on the partition, or a
+//! record lost or written twice, still ends the restore.
+
+use std::collections::VecDeque;
+use std::time::Duration;
+
+use mirror_core::Record;
+use rdkafka::config::ClientConfig;
+use rdkafka::error::{KafkaError as RdKafkaError, RDKafkaErrorCode};
+use rdkafka::producer::{DeliveryFuture, FutureProducer, FutureRecord, Producer};
+use rdkafka::util::Timeout;
+
+use crate::{build_headers, KafkaError};
+
+/// Records sent and not yet acknowledged, at most. librdkafka's own
+/// queue holds 100000 by default; this keeps memory bounded well below
+/// it and leaves the broker full batches to work on.
+const DEFAULT_WINDOW: usize = 10_000;
+
+/// Producer settings for restore. `enable.idempotence` implies
+/// `acks=all` and retries that neither duplicate nor reorder, with up
+/// to five requests in flight. `linger.ms` lets records batch.
+fn restore_producer_config(bootstrap_servers: &str) -> ClientConfig {
+    let mut cfg = ClientConfig::new();
+    cfg.set("bootstrap.servers", bootstrap_servers)
+        .set("enable.idempotence", "true")
+        .set("acks", "all")
+        .set("max.in.flight.requests.per.connection", "5")
+        .set("linger.ms", "20");
+    cfg
+}
+
+pub struct RestoreProducer {
+    producer: FutureProducer,
+    bootstrap_servers: String,
+    topic: String,
+    partition: i32,
+    watermark_timeout: Duration,
+    window: usize,
+    in_flight: VecDeque<(u64, DeliveryFuture)>,
+}
+
+impl RestoreProducer {
+    pub fn open(
+        bootstrap_servers: impl Into<String>,
+        topic: impl Into<String>,
+        partition: i32,
+    ) -> Result<Self, KafkaError> {
+        let bootstrap_servers = bootstrap_servers.into();
+        let producer: FutureProducer = restore_producer_config(&bootstrap_servers)
+            .create()
+            .map_err(|e| KafkaError::Init(e.to_string()))?;
+        Ok(Self {
+            producer,
+            bootstrap_servers,
+            topic: topic.into(),
+            partition,
+            watermark_timeout: crate::DEFAULT_WATERMARK_TIMEOUT,
+            window: DEFAULT_WINDOW,
+            in_flight: VecDeque::new(),
+        })
+    }
+
+    /// The partition's high watermark, from the broker.
+    pub async fn high_watermark(&self) -> Result<u64, String> {
+        let bootstrap = self.bootstrap_servers.clone();
+        let topic = self.topic.clone();
+        let partition = self.partition;
+        let timeout = self.watermark_timeout;
+        tokio::task::spawn_blocking(move || {
+            crate::fetch_high_watermark(&bootstrap, &topic, partition, timeout)
+        })
+        .await
+        .map_err(|e| format!("join: {e}"))?
+        .map_err(|e| e.to_string())
+    }
+
+    /// Send `record` to be stored at `offset`, with its key, value,
+    /// headers and timestamp (as CreateTime). Returns once it is
+    /// queued; waits first for the oldest record in flight when the
+    /// window is full, and fails if that one did not land at its
+    /// offset.
+    pub async fn send(&mut self, record: &Record, offset: u64) -> Result<(), String> {
+        if self.in_flight.len() >= self.window {
+            self.ack_oldest().await?;
+        }
+        loop {
+            let mut fr: FutureRecord<'_, [u8], [u8]> =
+                FutureRecord::to(&self.topic).partition(self.partition);
+            if let Some(k) = record.key.as_deref() {
+                fr = fr.key(k);
+            }
+            if let Some(v) = record.value.as_deref() {
+                fr = fr.payload(v);
+            }
+            if let Some(ts) = record.timestamp_ms {
+                fr = fr.timestamp(ts);
+            }
+            if !record.headers.is_empty() {
+                fr = fr.headers(build_headers(&record.headers));
+            }
+            match self.producer.send_result(fr) {
+                Ok(delivery) => {
+                    self.in_flight.push_back((offset, delivery));
+                    return Ok(());
+                }
+                Err((RdKafkaError::MessageProduction(RDKafkaErrorCode::QueueFull), _))
+                    if !self.in_flight.is_empty() =>
+                {
+                    self.ack_oldest().await?;
+                }
+                Err((e, _)) => return Err(format!("producing offset {offset}: {e}")),
+            }
+        }
+    }
+
+    /// Wait until every record sent has landed at its offset.
+    pub async fn finish(&mut self) -> Result<(), String> {
+        while !self.in_flight.is_empty() {
+            self.ack_oldest().await?;
+        }
+        self.producer
+            .flush(Timeout::After(self.watermark_timeout))
+            .map_err(|e| format!("flush: {e}"))
+    }
+
+    async fn ack_oldest(&mut self) -> Result<(), String> {
+        let Some((offset, delivery)) = self.in_flight.pop_front() else {
+            return Ok(());
+        };
+        let delivered = delivery
+            .await
+            .map_err(|_| format!("offset {offset}: the producer dropped the delivery report"))?
+            .map_err(|(e, _)| format!("offset {offset} was not delivered: {e}"))?;
+        if delivered.partition != self.partition || delivered.offset != offset as i64 {
+            return Err(format!(
+                "sent for offset {offset}, the broker stored it at {}/{} offset {}: another \
+                 writer on the partition, or a record lost or written twice",
+                self.topic, delivered.partition, delivered.offset
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn restore_produces_idempotently_with_retries_and_batching() {
+        let native = super::restore_producer_config("localhost:9092")
+            .create_native_config()
+            .expect("native config");
+        let get = |k: &str| native.get(k).unwrap();
+        assert_eq!(get("enable.idempotence"), "true");
+        assert_eq!(get("acks"), "-1", "acks=all");
+        assert_eq!(get("max.in.flight.requests.per.connection"), "5");
+        assert_ne!(get("message.send.max.retries"), "0");
+        assert_eq!(get("linger.ms"), "20");
+    }
+}

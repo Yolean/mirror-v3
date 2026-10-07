@@ -5,6 +5,8 @@
 //! hood). The end-offset gate lives in [`KafkaSink::write`]: it queries
 //! the destination high watermark, refuses to write if it has moved,
 //! then asserts that the produced offset matches the source offset.
+//! [`RestoreProducer`] is restore's target: in order, many records in
+//! flight, every delivery checked against its offset.
 
 #![allow(clippy::result_large_err)]
 
@@ -24,6 +26,9 @@ use rdkafka::producer::{FutureProducer, FutureRecord};
 use rdkafka::topic_partition_list::Offset;
 use rdkafka::util::Timeout;
 use rdkafka::TopicPartitionList;
+
+mod restore_producer;
+pub use restore_producer::RestoreProducer;
 
 const DEFAULT_POLL_TIMEOUT: Duration = Duration::from_secs(2);
 const DEFAULT_WATERMARK_TIMEOUT: Duration = Duration::from_secs(10);

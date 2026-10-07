@@ -1,17 +1,47 @@
-//! Write a verified backup to the target, record by record, in order.
+//! Write a verified backup to the target, in order.
 //!
-//! The target is a [`Sink`]: in production the Kafka destination, whose
-//! `write` reads the topic's high watermark before every produce and
-//! requires it to equal the record's offset, produces with zero retries
-//! and requires the broker to report that offset back. Restore adds
-//! the checks around it: the target must be empty before the first
-//! record, and its high watermark must equal the records produced
-//! after the last.
+//! The target is a [`RestoreTarget`]: in production
+//! [`mirror_kafka::RestoreProducer`], which keeps many records in
+//! flight and requires each to land at the offset it was sent for.
+//! Restore adds the checks around it: the target must be empty before
+//! the first record, and its high watermark must equal the records
+//! produced after the last. A restore that fails part way is not
+//! resumed: the topic is deleted, created again, and restored again.
 
-use mirror_core::Sink;
+use async_trait::async_trait;
+use mirror_core::Record;
 use mirror_fs::blob::BlobStore;
 
 use crate::{BackupSummary, ChainObject, Reader, RestoreError};
+
+/// Where a restore writes, one partition.
+// async_trait marks the boxed future of each method #[must_use];
+// clippy 1.99 flags that as double_must_use in the expansion.
+#[allow(clippy::double_must_use)]
+#[async_trait]
+pub trait RestoreTarget: Send {
+    /// The partition's high watermark.
+    async fn high_watermark(&mut self) -> Result<u64, String>;
+    /// Send `record` to be stored at `offset`. May return before it is
+    /// stored; fails if a record sent earlier did not land at its
+    /// offset.
+    async fn send(&mut self, record: &Record, offset: u64) -> Result<(), String>;
+    /// Wait until every record sent is stored at its offset.
+    async fn finish(&mut self) -> Result<(), String>;
+}
+
+#[async_trait]
+impl RestoreTarget for mirror_kafka::RestoreProducer {
+    async fn high_watermark(&mut self) -> Result<u64, String> {
+        mirror_kafka::RestoreProducer::high_watermark(self).await
+    }
+    async fn send(&mut self, record: &Record, offset: u64) -> Result<(), String> {
+        mirror_kafka::RestoreProducer::send(self, record, offset).await
+    }
+    async fn finish(&mut self) -> Result<(), String> {
+        mirror_kafka::RestoreProducer::finish(self).await
+    }
+}
 
 /// Which offsets the records get in the target. There is no default:
 /// the choice depends on what reads the topic.
@@ -67,7 +97,7 @@ pub async fn produce<S: BlobStore>(
     chain: &[ChainObject],
     summary: &BackupSummary,
     mode: OffsetMode,
-    target: &mut dyn Sink,
+    target: &mut dyn RestoreTarget,
 ) -> Result<RestoreReport, RestoreError> {
     mode.check(summary)?;
     if chain.len() != summary.objects.len() {
@@ -78,7 +108,7 @@ pub async fn produce<S: BlobStore>(
         )));
     }
     let start = target
-        .next_expected_offset()
+        .high_watermark()
         .await
         .map_err(|e| RestoreError::Target(format!("reading its high watermark: {e}")))?;
     if start != 0 {
@@ -86,13 +116,11 @@ pub async fn produce<S: BlobStore>(
     }
     let mut next = 0u64;
     for (object, verified) in chain.iter().zip(&summary.objects) {
-        let records = reader.read_object(object).await?;
-        if records.len() as u64 != verified.records {
+        let (records, digest) = reader.read_object_with_digest(object).await?;
+        if digest != verified.digest {
             return Err(RestoreError::Object(format!(
-                "{} holds {} records, and the verify pass read {}",
-                reader.store.location(&object.name),
-                records.len(),
-                verified.records
+                "{} changed after the verify pass read it",
+                reader.store.location(&object.name)
             )));
         }
         for mut record in records {
@@ -108,7 +136,7 @@ pub async fn produce<S: BlobStore>(
                 OffsetMode::Renumber => record.source_offset = next,
             }
             target
-                .write(record)
+                .send(&record, next)
                 .await
                 .map_err(|e| RestoreError::Target(format!("producing offset {next}: {e}")))?;
             next += 1;
@@ -117,11 +145,15 @@ pub async fn produce<S: BlobStore>(
             object = %reader.store.location(&object.name),
             records = verified.records,
             target_next = next,
-            "restored"
+            "sent"
         );
     }
+    target
+        .finish()
+        .await
+        .map_err(|e| RestoreError::Target(format!("waiting for the last records: {e}")))?;
     let high_watermark = target
-        .next_expected_offset()
+        .high_watermark()
         .await
         .map_err(|e| RestoreError::Target(format!("reading its high watermark: {e}")))?;
     if high_watermark != next || next != summary.records {

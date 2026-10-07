@@ -41,7 +41,7 @@ use mirror_e2e::ProvisionedStack;
 use mirror_envelope::{ColumnType, Format, Keyring, ParquetCompression};
 use mirror_fs::blob::BlobStore;
 use mirror_fs::{read_all_records, BlobEncryption, FlushTriggers, FsStore};
-use mirror_kafka::{KafkaSink, KafkaSinkConfig};
+use mirror_kafka::RestoreProducer;
 use mirror_restore::{plan_chain, produce, BackupSource, OffsetMode, Reader, RestoreError};
 use mirror_s3::S3Store;
 use object_store::aws::AmazonS3Builder;
@@ -271,8 +271,8 @@ async fn restore_from<S: BlobStore>(
         source: &source,
     };
     let summary = reader.verify(&chain).await?;
-    let mut sink = KafkaSink::open(KafkaSinkConfig::new(target, target_topic, 0)).expect("sink");
-    produce(&reader, &chain, &summary, mode, &mut sink).await
+    let mut producer = RestoreProducer::open(target, target_topic, 0).expect("producer");
+    produce(&reader, &chain, &summary, mode, &mut producer).await
 }
 
 async fn preserve_round_trip(brokers: &Brokers) {
