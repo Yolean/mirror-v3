@@ -1,0 +1,19 @@
+[package]
+name = "mirror-restore"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Restore a mirror-v3 blob backup (filesystem or S3) into a Kafka topic"
+
+[dependencies]
+mirror-core = { workspace = true }
+mirror-envelope = { workspace = true }
+mirror-fs = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["rt", "macros"] }

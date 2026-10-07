@@ -1934,6 +1934,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "mirror-restore"
+version = "0.1.0"
+dependencies = [
+ "mirror-core",
+ "mirror-envelope",
+ "mirror-fs",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "mirror-s3"
 version = "0.1.0"
 dependencies = [
