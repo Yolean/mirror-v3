@@ -10,9 +10,11 @@
 //! destination, with its high-watermark gate before every produce).
 
 pub mod chain;
+pub mod produce;
 pub mod read;
 
 pub use chain::{plan_chain, ChainObject};
+pub use produce::{produce, OffsetMode, RestoreReport};
 pub use read::{BackupSource, BackupSummary, ObjectSummary, Reader};
 
 #[derive(Debug, thiserror::Error)]
@@ -27,4 +29,17 @@ pub enum RestoreError {
     /// backup's source.
     #[error("backup object: {0}")]
     Object(String),
+    /// The backup cannot be restored with the chosen offset mode.
+    #[error("{0}")]
+    Mode(String),
+    /// Restore writes only to an empty topic.
+    #[error(
+        "the target topic is not empty: its high watermark is {0}; restore writes to an empty \
+         topic only (delete and create it again, with the configuration it needs)"
+    )]
+    TargetNotEmpty(u64),
+    /// The target refused a record, could not be reached, or does not
+    /// hold what was produced.
+    #[error("target: {0}")]
+    Target(String),
 }
