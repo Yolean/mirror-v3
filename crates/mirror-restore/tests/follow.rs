@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use common::*;
 use mirror_core::{run_mirror_with_heartbeat, MirrorError, Record, Sink, SinkError};
 use mirror_envelope::Format;
-use mirror_restore::{ChainSource, ChainSourceConfig, OffsetMode};
+use mirror_restore::{same_record, ChainSource, ChainSourceConfig, OffsetMode};
 
 /// A partition shared with the test: what it holds is readable while
 /// the loop runs and after it ends.
@@ -58,14 +58,24 @@ struct Follow {
 
 impl Follow {
     async fn start(dir: &std::path::Path, mode: OffsetMode, target: &Target) -> Self {
+        Self::polling(dir, mode, target, Duration::from_millis(20)).await
+    }
+
+    async fn polling(
+        dir: &std::path::Path,
+        mode: OffsetMode,
+        target: &Target,
+        poll_interval: Duration,
+    ) -> Self {
         let source = ChainSource::open(ChainSourceConfig {
             store: Arc::new(FsStore::new(dir.to_path_buf())),
+            location: dir.display().to_string(),
             format: Format::Parquet,
             keyring: None,
             source: source(),
             mode,
             chain_start: 0,
-            poll_interval: Duration::from_millis(20),
+            poll_interval,
         })
         .await
         .unwrap();
@@ -243,6 +253,7 @@ async fn record_at_is_the_record_a_restored_target_holds() {
     let open = |mode| {
         ChainSource::open(ChainSourceConfig {
             store: Arc::new(FsStore::new(dir.path().to_path_buf())),
+            location: dir.path().display().to_string(),
             format: Format::Parquet,
             keyring: None,
             source: source(),
@@ -268,6 +279,7 @@ async fn preserve_of_a_chain_that_starts_after_zero_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let err = ChainSource::open(ChainSourceConfig {
         store: Arc::new(FsStore::new(dir.path().to_path_buf())),
+        location: dir.path().display().to_string(),
         format: Format::Parquet,
         keyring: None,
         source: source(),
@@ -279,4 +291,98 @@ async fn preserve_of_a_chain_that_starts_after_zero_is_refused() {
     .err()
     .expect("refused");
     assert!(err.to_string().contains("starts at offset 5"), "{err}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_idle_drift_check_runs_with_a_poll_interval_longer_than_the_heartbeat() {
+    let dir = tempfile::tempdir().unwrap();
+    let written: Vec<Record> = (0..5).map(rec).collect();
+    write_backup(dir.path(), &written, 5, None).await;
+    let target = Target::default();
+    // The heartbeat (3 ms) drops poll_one about 70 times per wait.
+    let follow = Follow::polling(
+        dir.path(),
+        OffsetMode::Preserve,
+        &target,
+        Duration::from_millis(200),
+    )
+    .await;
+    wait_for(&target, 5).await;
+    // Another writer.
+    target.0.lock().unwrap().push(rec(5));
+    let err = follow.ended().await;
+    assert!(
+        matches!(
+            err,
+            MirrorError::DestinationDrift {
+                expected: 5,
+                actual: 6
+            }
+        ),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+async fn a_target_is_resumed_only_if_it_ends_with_the_backups_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let written: Vec<Record> = [0, 1, 3, 4].into_iter().map(rec).collect();
+    write_backup(dir.path(), &written, 2, None).await;
+    let open = |mode| {
+        ChainSource::open(ChainSourceConfig {
+            store: Arc::new(FsStore::new(dir.path().to_path_buf())),
+            location: dir.path().display().to_string(),
+            format: Format::Parquet,
+            keyring: None,
+            source: source(),
+            mode,
+            chain_start: 0,
+            poll_interval: Duration::from_millis(20),
+        })
+    };
+    let mut preserve = open(OffsetMode::Preserve).await.unwrap();
+    preserve.check_resume(0, &rec(0)).await.unwrap();
+    preserve.check_resume(4, &rec(3)).await.unwrap();
+    let other = Record {
+        value: Some(b"other".to_vec()),
+        ..rec(3)
+    };
+    let err = preserve.check_resume(4, &other).await.unwrap_err();
+    assert!(
+        err.to_string().contains("not the backup's record there"),
+        "{err}"
+    );
+    let err = preserve.check_resume(9, &rec(8)).await.unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("the backup has no record at offset 8"),
+        "{err}"
+    );
+    // With renumber the target's offset 2 holds the record of offset 3.
+    let mut renumber = open(OffsetMode::Renumber).await.unwrap();
+    renumber.check_resume(3, &rec(3)).await.unwrap();
+    let err = renumber.check_resume(3, &rec(1)).await.unwrap_err();
+    assert!(
+        err.to_string().contains("not the backup's record there"),
+        "{err}"
+    );
+}
+
+#[test]
+fn a_backup_record_without_a_timestamp_matches_any_timestamp() {
+    let ours = Record {
+        timestamp_ms: None,
+        ..rec(1)
+    };
+    let theirs = Record {
+        timestamp_ms: Some(42),
+        ..rec(1)
+    };
+    assert!(same_record(&ours, &theirs));
+    assert!(!same_record(&rec(1), &theirs));
+    let other_headers = Record {
+        headers: Vec::new(),
+        ..rec(1)
+    };
+    assert!(!same_record(&rec(1), &other_headers));
 }

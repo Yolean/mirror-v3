@@ -74,10 +74,10 @@ pub fn read_record_at(
         match consumer.poll(Timeout::After(Duration::from_millis(200))) {
             Some(Ok(msg)) if msg.offset() == offset as i64 => return Ok(borrowed_to_record(&msg)),
             Some(Ok(_)) | None => {}
-            Some(Err(e)) => return Err(KafkaError::Init(format!("reading offset {offset}: {e}"))),
+            Some(Err(e)) => return Err(KafkaError::Read(format!("reading offset {offset}: {e}"))),
         }
     }
-    Err(KafkaError::Init(format!(
+    Err(KafkaError::Read(format!(
         "no record at {topic}/{partition} offset {offset} within {timeout:?}"
     )))
 }
@@ -769,6 +769,8 @@ fn build_headers(headers: &[Header]) -> OwnedHeaders {
 pub enum KafkaError {
     #[error("kafka client init: {0}")]
     Init(String),
+    #[error("kafka read: {0}")]
+    Read(String),
 }
 
 #[cfg(test)]

@@ -104,8 +104,9 @@ pub async fn run_restore(args: RestoreArgs) -> Result<()> {
     match destination {
         Destination::Filesystem(fs) => {
             let dir = mirror_fs::naming::partition_dir(&fs.root, &dest_name, mirror.partition);
-            // Followed, a backup whose mirror has written nothing yet is waited for.
-            if args.follow.is_none() && !dir.is_dir() {
+            // The filesystem mirror creates the directory when it opens: one
+            // that does not exist is a wrong root or a mirror that never ran.
+            if !dir.is_dir() {
                 bail!("the backup directory {} does not exist", dir.display());
             }
             let location = dir.display().to_string();
@@ -221,8 +222,13 @@ impl Backup<'_> {
         target: Target,
         poll_interval: Duration,
     ) -> Result<()> {
+        // First, so that a SIGTERM during startup stops the follower once
+        // it runs, rather than killing it.
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        super::install_shutdown_signals(&shutdown_tx)?;
         let mut source = ChainSource::open(ChainSourceConfig {
             store,
+            location: location.to_string(),
             format: self.format,
             keyring,
             source: self.source.clone(),
@@ -247,13 +253,33 @@ impl Backup<'_> {
             .await
             .context("reading the target's high watermark")?;
         if at > 0 {
-            self.check_resume(&mut source, &target, at).await?;
+            let (bootstrap, topic, partition) = (
+                target.bootstrap_servers.clone(),
+                target.topic.clone(),
+                self.source.partition,
+            );
+            let last = tokio::task::spawn_blocking(move || {
+                mirror_kafka::read_record_at(
+                    &bootstrap,
+                    &topic,
+                    partition,
+                    at - 1,
+                    Duration::from_secs(10),
+                )
+            })
+            .await?
+            .context("reading the target's last record")?;
+            source.check_resume(at, &last).await?;
+            tracing::info!(
+                offset = at - 1,
+                "the target's last record is the backup's; resuming"
+            );
         }
         println!(
             "following: {location} into {}/{} from offset {at}",
             target.topic, self.source.partition
         );
-        mirror_core::run_mirror(source, sink, shutdown_requested())
+        mirror_core::run_mirror(source, sink, super::shutdown_signal(shutdown_rx))
             .await
             .with_context(|| {
                 format!(
@@ -262,58 +288,6 @@ impl Backup<'_> {
                 )
             })?;
         println!("stopped");
-        Ok(())
-    }
-
-    /// A target that is not empty is resumed only if its last record is
-    /// the backup's record at that position: the target holds this
-    /// backup's first records, not another topic's.
-    async fn check_resume<S: BlobStore + Send + Sync + 'static>(
-        &self,
-        source: &mut ChainSource<S>,
-        target: &Target,
-        at: u64,
-    ) -> Result<()> {
-        let last = at - 1;
-        let Some(ours) = source.record_at(last).await? else {
-            bail!(
-                "the target holds {at} records, and the backup has no record at offset {last}: \
-                 it holds more than this backup, or is another topic"
-            );
-        };
-        let (bootstrap, topic, partition) = (
-            target.bootstrap_servers.clone(),
-            target.topic.clone(),
-            self.source.partition,
-        );
-        let theirs = tokio::task::spawn_blocking(move || {
-            mirror_kafka::read_record_at(
-                &bootstrap,
-                &topic,
-                partition,
-                last,
-                Duration::from_secs(10),
-            )
-        })
-        .await?
-        .context("reading the target's last record")?;
-        let same_time = ours.timestamp_ms.is_none() || ours.timestamp_ms == theirs.timestamp_ms;
-        if ours.key != theirs.key
-            || ours.value != theirs.value
-            || ours.headers != theirs.headers
-            || !same_time
-        {
-            bail!(
-                "the target's record at offset {last} is not the backup's record there (key, \
-                 value, headers or timestamp differ): the target holds another topic's records; \
-                 follow into an empty topic, or one this backup was restored into with the same \
-                 --offsets"
-            );
-        }
-        tracing::info!(
-            offset = last,
-            "the target's last record is the backup's; resuming"
-        );
         Ok(())
     }
 
@@ -388,22 +362,4 @@ impl Backup<'_> {
             Some(first) => println!("holes: {}, the first at offset {first}", summary.holes),
         }
     }
-}
-
-/// SIGTERM or SIGINT: the loop then stops after the record in hand.
-async fn shutdown_requested() {
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{signal, SignalKind};
-        if let Ok(mut term) = signal(SignalKind::terminate()) {
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => {}
-                _ = term.recv() => {}
-            }
-            tracing::info!("shutdown requested");
-            return;
-        }
-    }
-    let _ = tokio::signal::ctrl_c().await;
-    tracing::info!("shutdown requested");
 }

@@ -33,6 +33,8 @@ type PendingRead = Pin<Box<dyn Future<Output = Result<Vec<Record>, RestoreError>
 /// How to read a backup as a source.
 pub struct ChainSourceConfig<S> {
     pub store: Arc<S>,
+    /// Where the backup is, for logs.
+    pub location: String,
     pub format: Format,
     /// `None` for a destination with `encryption: none`.
     pub keyring: Option<Arc<Keyring>>,
@@ -64,6 +66,12 @@ pub struct ChainSource<S> {
     buffer: VecDeque<Record>,
     /// The target position of the next record yielded.
     position: u64,
+    /// When the current wait for new objects ends. Kept across a
+    /// cancelled `poll_one`, so that with a poll interval longer than
+    /// the heartbeat the wait still ends, `poll_one` returns `None`, and
+    /// the run loop's idle drift check runs.
+    idle_until: Option<tokio::time::Instant>,
+    opened_at: std::time::Instant,
 }
 
 impl<S: BlobStore + Send + Sync + 'static> ChainSource<S> {
@@ -86,6 +94,8 @@ impl<S: BlobStore + Send + Sync + 'static> ChainSource<S> {
             pending: None,
             buffer: VecDeque::new(),
             position: 0,
+            idle_until: None,
+            opened_at: std::time::Instant::now(),
         };
         source.list_new().await?;
         Ok(source)
@@ -94,6 +104,36 @@ impl<S: BlobStore + Send + Sync + 'static> ChainSource<S> {
     /// The objects of the chain listed so far.
     pub fn chain(&self) -> &[ChainObject] {
         &self.chain
+    }
+
+    /// Whether a target at `high_watermark`, whose last record is
+    /// `last`, may be resumed: it must end with this backup's record at
+    /// that position. Only the last record is compared, so this tells a
+    /// target that holds another topic, or another backup, from one this
+    /// backup was restored into; it does not re-read the target.
+    pub async fn check_resume(
+        &mut self,
+        high_watermark: u64,
+        last: &Record,
+    ) -> Result<(), RestoreError> {
+        let Some(position) = high_watermark.checked_sub(1) else {
+            return Ok(());
+        };
+        let Some(ours) = self.record_at(position).await? else {
+            return Err(RestoreError::Target(format!(
+                "the target holds {high_watermark} records, and the backup has no record at \
+                 offset {position}: the target holds more than this backup, or another topic"
+            )));
+        };
+        if !same_record(&ours, last) {
+            return Err(RestoreError::Target(format!(
+                "the target's record at offset {position} is not the backup's record there (key, \
+                 value, headers or timestamp differ): the target holds another topic's records; \
+                 follow into an empty topic, or one this backup was restored into with the same \
+                 --offsets"
+            )));
+        }
+        Ok(())
     }
 
     /// The record the target holds at `position` if it is this backup,
@@ -259,6 +299,16 @@ impl<S: BlobStore + Send + Sync + 'static> ChainSource<S> {
     }
 }
 
+/// Whether `theirs`, read from a target, is `ours` as restore produces
+/// it: key, value and headers, and the timestamp unless the backup has
+/// none (the producer's clock stamps those).
+pub fn same_record(ours: &Record, theirs: &Record) -> bool {
+    ours.key == theirs.key
+        && ours.value == theirs.value
+        && ours.headers == theirs.headers
+        && (ours.timestamp_ms.is_none() || ours.timestamp_ms == theirs.timestamp_ms)
+}
+
 /// A store that cannot be reached can be tried again; anything else
 /// about the backup cannot be fixed by trying again.
 fn source_error(e: RestoreError) -> SourceError {
@@ -284,6 +334,7 @@ impl<S: BlobStore + Send + Sync + 'static> Source for ChainSource<S> {
         self.pending = None;
         self.buffer.clear();
         self.skip = 0;
+        self.idle_until = None;
         self.position = position;
         self.next_object = match self.cfg.mode {
             // The object's records below `position` are dropped when it is read.
@@ -312,6 +363,11 @@ impl<S: BlobStore + Send + Sync + 'static> Source for ChainSource<S> {
 
     async fn poll_one(&mut self) -> Result<Option<Record>, SourceError> {
         loop {
+            if let Some(until) = self.idle_until {
+                tokio::time::sleep_until(until).await;
+                self.idle_until = None;
+                return Ok(None);
+            }
             if let Some(r) = self.buffer.pop_front() {
                 self.position += 1;
                 return Ok(Some(r));
@@ -323,8 +379,15 @@ impl<S: BlobStore + Send + Sync + 'static> Source for ChainSource<S> {
             if self.list_new().await.map_err(source_error)? {
                 continue;
             }
-            tokio::time::sleep(self.cfg.poll_interval).await;
-            return Ok(None);
+            if self.chain.is_empty() {
+                // A wrong prefix looks like this too: say so on every listing.
+                tracing::info!(
+                    location = %self.cfg.location,
+                    waited_s = self.opened_at.elapsed().as_secs(),
+                    "the backup has no objects yet"
+                );
+            }
+            self.idle_until = Some(tokio::time::Instant::now() + self.cfg.poll_interval);
         }
     }
 

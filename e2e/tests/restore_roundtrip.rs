@@ -263,19 +263,12 @@ async fn wait_for_high_watermark(bootstrap: &str, topic: &str, records: i64) {
     }
 }
 
-/// `run_mirror` from the backup in `root/ops/0` into `target_topic`,
-/// through the Kafka destination, until the returned sender fires.
-async fn start_follow(
-    root: &Path,
-    source_topic: &str,
-    target: &str,
-    target_topic: &str,
-) -> (
-    tokio::sync::oneshot::Sender<()>,
-    tokio::task::JoinHandle<Result<(), mirror_core::MirrorError>>,
-) {
-    let source = ChainSource::open(ChainSourceConfig {
-        store: Arc::new(FsStore::new(root.join("ops").join("0"))),
+/// The backup in `root/ops/0` as a mirror's source.
+async fn chain_source(root: &Path, source_topic: &str) -> ChainSource<FsStore> {
+    let dir = root.join("ops").join("0");
+    ChainSource::open(ChainSourceConfig {
+        location: dir.display().to_string(),
+        store: Arc::new(FsStore::new(dir)),
         format: Format::Parquet,
         keyring: None,
         source: BackupSource {
@@ -287,7 +280,19 @@ async fn start_follow(
         poll_interval: Duration::from_millis(100),
     })
     .await
-    .unwrap();
+    .unwrap()
+}
+
+/// `run_mirror` from `source` into `target_topic`, through the Kafka
+/// destination, until the returned sender fires.
+fn start_follow(
+    source: ChainSource<FsStore>,
+    target: &str,
+    target_topic: &str,
+) -> (
+    tokio::sync::oneshot::Sender<()>,
+    tokio::task::JoinHandle<Result<(), mirror_core::MirrorError>>,
+) {
     let sink = KafkaSink::open(KafkaSinkConfig::new(target, target_topic, 0)).unwrap();
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
     let run = tokio::spawn(mirror_core::run_mirror(source, sink, async move {
@@ -310,8 +315,11 @@ async fn follow(brokers: &Brokers) {
     let root = tempfile::tempdir().unwrap();
     // Nothing backed up yet: the follower waits for the first object.
     let backup = spawn_backup(&brokers.source, &source_topic, root.path()).unwrap();
-    let (stop, run) =
-        start_follow(root.path(), &source_topic, &brokers.target, &target_topic).await;
+    let (stop, run) = start_follow(
+        chain_source(root.path(), &source_topic).await,
+        &brokers.target,
+        &target_topic,
+    );
     produce_numbered(&brokers.source, &source_topic, 0, 30).await;
     wait_for_high_watermark(&brokers.target, &target_topic, 30).await;
     produce_numbered(&brokers.source, &source_topic, 30, 20).await;
@@ -322,22 +330,8 @@ async fn follow(brokers: &Brokers) {
     // Records backed up while no follower runs; then one resumes, at
     // the target's high watermark, after the check the CLI makes.
     produce_numbered(&brokers.source, &source_topic, 50, 15).await;
-    let mut probe = ChainSource::open(ChainSourceConfig {
-        store: Arc::new(FsStore::new(root.path().join("ops").join("0"))),
-        format: Format::Parquet,
-        keyring: None,
-        source: BackupSource {
-            topic: source_topic.clone(),
-            partition: 0,
-        },
-        mode: OffsetMode::Preserve,
-        chain_start: 0,
-        poll_interval: Duration::from_millis(100),
-    })
-    .await
-    .unwrap();
-    let ours = probe.record_at(49).await.unwrap().unwrap();
-    let theirs = mirror_kafka::read_record_at(
+    let mut source = chain_source(root.path(), &source_topic).await;
+    let last = mirror_kafka::read_record_at(
         &brokers.target,
         &target_topic,
         0,
@@ -345,17 +339,8 @@ async fn follow(brokers: &Brokers) {
         Duration::from_secs(10),
     )
     .unwrap();
-    assert_eq!(
-        (ours.key, ours.value, ours.headers, ours.timestamp_ms),
-        (
-            theirs.key,
-            theirs.value,
-            theirs.headers,
-            theirs.timestamp_ms
-        )
-    );
-    let (stop, run) =
-        start_follow(root.path(), &source_topic, &brokers.target, &target_topic).await;
+    source.check_resume(50, &last).await.unwrap();
+    let (stop, run) = start_follow(source, &brokers.target, &target_topic);
     wait_for_high_watermark(&brokers.target, &target_topic, 65).await;
     stop.send(()).unwrap();
     run.await.unwrap().unwrap();

@@ -17,7 +17,7 @@ pub mod produce;
 pub mod read;
 
 pub use chain::{plan_chain, ChainObject};
-pub use follow::{ChainSource, ChainSourceConfig};
+pub use follow::{same_record, ChainSource, ChainSourceConfig};
 pub use mirror_core::RestoreTarget;
 pub use produce::{produce, OffsetMode, RestoreReport};
 pub use read::{BackupSource, BackupSummary, ObjectSummary, Reader};

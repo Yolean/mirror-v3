@@ -568,26 +568,7 @@ async fn run(path: PathBuf) -> Result<()> {
     // One shutdown channel, cloned per mirror. SIGINT and SIGTERM
     // trigger a graceful flush.
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let signal_tx = shutdown_tx.clone();
-    tokio::spawn(async move {
-        if tokio::signal::ctrl_c().await.is_ok() {
-            tracing::info!("received SIGINT; requesting graceful shutdown");
-            let _ = signal_tx.send(true);
-        }
-    });
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{signal, SignalKind};
-        let mut sigterm =
-            signal(SignalKind::terminate()).context("installing the SIGTERM handler")?;
-        let term_tx = shutdown_tx.clone();
-        tokio::spawn(async move {
-            if sigterm.recv().await.is_some() {
-                tracing::info!("received SIGTERM; requesting graceful shutdown");
-                let _ = term_tx.send(true);
-            }
-        });
-    }
+    install_shutdown_signals(&shutdown_tx)?;
 
     // Every *enabled* mirror gets a `CacheState` slot, regardless of
     // whether it has `http_access` or `notify`. The slot is what the
@@ -918,6 +899,33 @@ async fn fetch_low_watermark_for_mirror(mirror: &Mirror) -> Result<u64> {
     .with_context(|| format!("mirror {mirror_name}: low watermark task join"))?
     .with_context(|| format!("mirror {mirror_name}: fetch low watermark"))?;
     Ok(low)
+}
+
+/// SIGINT and SIGTERM set `shutdown_tx` to true. A SIGTERM handler that
+/// cannot be installed is an error: SIGTERM would then kill the process
+/// instead of stopping it gracefully.
+fn install_shutdown_signals(shutdown_tx: &tokio::sync::watch::Sender<bool>) -> Result<()> {
+    let signal_tx = shutdown_tx.clone();
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            tracing::info!("received SIGINT; requesting graceful shutdown");
+            let _ = signal_tx.send(true);
+        }
+    });
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut sigterm =
+            signal(SignalKind::terminate()).context("installing the SIGTERM handler")?;
+        let term_tx = shutdown_tx.clone();
+        tokio::spawn(async move {
+            if sigterm.recv().await.is_some() {
+                tracing::info!("received SIGTERM; requesting graceful shutdown");
+                let _ = term_tx.send(true);
+            }
+        });
+    }
+    Ok(())
 }
 
 async fn shutdown_signal(mut rx: tokio::sync::watch::Receiver<bool>) {
