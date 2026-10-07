@@ -11,10 +11,11 @@
 //!   before producing anything; `renumber` restores every record in
 //!   order at 0, 1, 2, ...
 //! - S3: a backup encrypted across a key rotation, restored from the
-//!   bucket through a read-only store. Docker only (kafka-native and
-//!   VersityGW).
+//!   bucket through a read-only store, on kafka-native and VersityGW,
+//!   and, `#[ignore]`d, on the broker and S3 endpoint the environment
+//!   names (see its test).
 //!
-//! The first two run against the Docker stack (kafka-native source,
+//! The others run against the Docker stack (kafka-native source,
 //! Redpanda target), and, `#[ignore]`d, against any broker named by
 //! `MIRROR_E2E_EXTERNAL_KAFKA=<bootstrap>` (one cluster for source and
 //! target, as on a host without Docker):
@@ -465,23 +466,66 @@ async fn holes(brokers: &Brokers) {
 /// a store that may only read: the disaster-recovery path.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_encrypted_s3_backup_restores_across_a_key_rotation() {
-    install_tracing();
     const BUCKET: &str = "mirror-v3";
     let stack = KafkaNativeToVersityGWStack::start(BUCKET)
         .await
         .expect("provision the Docker stack");
-    let broker = stack.source_bootstrap();
-    let s3: Arc<dyn ObjectStore> = Arc::new(
+    let s3 = s3_store(
+        &stack.s3_endpoint(),
+        BUCKET,
+        VERSITYGW_ACCESS_KEY,
+        VERSITYGW_SECRET_KEY,
+    );
+    s3_key_rotation(&stack.source_bootstrap(), s3).await;
+}
+
+/// The same against a broker and an S3 endpoint the environment names,
+/// for a host without Docker (VersityGW runs as a single binary):
+///
+///     MIRROR_E2E_EXTERNAL_KAFKA=localhost:9092 \
+///     MIRROR_E2E_EXTERNAL_S3=http://localhost:7070 \
+///       cargo test -p mirror-e2e --test restore_roundtrip external_an_encrypted -- --ignored
+///
+/// The bucket (`MIRROR_E2E_EXTERNAL_S3_BUCKET`, default `mirror-v3`)
+/// must exist; the credentials default to the Docker stack's
+/// (`MIRROR_E2E_EXTERNAL_S3_ACCESS_KEY_ID`,
+/// `MIRROR_E2E_EXTERNAL_S3_SECRET_ACCESS_KEY`). Every run writes under
+/// a prefix of its own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs MIRROR_E2E_EXTERNAL_KAFKA=<bootstrap> and MIRROR_E2E_EXTERNAL_S3=<endpoint>"]
+async fn external_an_encrypted_s3_backup_restores_across_a_key_rotation() {
+    let env = |name: &str, default: &str| std::env::var(name).unwrap_or_else(|_| default.into());
+    let endpoint = std::env::var("MIRROR_E2E_EXTERNAL_S3")
+        .expect("MIRROR_E2E_EXTERNAL_S3=<endpoint> names the S3 endpoint");
+    let s3 = s3_store(
+        &endpoint,
+        &env("MIRROR_E2E_EXTERNAL_S3_BUCKET", "mirror-v3"),
+        &env("MIRROR_E2E_EXTERNAL_S3_ACCESS_KEY_ID", VERSITYGW_ACCESS_KEY),
+        &env(
+            "MIRROR_E2E_EXTERNAL_S3_SECRET_ACCESS_KEY",
+            VERSITYGW_SECRET_KEY,
+        ),
+    );
+    s3_key_rotation(&external().source, s3).await;
+}
+
+fn s3_store(endpoint: &str, bucket: &str, key_id: &str, secret: &str) -> Arc<dyn ObjectStore> {
+    Arc::new(
         AmazonS3Builder::new()
-            .with_endpoint(stack.s3_endpoint())
+            .with_endpoint(endpoint)
             .with_allow_http(true)
             .with_region("us-east-1")
-            .with_bucket_name(BUCKET)
-            .with_access_key_id(VERSITYGW_ACCESS_KEY)
-            .with_secret_access_key(VERSITYGW_SECRET_KEY)
+            .with_bucket_name(bucket)
+            .with_access_key_id(key_id)
+            .with_secret_access_key(secret)
             .build()
             .expect("S3 client"),
-    );
+    )
+}
+
+async fn s3_key_rotation(broker: &str, s3: Arc<dyn ObjectStore>) {
+    install_tracing();
+    let broker = broker.to_string();
     let keys_dir = tempfile::tempdir().unwrap();
     std::fs::write(
         keys_dir.path().join("k1"),
@@ -494,7 +538,7 @@ async fn an_encrypted_s3_backup_restores_across_a_key_rotation() {
     )
     .unwrap();
     let keyring = Arc::new(Keyring::load(keys_dir.path()).unwrap());
-    let prefix = object_store::path::Path::from("sites/e2e");
+    let prefix = object_store::path::Path::from(unique("e2e/restore"));
     let dir = mirror_s3::partition_prefix(Some(&prefix), "ops", 0);
     let backup = S3Store::read_only(Arc::clone(&s3), dir);
 
@@ -534,10 +578,12 @@ async fn an_encrypted_s3_backup_restores_across_a_key_rotation() {
         let deadline = std::time::Instant::now() + Duration::from_secs(60);
         loop {
             let names = backup.list().await.unwrap();
-            let held = plan_chain(&names, Format::Parquet, 0, Some(&keyring))
-                .ok()
-                .and_then(|c| c.last().map(|o| o.to + 1))
-                .unwrap_or(0);
+            let held = if names.is_empty() {
+                0
+            } else {
+                let chain = plan_chain(&names, Format::Parquet, 0, Some(&keyring)).unwrap();
+                chain.last().map_or(0, |o| o.to + 1)
+            };
             if held == written {
                 break;
             }
@@ -557,7 +603,7 @@ async fn an_encrypted_s3_backup_restores_across_a_key_rotation() {
         );
     }
 
-    // Without k2 the chain is refused before any object is read.
+    // Without k2 the chain is refused from the names alone.
     let only_k1 = tempfile::tempdir().unwrap();
     std::fs::copy(keys_dir.path().join("k1"), only_k1.path().join("k1")).unwrap();
     let only_k1 = Keyring::load(only_k1.path()).unwrap();
