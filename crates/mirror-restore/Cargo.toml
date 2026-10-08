@@ -8,12 +8,14 @@ repository.workspace = true
 description = "Restore a mirror-v3 blob backup (filesystem or S3) into a Kafka topic"
 
 [dependencies]
+async-trait = { workspace = true }
 mirror-core = { workspace = true }
 mirror-envelope = { workspace = true }
 mirror-fs = { workspace = true }
 thiserror = { workspace = true }
+tokio = { workspace = true, features = ["time"] }
 tracing = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
-tokio = { workspace = true, features = ["rt", "macros"] }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "sync"] }

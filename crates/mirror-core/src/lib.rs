@@ -279,6 +279,24 @@ pub trait Source: Send {
     }
 }
 
+/// Where a one-shot restore writes, one partition: unlike a [`Sink`],
+/// records are sent many at a time and acknowledged later, since a
+/// restore does not resume (a failed one is deleted and run again).
+// async_trait marks the boxed future of each method #[must_use];
+// clippy 1.99 flags that as double_must_use in the expansion.
+#[allow(clippy::double_must_use)]
+#[async_trait]
+pub trait RestoreTarget: Send {
+    /// The partition's high watermark.
+    async fn high_watermark(&mut self) -> Result<u64, String>;
+    /// Send `record` to be stored at `offset`. May return before it is
+    /// stored; fails if a record sent earlier did not land at its
+    /// offset, naming that record's offset.
+    async fn send(&mut self, record: &Record, offset: u64) -> Result<(), String>;
+    /// Wait until every record sent is stored at its offset.
+    async fn finish(&mut self) -> Result<(), String>;
+}
+
 /// A destination for exactly-once mirroring. The sink owns the truth
 /// about "where we are" - the loop trusts `next_expected_offset`.
 // async_trait marks the boxed future of each default method #[must_use];
@@ -528,6 +546,11 @@ pub enum SourceError {
     /// them, so it is not retried.
     #[error("source position lost: {0}")]
     PositionLost(String),
+    /// The source contradicts what the mirror requires of it (a backup
+    /// read back as a source, with a gap or a hole the destination
+    /// cannot take). Trying again cannot fix it.
+    #[error("source inconsistent: {0}")]
+    Inconsistent(String),
 }
 
 impl SourceError {

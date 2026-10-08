@@ -6,14 +6,19 @@
 //! consumer positions. Restore reads that chain back: [`chain`]
 //! validates the names, [`read`] decodes and checks every object (the
 //! verify pass, which is also the "is the backup complete" check), and
-//! [`produce`] writes the records to a [`mirror_core::Sink`] (the Kafka
-//! destination, with its high-watermark gate before every produce).
+//! [`produce`] writes the records to a [`RestoreTarget`] (in production
+//! a Kafka producer with many records in flight, each checked to land
+//! at its offset). [`follow`] reads a backup as a mirror's source, for
+//! a restore that keeps up with the backup.
 
 pub mod chain;
+pub mod follow;
 pub mod produce;
 pub mod read;
 
 pub use chain::{plan_chain, ChainObject};
+pub use follow::{same_record, ChainSource, ChainSourceConfig};
+pub use mirror_core::RestoreTarget;
 pub use produce::{produce, OffsetMode, RestoreReport};
 pub use read::{BackupSource, BackupSummary, ObjectSummary, Reader};
 
@@ -38,8 +43,15 @@ pub enum RestoreError {
          topic only (delete and create it again, with the configuration it needs)"
     )]
     TargetNotEmpty(u64),
-    /// The target refused a record, could not be reached, or does not
-    /// hold what was produced.
+    /// The target could not be read before anything was produced.
     #[error("target: {0}")]
     Target(String),
+    /// The restore failed after records were sent (the target refused
+    /// one, the backup changed, a read failed), or the target does not
+    /// hold what was produced. Records sent may still be stored.
+    #[error(
+        "{0}. Records sent before this may still be stored: delete the topic and create it again \
+         before restoring again"
+    )]
+    Produce(String),
 }

@@ -65,7 +65,9 @@ enum Cmd {
     /// records, holes) without a target. Exits non-zero if the backup
     /// is incomplete, cannot be restored with the chosen offsets, the
     /// target topic is not empty, or the target's high watermark does
-    /// not match what was produced.
+    /// not match what was produced. With --follow, keep the target
+    /// restored as the backup grows, resuming where it is, until
+    /// SIGTERM or SIGINT.
     Restore {
         #[arg(short, long)]
         config: PathBuf,
@@ -103,6 +105,21 @@ enum Cmd {
             conflicts_with = "verify_only"
         )]
         topic: Option<String>,
+        /// Keep restoring: start at the target's high watermark (its
+        /// last record must be the backup's record there), produce each
+        /// object the backup's mirror adds, through the Kafka
+        /// destination's per-record gate, until SIGTERM or SIGINT.
+        #[arg(long, requires = "topic")]
+        follow: bool,
+        /// With --follow: how often to list the backup once every
+        /// object is restored, at least 100.
+        #[arg(
+            long,
+            default_value_t = 5000,
+            requires = "follow",
+            value_parser = clap::value_parser!(u64).range(100..)
+        )]
+        poll_interval_ms: u64,
     },
 }
 
@@ -157,6 +174,8 @@ fn main() -> ExitCode {
             verify_only,
             bootstrap_servers,
             topic,
+            follow,
+            poll_interval_ms,
         } => {
             let target = match (verify_only, bootstrap_servers, topic) {
                 (true, None, None) => None,
@@ -176,6 +195,7 @@ fn main() -> ExitCode {
                 offsets,
                 chain_start,
                 target,
+                follow: follow.then(|| std::time::Duration::from_millis(poll_interval_ms)),
             };
             let rt = match tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
@@ -187,7 +207,12 @@ fn main() -> ExitCode {
                     return ExitCode::from(1);
                 }
             };
-            match rt.block_on(restore::run_restore(args)) {
+            let result = rt.block_on(restore::run_restore(args));
+            // A broker query still blocking in the pool (a follower stopped
+            // during its startup) would hold the exit for up to its timeout;
+            // it holds nothing that needs finishing.
+            rt.shutdown_background();
+            match result {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(err) => {
                     eprintln!("error: {err:?}");
@@ -553,26 +578,7 @@ async fn run(path: PathBuf) -> Result<()> {
     // One shutdown channel, cloned per mirror. SIGINT and SIGTERM
     // trigger a graceful flush.
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let signal_tx = shutdown_tx.clone();
-    tokio::spawn(async move {
-        if tokio::signal::ctrl_c().await.is_ok() {
-            tracing::info!("received SIGINT; requesting graceful shutdown");
-            let _ = signal_tx.send(true);
-        }
-    });
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{signal, SignalKind};
-        let mut sigterm =
-            signal(SignalKind::terminate()).context("installing the SIGTERM handler")?;
-        let term_tx = shutdown_tx.clone();
-        tokio::spawn(async move {
-            if sigterm.recv().await.is_some() {
-                tracing::info!("received SIGTERM; requesting graceful shutdown");
-                let _ = term_tx.send(true);
-            }
-        });
-    }
+    install_shutdown_signals(&shutdown_tx)?;
 
     // Every *enabled* mirror gets a `CacheState` slot, regardless of
     // whether it has `http_access` or `notify`. The slot is what the
@@ -754,6 +760,12 @@ fn is_transient(err: &anyhow::Error) -> bool {
         if let Some(e) = cause.downcast_ref::<mirror_fs::BlobError>() {
             return matches!(e, mirror_fs::BlobError::Store(_));
         }
+        if let Some(e) = cause.downcast_ref::<mirror_restore::RestoreError>() {
+            return matches!(e, mirror_restore::RestoreError::Store(_));
+        }
+        if let Some(e) = cause.downcast_ref::<mirror_kafka::KafkaError>() {
+            return matches!(e, mirror_kafka::KafkaError::Read(_));
+        }
     }
     false
 }
@@ -903,6 +915,33 @@ async fn fetch_low_watermark_for_mirror(mirror: &Mirror) -> Result<u64> {
     .with_context(|| format!("mirror {mirror_name}: low watermark task join"))?
     .with_context(|| format!("mirror {mirror_name}: fetch low watermark"))?;
     Ok(low)
+}
+
+/// SIGINT and SIGTERM set `shutdown_tx` to true. A SIGTERM handler that
+/// cannot be installed is an error: SIGTERM would then kill the process
+/// instead of stopping it gracefully.
+fn install_shutdown_signals(shutdown_tx: &tokio::sync::watch::Sender<bool>) -> Result<()> {
+    let signal_tx = shutdown_tx.clone();
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            tracing::info!("received SIGINT; requesting graceful shutdown");
+            let _ = signal_tx.send(true);
+        }
+    });
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut sigterm =
+            signal(SignalKind::terminate()).context("installing the SIGTERM handler")?;
+        let term_tx = shutdown_tx.clone();
+        tokio::spawn(async move {
+            if sigterm.recv().await.is_some() {
+                tracing::info!("received SIGTERM; requesting graceful shutdown");
+                let _ = term_tx.send(true);
+            }
+        });
+    }
+    Ok(())
 }
 
 async fn shutdown_signal(mut rx: tokio::sync::watch::Receiver<bool>) {
@@ -1661,6 +1700,10 @@ mirrors:
             anyhow::Error::from(MirrorError::Source(SourceError::Transport("down".into()))),
             anyhow::Error::from(BlobError::Store("timeout".into())).context("opening s3 sink"),
             anyhow::Error::from(SinkError::Transport("503".into())).context("opening tee"),
+            anyhow::Error::from(mirror_restore::RestoreError::Store("503".into()))
+                .context("listing the backup"),
+            anyhow::Error::from(mirror_kafka::KafkaError::Read("timed out".into()))
+                .context("reading the target's last record"),
         ];
         for e in &transient {
             assert!(is_transient(e), "{e:#}");
@@ -1681,6 +1724,12 @@ mirrors:
             ))),
             anyhow::Error::from(BlobError::CorruptChain("overlap".into())).context("opening"),
             anyhow::anyhow!("environment variable S3_KEY is not set"),
+            anyhow::Error::from(MirrorError::Source(SourceError::Inconsistent(
+                "a hole".into(),
+            ))),
+            anyhow::Error::from(mirror_restore::RestoreError::Target("another topic".into())),
+            anyhow::Error::from(mirror_kafka::KafkaError::Gone("retention".into()))
+                .context("reading the target's last record"),
         ];
         for e in &fatal {
             assert!(!is_transient(e), "{e:#}");
