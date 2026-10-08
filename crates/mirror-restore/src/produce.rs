@@ -1,47 +1,17 @@
 //! Write a verified backup to the target, in order.
 //!
 //! The target is a [`RestoreTarget`]: in production
-//! [`mirror_kafka::RestoreProducer`], which keeps many records in
+//! `mirror_kafka::RestoreProducer`, which keeps many records in
 //! flight and requires each to land at the offset it was sent for.
 //! Restore adds the checks around it: the target must be empty before
 //! the first record, and its high watermark must equal the records
 //! produced after the last. A restore that fails part way is not
 //! resumed: the topic is deleted, created again, and restored again.
 
-use async_trait::async_trait;
-use mirror_core::Record;
+use mirror_core::RestoreTarget;
 use mirror_fs::blob::BlobStore;
 
 use crate::{BackupSummary, ChainObject, Reader, RestoreError};
-
-/// Where a restore writes, one partition.
-// async_trait marks the boxed future of each method #[must_use];
-// clippy 1.99 flags that as double_must_use in the expansion.
-#[allow(clippy::double_must_use)]
-#[async_trait]
-pub trait RestoreTarget: Send {
-    /// The partition's high watermark.
-    async fn high_watermark(&mut self) -> Result<u64, String>;
-    /// Send `record` to be stored at `offset`. May return before it is
-    /// stored; fails if a record sent earlier did not land at its
-    /// offset.
-    async fn send(&mut self, record: &Record, offset: u64) -> Result<(), String>;
-    /// Wait until every record sent is stored at its offset.
-    async fn finish(&mut self) -> Result<(), String>;
-}
-
-#[async_trait]
-impl RestoreTarget for mirror_kafka::RestoreProducer {
-    async fn high_watermark(&mut self) -> Result<u64, String> {
-        mirror_kafka::RestoreProducer::high_watermark(self).await
-    }
-    async fn send(&mut self, record: &Record, offset: u64) -> Result<(), String> {
-        mirror_kafka::RestoreProducer::send(self, record, offset).await
-    }
-    async fn finish(&mut self) -> Result<(), String> {
-        mirror_kafka::RestoreProducer::finish(self).await
-    }
-}
 
 /// Which offsets the records get in the target. There is no default:
 /// the choice depends on what reads the topic.
@@ -115,6 +85,51 @@ pub async fn produce<S: BlobStore>(
         return Err(RestoreError::TargetNotEmpty(start));
     }
     let mut next = 0u64;
+    if let Err(e) = send_all(reader, chain, summary, mode, target, &mut next).await {
+        if next == 0 {
+            // Nothing was sent: the target is as it was.
+            return Err(e);
+        }
+        // Whatever failed, records are in flight: wait for them, so that
+        // the error is the last thing that happens to the target.
+        let drained = match target.finish().await {
+            Ok(()) => String::new(),
+            Err(d) => format!(" (and waiting for the records in flight: {d})"),
+        };
+        return Err(RestoreError::Produce(format!(
+            "after sending {next} records: {e}{drained}"
+        )));
+    }
+    target
+        .finish()
+        .await
+        .map_err(|e| RestoreError::Produce(format!("target: waiting for the last records: {e}")))?;
+    let high_watermark = target
+        .high_watermark()
+        .await
+        .map_err(|e| RestoreError::Produce(format!("target: reading its high watermark: {e}")))?;
+    if high_watermark != next || next != summary.records {
+        return Err(RestoreError::Produce(format!(
+            "target: produced {next} of the backup's {} records, and its high watermark is \
+             {high_watermark}",
+            summary.records
+        )));
+    }
+    Ok(RestoreReport {
+        records: next,
+        high_watermark,
+    })
+}
+
+/// Send every record of `chain` in order, counting in `next`.
+async fn send_all<S: BlobStore>(
+    reader: &Reader<'_, S>,
+    chain: &[ChainObject],
+    summary: &BackupSummary,
+    mode: OffsetMode,
+    target: &mut dyn RestoreTarget,
+    next: &mut u64,
+) -> Result<(), RestoreError> {
     for (object, verified) in chain.iter().zip(&summary.objects) {
         let (records, digest) = reader.read_object_with_digest(object).await?;
         if digest != verified.digest {
@@ -126,47 +141,29 @@ pub async fn produce<S: BlobStore>(
         for mut record in records {
             match mode {
                 OffsetMode::Preserve => {
-                    if record.source_offset != next {
+                    if record.source_offset != *next {
                         return Err(RestoreError::Mode(format!(
                             "--offsets=preserve: offset {next} is missing (next record is at {})",
                             record.source_offset
                         )));
                     }
                 }
-                OffsetMode::Renumber => record.source_offset = next,
+                OffsetMode::Renumber => record.source_offset = *next,
             }
             // The error names its own offset: a delivery that failed is
             // reported for a record sent earlier.
             target
-                .send(&record, next)
+                .send(&record, *next)
                 .await
-                .map_err(RestoreError::Produce)?;
-            next += 1;
+                .map_err(RestoreError::Target)?;
+            *next += 1;
         }
         tracing::info!(
             object = %reader.store.location(&object.name),
             records = verified.records,
-            target_next = next,
+            target_next = *next,
             "sent"
         );
     }
-    target
-        .finish()
-        .await
-        .map_err(|e| RestoreError::Produce(format!("waiting for the last records: {e}")))?;
-    let high_watermark = target
-        .high_watermark()
-        .await
-        .map_err(|e| RestoreError::Produce(format!("reading its high watermark: {e}")))?;
-    if high_watermark != next || next != summary.records {
-        return Err(RestoreError::Produce(format!(
-            "produced {next} of the backup's {} records, and the target's high watermark is \
-             {high_watermark}",
-            summary.records
-        )));
-    }
-    Ok(RestoreReport {
-        records: next,
-        high_watermark,
-    })
+    Ok(())
 }

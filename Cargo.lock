@@ -1944,7 +1944,6 @@ dependencies = [
  "mirror-core",
  "mirror-envelope",
  "mirror-fs",
- "mirror-kafka",
  "tempfile",
  "thiserror",
  "tokio",

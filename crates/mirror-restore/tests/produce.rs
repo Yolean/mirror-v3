@@ -23,6 +23,7 @@ struct MockTarget {
     sent: Vec<(u64, Record)>,
     refuse_offset: Option<u64>,
     finish_error: Option<String>,
+    finished: u32,
 }
 
 impl MockTarget {
@@ -59,6 +60,7 @@ impl RestoreTarget for MockTarget {
     }
 
     async fn finish(&mut self) -> Result<(), String> {
+        self.finished += 1;
         self.finish_error.clone().map_or(Ok(()), Err)
     }
 }
@@ -270,7 +272,7 @@ async fn a_high_watermark_that_does_not_match_at_the_end_is_an_error() {
         .unwrap_err();
     assert!(
         err.to_string()
-            .contains("produced 4 of the backup's 4 records, and the target's high watermark is 5"),
+            .contains("produced 4 of the backup's 4 records, and its high watermark is 5"),
         "{err}"
     );
 }
@@ -300,11 +302,39 @@ async fn an_object_replaced_after_the_verify_pass_ends_the_restore() {
     )
     .await
     .unwrap_err();
+    assert!(matches!(err, RestoreError::Produce(_)), "{err}");
+    assert!(
+        err.to_string()
+            .contains("after sending 5 records: backup object:"),
+        "{err}"
+    );
     assert!(
         err.to_string()
             .contains("changed after the verify pass read it"),
         "{err}"
     );
     assert!(err.to_string().contains(&name), "{err}");
+    assert!(
+        err.to_string()
+            .contains("delete the topic and create it again"),
+        "{err}"
+    );
     assert_eq!(target.sent.len(), 5, "the first object was produced");
+    assert_eq!(target.finished, 1, "the records in flight were waited for");
+}
+
+#[tokio::test]
+async fn a_record_refused_before_anything_is_sent_leaves_the_target_as_it_was() {
+    let backup = Backup::write(&(0..4).map(rec).collect::<Vec<_>>(), 5).await;
+    let mut target = MockTarget {
+        refuse_offset: Some(0),
+        ..MockTarget::at(0)
+    };
+    let err = backup
+        .restore(0, OffsetMode::Preserve, &mut target)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, RestoreError::Target(_)), "{err}");
+    assert!(!err.to_string().contains("delete the topic"), "{err}");
+    assert_eq!(target.finished, 0);
 }

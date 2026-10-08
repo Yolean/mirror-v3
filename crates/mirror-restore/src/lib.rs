@@ -15,7 +15,8 @@ pub mod produce;
 pub mod read;
 
 pub use chain::{plan_chain, ChainObject};
-pub use produce::{produce, OffsetMode, RestoreReport, RestoreTarget};
+pub use mirror_core::RestoreTarget;
+pub use produce::{produce, OffsetMode, RestoreReport};
 pub use read::{BackupSource, BackupSummary, ObjectSummary, Reader};
 
 #[derive(Debug, thiserror::Error)]
@@ -42,11 +43,12 @@ pub enum RestoreError {
     /// The target could not be read before anything was produced.
     #[error("target: {0}")]
     Target(String),
-    /// Producing failed, or the target does not hold what was produced.
-    /// Records sent before the failure may still be stored.
+    /// The restore failed after records were sent (the target refused
+    /// one, the backup changed, a read failed), or the target does not
+    /// hold what was produced. Records sent may still be stored.
     #[error(
-        "target: {0}. Records sent before this may still be stored: delete the topic and create \
-         it again before restoring again"
+        "{0}. Records sent before this may still be stored: delete the topic and create it again \
+         before restoring again"
     )]
     Produce(String),
 }

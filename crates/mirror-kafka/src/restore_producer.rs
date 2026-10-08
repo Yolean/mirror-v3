@@ -16,7 +16,8 @@
 use std::collections::VecDeque;
 use std::time::Duration;
 
-use mirror_core::{ColumnType, Record};
+use async_trait::async_trait;
+use mirror_core::{ColumnType, Record, RestoreTarget};
 use rdkafka::config::ClientConfig;
 use rdkafka::error::{KafkaError as RdKafkaError, RDKafkaErrorCode};
 use rdkafka::producer::{DeliveryFuture, FutureProducer, FutureRecord, Producer};
@@ -85,8 +86,29 @@ impl RestoreProducer {
         })
     }
 
+    async fn ack_oldest(&mut self) -> Result<(), String> {
+        let Some((offset, delivery)) = self.in_flight.pop_front() else {
+            return Ok(());
+        };
+        let delivered = delivery
+            .await
+            .map_err(|_| format!("offset {offset}: the producer dropped the delivery report"))?
+            .map_err(|(e, _)| format!("offset {offset} was not delivered: {e}"))?;
+        if delivered.partition != self.partition || delivered.offset != offset as i64 {
+            return Err(format!(
+                "sent for offset {offset}, the broker stored it at {}/{} offset {}: another \
+                 writer on the partition, or a record lost or written twice",
+                self.topic, delivered.partition, delivered.offset
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl RestoreTarget for RestoreProducer {
     /// The partition's high watermark, from the broker.
-    pub async fn high_watermark(&self) -> Result<u64, String> {
+    async fn high_watermark(&mut self) -> Result<u64, String> {
         let bootstrap = self.bootstrap_servers.clone();
         let topic = self.topic.clone();
         let partition = self.partition;
@@ -104,7 +126,7 @@ impl RestoreProducer {
     /// queued; waits first for the oldest record in flight when the
     /// window is full, and fails if that one did not land at its
     /// offset.
-    pub async fn send(&mut self, record: &Record, offset: u64) -> Result<(), String> {
+    async fn send(&mut self, record: &Record, offset: u64) -> Result<(), String> {
         self.keys.validate("key", offset, record.key.as_deref())?;
         self.values
             .validate("value", offset, record.value.as_deref())?;
@@ -142,7 +164,7 @@ impl RestoreProducer {
     }
 
     /// Wait until every record sent has landed at its offset.
-    pub async fn finish(&mut self) -> Result<(), String> {
+    async fn finish(&mut self) -> Result<(), String> {
         while !self.in_flight.is_empty() {
             self.ack_oldest().await?;
         }
@@ -150,29 +172,11 @@ impl RestoreProducer {
             .flush(Timeout::After(self.watermark_timeout))
             .map_err(|e| format!("flush: {e}"))
     }
-
-    async fn ack_oldest(&mut self) -> Result<(), String> {
-        let Some((offset, delivery)) = self.in_flight.pop_front() else {
-            return Ok(());
-        };
-        let delivered = delivery
-            .await
-            .map_err(|_| format!("offset {offset}: the producer dropped the delivery report"))?
-            .map_err(|(e, _)| format!("offset {offset} was not delivered: {e}"))?;
-        if delivered.partition != self.partition || delivered.offset != offset as i64 {
-            return Err(format!(
-                "sent for offset {offset}, the broker stored it at {}/{} offset {}: another \
-                 writer on the partition, or a record lost or written twice",
-                self.topic, delivered.partition, delivered.offset
-            ));
-        }
-        Ok(())
-    }
 }
 
 #[cfg(test)]
 mod tests {
-    use mirror_core::{ColumnType, Record, TimestampType};
+    use mirror_core::{ColumnType, Record, RestoreTarget, TimestampType};
 
     use super::RestoreProducer;
 
