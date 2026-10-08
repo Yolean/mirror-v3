@@ -9,6 +9,7 @@ use mirror_config::{Destination, HttpAccess, Mirror};
 mod ack_tracker;
 mod knobs;
 mod readiness_poller;
+mod restore;
 use ack_tracker::{
     final_commit, spawn_periodic_commit_task, AckTracker, DestAckSlot, FlushAckShim, WriteAckShim,
 };
@@ -58,6 +59,51 @@ enum Cmd {
         #[arg(long, default_value = "table")]
         format: StatusFormat,
     },
+    /// Read one mirror's blob backup (filesystem or S3) back into a
+    /// Kafka topic, in order, after verifying every object. With
+    /// --verify-only, verify and print the summary (objects, offsets,
+    /// records, holes) without a target. Exits non-zero if the backup
+    /// is incomplete, cannot be restored with the chosen offsets, the
+    /// target topic is not empty, or the target's high watermark does
+    /// not match what was produced.
+    Restore {
+        #[arg(short, long)]
+        config: PathBuf,
+        /// The mirror whose backup to read.
+        #[arg(long)]
+        mirror: String,
+        /// The destination to read, by name; required when the mirror
+        /// has more than one.
+        #[arg(long)]
+        destination: Option<String>,
+        /// Which offsets the records get in the target. `preserve`:
+        /// each at its original offset (the backup must start at 0 and
+        /// have no holes). `renumber`: 0, 1, 2, ... in original order.
+        #[arg(long, value_enum)]
+        offsets: restore::OffsetsArg,
+        /// The offset the backup starts at, when objects before it were
+        /// removed on purpose.
+        #[arg(long, default_value_t = 0)]
+        chain_start: u64,
+        /// Verify the backup and print its summary; produce nothing.
+        #[arg(long)]
+        verify_only: bool,
+        /// `bootstrap.servers` of the target cluster.
+        #[arg(
+            long,
+            required_unless_present = "verify_only",
+            conflicts_with = "verify_only"
+        )]
+        bootstrap_servers: Option<String>,
+        /// The target topic, which must exist and be empty. The
+        /// partition is the mirror's.
+        #[arg(
+            long,
+            required_unless_present = "verify_only",
+            conflicts_with = "verify_only"
+        )]
+        topic: Option<String>,
+    },
 }
 
 #[derive(Copy, Clone, clap::ValueEnum)]
@@ -96,6 +142,53 @@ fn main() -> ExitCode {
                         ExitCode::SUCCESS
                     }
                 }
+                Err(err) => {
+                    eprintln!("error: {err:?}");
+                    ExitCode::from(1)
+                }
+            }
+        }
+        Cmd::Restore {
+            config,
+            mirror,
+            destination,
+            offsets,
+            chain_start,
+            verify_only,
+            bootstrap_servers,
+            topic,
+        } => {
+            let target = match (verify_only, bootstrap_servers, topic) {
+                (true, None, None) => None,
+                (false, Some(bootstrap_servers), Some(topic)) => Some(restore::Target {
+                    bootstrap_servers,
+                    topic,
+                }),
+                _ => unreachable!(
+                    "clap requires --bootstrap-servers and --topic unless --verify-only, \
+                     which conflicts with both"
+                ),
+            };
+            let args = restore::RestoreArgs {
+                config,
+                mirror,
+                destination,
+                offsets,
+                chain_start,
+                target,
+            };
+            let rt = match tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(err) => {
+                    eprintln!("error: tokio init: {err}");
+                    return ExitCode::from(1);
+                }
+            };
+            match rt.block_on(restore::run_restore(args)) {
+                Ok(()) => ExitCode::SUCCESS,
                 Err(err) => {
                     eprintln!("error: {err:?}");
                     ExitCode::from(1)

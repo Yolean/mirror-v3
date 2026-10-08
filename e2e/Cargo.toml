@@ -17,6 +17,7 @@ mirror-fs = { workspace = true }
 mirror-s3 = { workspace = true }
 mirror-config = { workspace = true }
 mirror-notify-kkv = { workspace = true }
+mirror-restore = { workspace = true }
 axum = { workspace = true }
 async-trait = { workspace = true }
 anyhow = { workspace = true }

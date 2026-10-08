@@ -212,19 +212,20 @@ fn file_extension(name: &str) -> Option<&str> {
     Some(&name[dot + 1..])
 }
 
-/// Decode a blob, with the key its name carries if it has one.
+/// Decode a blob, with the key its name carries if it has one;
+/// `keyring` is `None` for a destination with `encryption: none`.
 pub fn decode_blob(
     name: &str,
     location: &str,
     bytes: &[u8],
     format: Format,
-    encryption: Option<&BlobEncryption>,
+    keyring: Option<&mirror_envelope::Keyring>,
 ) -> Result<Vec<Record>, BlobError> {
     let key_id = naming::parse_blob_name(name, format.extension()).and_then(|b| b.key_id);
     let decoded = match key_id {
         None => mirror_envelope::decode_batch(format, bytes),
         Some(id) => {
-            let ring = encryption.map(|e| &e.keyring).ok_or_else(|| {
+            let ring = keyring.ok_or_else(|| {
                 BlobError::Store(format!(
                     "{location} is encrypted with Parquet key {id}, and this destination has \
                      `encryption: none`"
@@ -248,7 +249,13 @@ pub fn decode_view(
     format: Format,
     encryption: Option<&BlobEncryption>,
 ) -> Result<BTreeMap<String, Record>, BlobError> {
-    let records = decode_blob(name, location, bytes, format, encryption)?;
+    let records = decode_blob(
+        name,
+        location,
+        bytes,
+        format,
+        encryption.map(|e| e.keyring.as_ref()),
+    )?;
     let mut view = BTreeMap::new();
     for r in records {
         let key_bytes = r.key.as_ref().ok_or_else(|| {

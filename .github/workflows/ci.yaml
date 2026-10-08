@@ -73,7 +73,9 @@ jobs:
         docker pull ghcr.io/shopify/toxiproxy:2.12.0 &
         wait
     - name: cargo test mirror-e2e
-      run: cargo test -p mirror-e2e --locked -- --test-threads=1
+      # --no-fail-fast: every test binary runs; without it cargo stops
+      # at the first failing one and the rest report nothing.
+      run: cargo test -p mirror-e2e --locked --no-fail-fast -- --test-threads=1
 
   image:
     name: build + push image

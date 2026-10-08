@@ -1781,10 +1781,12 @@ dependencies = [
  "mirror-fs",
  "mirror-kafka",
  "mirror-notify-kkv",
+ "mirror-restore",
  "mirror-s3",
  "object_store",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -1854,6 +1856,7 @@ dependencies = [
  "mirror-fs",
  "mirror-kafka",
  "mirror-notify-kkv",
+ "mirror-restore",
  "mirror-s3",
  "object_store",
  "portpicker",
@@ -1931,6 +1934,19 @@ dependencies = [
  "tower",
  "tracing",
  "url",
+]
+
+[[package]]
+name = "mirror-restore"
+version = "0.1.0"
+dependencies = [
+ "mirror-core",
+ "mirror-envelope",
+ "mirror-fs",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

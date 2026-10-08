@@ -124,6 +124,7 @@ assert_eq!(resp.status(), StatusCode::OK);
 - `kafka_helpers::create_topic`, `produce_records`, `drain_partition`; Kafka fixture utilities.
 - `mirror_runner::spawn_kafka_to_filesystem`, `spawn_kafka_to_s3`, `spawn_kafka_to_tee`; start a mirror in-process against the provisioned source/sink.
 - `stack.source_bootstrap()`, `stack.target_kafka_bootstrap()`, `stack.s3_endpoint()`, `stack.target_down()`; environment handles.
+- `restore_roundtrip.rs` runs each scenario on the Docker stack and, `#[ignore]`d, on the broker `MIRROR_E2E_EXTERNAL_KAFKA=<bootstrap>` names (`cargo test -p mirror-e2e --test restore_roundtrip -- --ignored`), for a host without Docker: Apache Kafka's release runs in KRaft mode from its tarball with a JDK, no root needed. The S3 scenario also needs `MIRROR_E2E_EXTERNAL_S3=<endpoint>` (VersityGW runs as a single binary; see the test for the bucket and credentials).
 
 **When to escalate to L7:** the spec needs a broker behaviour we don't yet have a harness for (real compaction, multi-broker metadata race, large-scale fixtures).
 

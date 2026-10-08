@@ -322,6 +322,7 @@ pub struct S3MirrorSpec {
     pub compaction: Option<mirror_s3::CompactionMode>,
     pub cache: Option<mirror_core::CacheBinding>,
     pub flush: mirror_s3::FlushTriggers,
+    pub encryption: Option<mirror_fs::BlobEncryption>,
 }
 
 pub async fn spawn_kafka_to_s3(spec: S3MirrorSpec) -> Result<MirrorHandle> {
@@ -349,7 +350,7 @@ pub async fn spawn_kafka_to_s3(spec: S3MirrorSpec) -> Result<MirrorHandle> {
         keys: spec.keys,
         values: spec.values,
         compaction: spec.compaction,
-        encryption: None,
+        encryption: spec.encryption,
         flush: spec.flush,
     };
     let sink = S3Sink::open(sink_cfg).await.context("open S3Sink")?;

@@ -56,10 +56,11 @@ pub struct S3SinkConfig {
 }
 
 /// One partition prefix in an object store, reached with two identities:
-/// one that lists and reads, one that writes.
+/// one that lists and reads, one that writes (none for a restore, which
+/// only reads).
 pub struct S3Store {
     read: Arc<dyn ObjectStore>,
-    write: Arc<dyn ObjectStore>,
+    write: Option<Arc<dyn ObjectStore>>,
     partition_prefix: Path,
 }
 
@@ -71,7 +72,16 @@ impl S3Store {
     ) -> Self {
         Self {
             read,
-            write,
+            write: Some(write),
+            partition_prefix,
+        }
+    }
+
+    /// A store that lists and reads only: a write is an error.
+    pub fn read_only(read: Arc<dyn ObjectStore>, partition_prefix: Path) -> Self {
+        Self {
+            read,
+            write: None,
             partition_prefix,
         }
     }
@@ -103,12 +113,16 @@ impl BlobStore for S3Store {
 
     async fn put_new(&self, name: &str, bytes: Vec<u8>) -> Result<(), BlobError> {
         let path = self.path(name);
+        let Some(write) = &self.write else {
+            return Err(BlobError::Store(format!(
+                "put {path}: this store was opened to read only"
+            )));
+        };
         let opts = PutOptions {
             mode: PutMode::Create,
             ..Default::default()
         };
-        match self
-            .write
+        match write
             .put_opts(&path, PutPayload::from(Bytes::from(bytes)), opts)
             .await
         {
@@ -193,7 +207,7 @@ impl S3Sink {
     #[doc(hidden)]
     pub async fn open_with_clock(cfg: S3SinkConfig, clock: UnixClock) -> Result<Self, S3Error> {
         let partition_prefix =
-            build_prefix(cfg.prefix.as_ref(), &cfg.destination_name, cfg.partition);
+            partition_prefix(cfg.prefix.as_ref(), &cfg.destination_name, cfg.partition);
         let spec = BlobSpec {
             format: cfg.format,
             compression: cfg.compression,
@@ -252,7 +266,9 @@ impl Sink for S3Sink {
     }
 }
 
-fn build_prefix(root: Option<&Path>, destination_name: &str, partition: u32) -> Path {
+/// The directory of one destination's partition:
+/// `<prefix>/<destination_name>/<partition>`.
+pub fn partition_prefix(root: Option<&Path>, destination_name: &str, partition: u32) -> Path {
     let mut parts: Vec<String> = Vec::new();
     if let Some(p) = root {
         for part in p.parts() {
@@ -266,9 +282,30 @@ fn build_prefix(root: Option<&Path>, destination_name: &str, partition: u32) -> 
 
 #[cfg(test)]
 mod tests {
-    use object_store::path::Path;
+    use std::sync::Arc;
 
-    use super::name_in_directory;
+    use mirror_fs::blob::BlobStore;
+    use object_store::memory::InMemory;
+    use object_store::path::Path;
+    use object_store::ObjectStore;
+
+    use super::{name_in_directory, partition_prefix, S3Store};
+
+    #[tokio::test]
+    async fn a_read_only_store_lists_and_reads_and_refuses_writes() {
+        let mem: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let dir = partition_prefix(Some(&Path::from("sites/x")), "operations", 0);
+        assert_eq!(dir.as_ref(), "sites/x/operations/0");
+        S3Store::new(Arc::clone(&mem), Arc::clone(&mem), dir.clone())
+            .put_new("a", b"x".to_vec())
+            .await
+            .unwrap();
+        let ro = S3Store::read_only(mem, dir);
+        assert_eq!(ro.list().await.unwrap(), ["a"]);
+        assert_eq!(ro.get("a").await.unwrap(), b"x");
+        let err = ro.put_new("b", Vec::new()).await.unwrap_err();
+        assert!(err.to_string().contains("opened to read only"), "{err}");
+    }
 
     #[test]
     fn a_folder_placeholder_is_not_an_object_of_the_directory() {

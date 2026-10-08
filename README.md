@@ -24,6 +24,7 @@ mirror-v3 validate --config config.yaml             # parse-only
 mirror-v3 run --config config.yaml                  # start the configured mirrors
 mirror-v3 status --config config.yaml               # one-shot health check, table format
 mirror-v3 status --config config.yaml --format json # same, machine-readable
+mirror-v3 restore --config config.yaml --mirror <name> --offsets preserve|renumber ...  # see Restore
 ```
 
 `status` queries the source Kafka high watermark and the destination's `next-expected-offset` for every mirror in the config and prints the lag. Exits non-zero if any mirror failed to query (unreachable broker, corrupt destination chain, etc.). Useful as a `kubectl exec` health probe before/during/after an appliance backup, without having to ssh to the node.
@@ -85,6 +86,57 @@ Also exposed on the same port:
 - `GET /docs` — Scalar UI rendering the spec.
 
 Bootstrap: a cache is built by reading the source topic from its low watermark, as kafka-keyvalue does, never from a destination. A cache does not need S3 to start and is not stalled by a slow destination when it is the only thing its mirror does, and a blob destination's startup reads object names only. On a mirror that has destinations too, the source is read from the low watermark and the destinations skip what they already hold. Put a cache in its own mirror when its availability must not depend on a destination: a cache mirror's failure ends the process, a destination's failure included. Whether a cache should share a mirror with destinations at all is open; see [Open design questions](#open-design-questions).
+
+## Restore
+
+`mirror-v3 restore` reads one mirror's blob backup (S3 or filesystem) back into a Kafka topic: disaster recovery from the bucket alone, after the cluster that wrote it is gone.
+
+```sh
+# Is the backup complete? Reads and decrypts every object, prints a summary, produces nothing.
+mirror-v3 restore --config mirror-v3.yaml --mirror operations-backup --offsets preserve --verify-only
+
+# Restore it into an empty topic.
+mirror-v3 restore --config mirror-v3.yaml --mirror operations-backup --offsets preserve \
+  --bootstrap-servers kafka:9092 --topic <topic>
+```
+
+| Flag | |
+|---|---|
+| `--config`, `--mirror` | The config and mirror that wrote the backup. The backup is that mirror's destination: its directory (`<prefix>/<name>/<partition>/`, or `<root>/<name>/<partition>/`), `format`, `keys`/`values`, encryption `keys-dir` and `credentials.read` are used as they are. The whole config is loaded and validated as for `run`, so its environment variables must be set, and the mirror's `topic` must be the topic the backup was taken of (every record is checked against it). |
+| `--destination` | The destination to read, by `name`; required when the mirror has more than one. A Kafka destination or a `compaction: log` mirror (whose objects are snapshots, not the topic's records) is refused. |
+| `--offsets` | `preserve` or `renumber`, required: see below. |
+| `--chain-start` | The offset the backup starts at, default 0. A chain that starts anywhere else is an error unless this says so, so objects removed from its head are never missed silently. |
+| `--verify-only` | Stop after the verify pass. |
+| `--bootstrap-servers`, `--topic` | The target: partition `partition` (the mirror's) of an existing, empty topic. |
+
+Every run first lists the backup and validates the chain of object names (sorted, no gap, no overlap, starting at `--chain-start`, every key id it names present in `keys-dir`), then reads every object and checks it against its name (records in increasing offset order inside `<from>-<to>`, the last at `to`) and the mirror's topic and partition. It prints the summary to stdout:
+
+```
+backup: s3://<bucket>/sites/<site>/operations/0 (mirror operations-backup, destination operations)
+source: <topic>/0
+objects: 3
+offsets: 0-24999
+records: 25000
+holes: 0
+```
+
+`holes` are positions of the chain without a record (see [Offset holes](#operational-invariants)): records compaction removed before they were backed up, and transaction markers. Every transaction marker takes an offset, so a topic written in transactions has holes on either broker (Apache Kafka writes a marker after each transaction, Redpanda also one before it, so on Redpanda from offset 0, even after one transaction) and restores only with `renumber`. Any failed check exits non-zero with the reason, and so does `--verify-only` when the backup cannot be restored with the `--offsets` given; `--verify-only` is the scheduled "is the backup complete" check.
+
+Then the records are produced in order, each with its key, value (tombstones included), headers and timestamp, through the Kafka destination: the target's high watermark is read before every produce and must equal the record's target offset, the producer never retries, and the broker must report that offset back. The target must be empty (high watermark 0) before the first record, and its high watermark must equal the records produced after the last; otherwise restore exits non-zero. One record at a time with a watermark read each is slow: about 140 records/s against a local broker (librdkafka's `linger.ms` and two round trips per record), so a million records take about two hours.
+
+The two offset modes:
+
+- **`preserve`**: every record at its original offset. For topics whose readers key on offsets, such as an operations topic that a downstream index keys rows on and resumes from `MAX(offset)`. A Kafka topic starts at 0 and cannot be written with holes, so a backup that starts after 0 or has a hole is refused before anything is produced, naming the first hole. After a `preserve` restore the topic continues the backup's chain exactly, so the backup mirror resumes on the same prefix where it stopped.
+- **`renumber`**: the records at 0, 1, 2, ... in their original order, for compacted topics (user-states), where holes are expected and keys, values and order are what matter. What changes: every offset from the first hole on (the topic is shorter than the chain by the number of holes), so committed consumer-group offsets and anything else that stores offsets of the old topic do not apply to the new one. Superseded values and tombstones are produced too; the broker compacts the restored topic by its own `cleanup.policy`. The backup's chain now ends past the restored topic's high watermark, so a backup mirror of the restored topic must write a new chain (another destination `name` or `prefix`): on the old one it stops with "the destination is ahead of the source".
+
+In both modes a record's timestamp is produced as its CreateTime, also for a record whose source topic stamped LogAppendTime; a target topic with `message.timestamp.type=LogAppendTime` restamps every record at restore time. A record without a timestamp gets the producer's clock.
+
+Restore does not create the target topic (its partitions, `cleanup.policy` and retention are the operator's decision) and does not resume: a restore that fails part way leaves a topic that the next run refuses as not empty, so delete and create it again and rerun.
+
+What disaster recovery needs besides the bucket:
+
+- An S3 identity that may list **and get** objects under the prefix, in the variables `credentials.read` names. A least-privilege `read` identity that only lists (the mirror needs no more in append mode) cannot restore. Restore opens the store read-only: the `write` identity's variables need not be set.
+- Every Parquet key the objects name (`.k-<key id>.parquet`), in `keys-dir`. A key kept only on the lost machine makes its objects unreadable: keep the keys where the bucket's backups can be restored without that machine.
 
 ## Observability
 
