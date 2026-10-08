@@ -214,6 +214,10 @@ impl Backup<'_> {
         }
     }
 
+    /// Follow the backup until SIGTERM or SIGINT. A failure that trying
+    /// again can fix (an unreachable store or broker) opens the follower
+    /// again after a backoff, as `run` does for a mirror; any other ends
+    /// it.
     async fn follow<S: BlobStore + Send + Sync + 'static>(
         &self,
         store: Arc<S>,
@@ -222,15 +226,85 @@ impl Backup<'_> {
         target: Target,
         poll_interval: Duration,
     ) -> Result<()> {
-        // First, so that a SIGTERM during startup stops the follower once
-        // it runs, rather than killing it.
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         super::install_shutdown_signals(&shutdown_tx)?;
+        let mut backoff = super::RESTART_BACKOFF_MIN;
+        loop {
+            let started = std::time::Instant::now();
+            // Startup (listing, counting, the resume check) stops at a
+            // signal too: it only reads.
+            let opened = tokio::select! {
+                opened = self.open_follow(&store, location, &keyring, &target, poll_interval) => opened,
+                _ = super::shutdown_signal(shutdown_rx.clone()) => {
+                    println!("stopped");
+                    return Ok(());
+                }
+            };
+            let result = match opened {
+                Ok((source, sink, at)) => {
+                    println!(
+                        "following: {location} into {}/{} from offset {at}",
+                        target.topic, self.source.partition
+                    );
+                    mirror_core::run_mirror(
+                        source,
+                        sink,
+                        super::shutdown_signal(shutdown_rx.clone()),
+                    )
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "following into {}/{} at {}",
+                            target.topic, self.source.partition, target.bootstrap_servers
+                        )
+                    })
+                }
+                Err(e) => Err(e),
+            };
+            let err = match result {
+                Ok(()) => {
+                    println!("stopped");
+                    return Ok(());
+                }
+                Err(e) => e,
+            };
+            if *shutdown_rx.borrow() || !super::is_transient(&err) {
+                return Err(err);
+            }
+            if started.elapsed() > super::RESTART_BACKOFF_MAX {
+                backoff = super::RESTART_BACKOFF_MIN;
+            }
+            tracing::error!(
+                error = %format!("{err:#}"),
+                retry_in_s = backoff.as_secs(),
+                "following failed; it resumes at the target's high watermark, so it is opened again"
+            );
+            tokio::select! {
+                _ = tokio::time::sleep(backoff) => {}
+                _ = super::shutdown_signal(shutdown_rx.clone()) => {
+                    println!("stopped");
+                    return Ok(());
+                }
+            }
+            backoff = (backoff * 2).min(super::RESTART_BACKOFF_MAX);
+        }
+    }
+
+    /// Open the backup as a source and the target as a destination, and
+    /// check that a target that is not empty may be resumed.
+    async fn open_follow<S: BlobStore + Send + Sync + 'static>(
+        &self,
+        store: &Arc<S>,
+        location: &str,
+        keyring: &Option<Arc<Keyring>>,
+        target: &Target,
+        poll_interval: Duration,
+    ) -> Result<(ChainSource<S>, KafkaSink, u64)> {
         let mut source = ChainSource::open(ChainSourceConfig {
-            store,
+            store: Arc::clone(store),
             location: location.to_string(),
             format: self.format,
-            keyring,
+            keyring: keyring.clone(),
             source: self.source.clone(),
             mode: self.mode,
             chain_start: self.chain_start,
@@ -268,27 +342,14 @@ impl Backup<'_> {
                 )
             })
             .await?
-            .context("reading the target's last record")?;
+            .context("reading the target's last record, to check that it is this backup's")?;
             source.check_resume(at, &last).await?;
             tracing::info!(
                 offset = at - 1,
                 "the target's last record is the backup's; resuming"
             );
         }
-        println!(
-            "following: {location} into {}/{} from offset {at}",
-            target.topic, self.source.partition
-        );
-        mirror_core::run_mirror(source, sink, super::shutdown_signal(shutdown_rx))
-            .await
-            .with_context(|| {
-                format!(
-                    "following into {}/{} at {}",
-                    target.topic, self.source.partition, target.bootstrap_servers
-                )
-            })?;
-        println!("stopped");
-        Ok(())
+        Ok((source, sink, at))
     }
 
     async fn run<S: BlobStore>(

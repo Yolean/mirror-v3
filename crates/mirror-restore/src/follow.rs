@@ -22,7 +22,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use mirror_core::{Record, Source, SourceError};
+use mirror_core::{Record, Source, SourceError, TimestampType};
 use mirror_envelope::{Format, Keyring};
 use mirror_fs::blob::BlobStore;
 
@@ -72,6 +72,9 @@ pub struct ChainSource<S> {
     /// the run loop's idle drift check runs.
     idle_until: Option<tokio::time::Instant>,
     opened_at: std::time::Instant,
+    /// The records of the object read last outside `fill` (counting,
+    /// `record_at`), so that a start reads the object it resumes in once.
+    last_read: Option<(usize, Vec<Record>)>,
 }
 
 impl<S: BlobStore + Send + Sync + 'static> ChainSource<S> {
@@ -96,6 +99,7 @@ impl<S: BlobStore + Send + Sync + 'static> ChainSource<S> {
             position: 0,
             idle_until: None,
             opened_at: std::time::Instant::now(),
+            last_read: None,
         };
         source.list_new().await?;
         Ok(source)
@@ -163,7 +167,7 @@ impl<S: BlobStore + Send + Sync + 'static> ChainSource<S> {
         let Some((i, index)) = found else {
             return Ok(None);
         };
-        let records = self.read(i).await?;
+        let records = self.records_of(i).await?;
         Ok(match index {
             None => records.into_iter().find(|r| r.source_offset == position),
             Some(k) => records.into_iter().nth(k as usize).map(|r| Record {
@@ -229,38 +233,52 @@ impl<S: BlobStore + Send + Sync + 'static> ChainSource<S> {
         })
     }
 
+    /// The records of `chain[i]`, from the last read if it was that
+    /// object.
+    async fn records_of(&mut self, i: usize) -> Result<Vec<Record>, RestoreError> {
+        if let Some((j, records)) = &self.last_read {
+            if *j == i {
+                return Ok(records.clone());
+            }
+        }
+        let records = self.read(i).await?;
+        self.last_read = Some((i, records.clone()));
+        Ok(records)
+    }
+
     /// Records of `chain[i]`, reading the objects not counted yet.
     async fn count(&mut self, i: usize) -> Result<u64, RestoreError> {
         while self.counts.len() <= i {
-            let n = self.read(self.counts.len()).await?.len() as u64;
+            let j = self.counts.len();
+            let n = self.records_of(j).await?.len() as u64;
             self.counts.push(n);
         }
         Ok(self.counts[i])
     }
 
-    /// The position after the last record of the chain listed so far.
-    async fn end(&mut self) -> Result<u64, RestoreError> {
-        match self.cfg.mode {
-            OffsetMode::Preserve => Ok(self.chain.last().map_or(0, |o| o.to + 1)),
-            OffsetMode::Renumber => {
-                let mut total = 0;
-                for i in 0..self.chain.len() {
-                    total += self.count(i).await?;
-                }
-                Ok(total)
-            }
-        }
+    /// The position after the chain listed so far: exact with preserve;
+    /// with renumber an upper bound (the chain's positions, holes
+    /// included), so that it costs no reads.
+    fn positions_end(&self) -> u64 {
+        self.chain
+            .last()
+            .map_or(0, |o| o.to + 1 - self.cfg.chain_start)
     }
 
     /// Read `next_object` into the buffer.
     async fn fill(&mut self) -> Result<(), RestoreError> {
         let i = self.next_object;
-        if self.pending.is_none() {
-            self.pending = Some(self.read(i));
-        }
-        let records = self.pending.as_mut().expect("set above").await;
-        self.pending = None;
-        let records = records?;
+        let records = match self.last_read.take() {
+            Some((j, records)) if j == i && self.pending.is_none() => records,
+            _ => {
+                if self.pending.is_none() {
+                    self.pending = Some(self.read(i));
+                }
+                let records = self.pending.as_mut().expect("set above").await;
+                self.pending = None;
+                records?
+            }
+        };
         if self.counts.len() == i {
             self.counts.push(records.len() as u64);
         }
@@ -300,13 +318,17 @@ impl<S: BlobStore + Send + Sync + 'static> ChainSource<S> {
 }
 
 /// Whether `theirs`, read from a target, is `ours` as restore produces
-/// it: key, value and headers, and the timestamp unless the backup has
-/// none (the producer's clock stamps those).
+/// it: key, value and headers, and the timestamp when the target kept
+/// the one produced: not for a backup record without one (the
+/// producer's clock stamps those), nor on a target that stamps
+/// LogAppendTime.
 pub fn same_record(ours: &Record, theirs: &Record) -> bool {
+    let compare_time =
+        ours.timestamp_ms.is_some() && theirs.timestamp_type == TimestampType::CreateTime;
     ours.key == theirs.key
         && ours.value == theirs.value
         && ours.headers == theirs.headers
-        && (ours.timestamp_ms.is_none() || ours.timestamp_ms == theirs.timestamp_ms)
+        && (!compare_time || ours.timestamp_ms == theirs.timestamp_ms)
 }
 
 /// A store that cannot be reached can be tried again; anything else
@@ -325,11 +347,13 @@ fn source_error(e: RestoreError) -> SourceError {
 impl<S: BlobStore + Send + Sync + 'static> Source for ChainSource<S> {
     async fn seek(&mut self, position: u64) -> Result<(), SourceError> {
         self.list_new().await.map_err(source_error)?;
-        let end = self.end().await.map_err(source_error)?;
-        if position > end {
-            return Err(SourceError::Inconsistent(format!(
+        let past_end = |end: u64| {
+            SourceError::Inconsistent(format!(
                 "the target is at offset {position}, past the backup's end at {end}"
-            )));
+            ))
+        };
+        if self.cfg.mode == OffsetMode::Preserve && position > self.positions_end() {
+            return Err(past_end(self.positions_end()));
         }
         self.pending = None;
         self.buffer.clear();
@@ -354,6 +378,9 @@ impl<S: BlobStore + Send + Sync + 'static> Source for ChainSource<S> {
                     }
                     first += n;
                     i += 1;
+                }
+                if i == self.chain.len() && position > first {
+                    return Err(past_end(first));
                 }
                 i
             }
@@ -391,10 +418,12 @@ impl<S: BlobStore + Send + Sync + 'static> Source for ChainSource<S> {
         }
     }
 
-    /// The position after the backup's last record: the run loop
-    /// refuses a target that is further.
+    /// The position after the backup's last record (with renumber an
+    /// upper bound, see [`ChainSource::positions_end`]): the run loop
+    /// refuses a target that is further. `seek` checks exactly, counting
+    /// only the records before the target's position.
     async fn high_watermark(&mut self) -> Result<u64, SourceError> {
         self.list_new().await.map_err(source_error)?;
-        self.end().await.map_err(source_error)
+        Ok(self.positions_end())
     }
 }

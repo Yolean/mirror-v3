@@ -9,8 +9,11 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use common::*;
-use mirror_core::{run_mirror_with_heartbeat, MirrorError, Record, Sink, SinkError};
+use mirror_core::{
+    run_mirror_with_heartbeat, MirrorError, Record, Sink, SinkError, Source, TimestampType,
+};
 use mirror_envelope::Format;
+use mirror_fs::blob::{BlobError, BlobStore};
 use mirror_restore::{same_record, ChainSource, ChainSourceConfig, OffsetMode};
 
 /// A partition shared with the test: what it holds is readable while
@@ -385,4 +388,119 @@ fn a_backup_record_without_a_timestamp_matches_any_timestamp() {
         ..rec(1)
     };
     assert!(!same_record(&rec(1), &other_headers));
+}
+
+/// A filesystem store that counts the objects read from it.
+struct Counting {
+    inner: FsStore,
+    gets: Arc<Mutex<Vec<String>>>,
+}
+
+#[async_trait]
+impl BlobStore for Counting {
+    async fn list(&self) -> Result<Vec<String>, BlobError> {
+        self.inner.list().await
+    }
+    async fn put_new(&self, name: &str, bytes: Vec<u8>) -> Result<(), BlobError> {
+        self.inner.put_new(name, bytes).await
+    }
+    async fn get(&self, name: &str) -> Result<Vec<u8>, BlobError> {
+        self.gets.lock().unwrap().push(name.to_string());
+        self.inner.get(name).await
+    }
+    async fn list_after(&self, after: Option<&str>) -> Result<Vec<String>, BlobError> {
+        self.inner.list_after(after).await
+    }
+    fn location(&self, name: &str) -> String {
+        self.inner.location(name)
+    }
+}
+
+async fn counting(
+    dir: &std::path::Path,
+    mode: OffsetMode,
+) -> (ChainSource<Counting>, Arc<Mutex<Vec<String>>>) {
+    let gets = Arc::new(Mutex::new(Vec::new()));
+    let source = ChainSource::open(ChainSourceConfig {
+        store: Arc::new(Counting {
+            inner: FsStore::new(dir.to_path_buf()),
+            gets: Arc::clone(&gets),
+        }),
+        location: dir.display().to_string(),
+        format: Format::Parquet,
+        keyring: None,
+        source: source(),
+        mode,
+        chain_start: 0,
+        poll_interval: Duration::from_millis(20),
+    })
+    .await
+    .unwrap();
+    (source, gets)
+}
+
+#[tokio::test]
+async fn a_start_reads_only_the_objects_before_the_targets_position_and_each_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let written: Vec<Record> = [0, 1, 3, 4, 7, 8, 9, 12].into_iter().map(rec).collect();
+    write_backup(dir.path(), &written, 2, None).await;
+    // Into an empty target: only the first object is read, once, before
+    // its first record is yielded.
+    let (mut source, gets) = counting(dir.path(), OffsetMode::Renumber).await;
+    assert_eq!(
+        source.high_watermark().await.unwrap(),
+        13,
+        "positions, holes included"
+    );
+    source.seek(0).await.unwrap();
+    assert_eq!(
+        source.poll_one().await.unwrap(),
+        Some(renumbered(&written)[0].clone())
+    );
+    let object = |from, to| mirror_fs::naming::blob_filename(from, to, None, "parquet");
+    assert_eq!(*gets.lock().unwrap(), [object(0, 1)]);
+    // Resuming at 3, as the CLI does: the resume check, then the run
+    // loop. Objects 0-1 and 2-4 (which holds record 3) are read once.
+    let (mut source, gets) = counting(dir.path(), OffsetMode::Renumber).await;
+    let expected = renumbered(&written);
+    source.check_resume(3, &expected[2]).await.unwrap();
+    source.high_watermark().await.unwrap();
+    source.seek(3).await.unwrap();
+    assert_eq!(source.poll_one().await.unwrap(), Some(expected[3].clone()));
+    assert_eq!(*gets.lock().unwrap(), [object(0, 1), object(2, 4)]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_renumber_target_past_the_backups_records_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    // 4 records over positions 0-4.
+    let written: Vec<Record> = [0, 1, 3, 4].into_iter().map(rec).collect();
+    write_backup(dir.path(), &written, 2, None).await;
+    let mut held = renumbered(&written);
+    held.push(rec(4));
+    let target = Target::holding(held);
+    let err = Follow::start(dir.path(), OffsetMode::Renumber, &target)
+        .await
+        .ended()
+        .await;
+    assert!(
+        err.to_string()
+            .contains("the target is at offset 5, past the backup's end at 4"),
+        "{err}"
+    );
+}
+
+#[test]
+fn a_target_that_stamps_log_append_time_matches_on_everything_else() {
+    let theirs = Record {
+        timestamp_ms: Some(42),
+        timestamp_type: TimestampType::LogAppendTime,
+        ..rec(1)
+    };
+    assert!(same_record(&rec(1), &theirs));
+    let other = Record {
+        value: Some(b"other".to_vec()),
+        ..theirs
+    };
+    assert!(!same_record(&rec(1), &other));
 }

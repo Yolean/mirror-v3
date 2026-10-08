@@ -112,8 +112,13 @@ enum Cmd {
         #[arg(long, requires = "topic")]
         follow: bool,
         /// With --follow: how often to list the backup once every
-        /// object is restored.
-        #[arg(long, default_value_t = 5000, requires = "follow")]
+        /// object is restored, at least 100.
+        #[arg(
+            long,
+            default_value_t = 5000,
+            requires = "follow",
+            value_parser = clap::value_parser!(u64).range(100..)
+        )]
         poll_interval_ms: u64,
     },
 }
@@ -202,7 +207,12 @@ fn main() -> ExitCode {
                     return ExitCode::from(1);
                 }
             };
-            match rt.block_on(restore::run_restore(args)) {
+            let result = rt.block_on(restore::run_restore(args));
+            // A broker query still blocking in the pool (a follower stopped
+            // during its startup) would hold the exit for up to its timeout;
+            // it holds nothing that needs finishing.
+            rt.shutdown_background();
+            match result {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(err) => {
                     eprintln!("error: {err:?}");
@@ -749,6 +759,12 @@ fn is_transient(err: &anyhow::Error) -> bool {
         }
         if let Some(e) = cause.downcast_ref::<mirror_fs::BlobError>() {
             return matches!(e, mirror_fs::BlobError::Store(_));
+        }
+        if let Some(e) = cause.downcast_ref::<mirror_restore::RestoreError>() {
+            return matches!(e, mirror_restore::RestoreError::Store(_));
+        }
+        if let Some(e) = cause.downcast_ref::<mirror_kafka::KafkaError>() {
+            return matches!(e, mirror_kafka::KafkaError::Read(_));
         }
     }
     false
@@ -1684,6 +1700,10 @@ mirrors:
             anyhow::Error::from(MirrorError::Source(SourceError::Transport("down".into()))),
             anyhow::Error::from(BlobError::Store("timeout".into())).context("opening s3 sink"),
             anyhow::Error::from(SinkError::Transport("503".into())).context("opening tee"),
+            anyhow::Error::from(mirror_restore::RestoreError::Store("503".into()))
+                .context("listing the backup"),
+            anyhow::Error::from(mirror_kafka::KafkaError::Read("timed out".into()))
+                .context("reading the target's last record"),
         ];
         for e in &transient {
             assert!(is_transient(e), "{e:#}");
@@ -1704,6 +1724,12 @@ mirrors:
             ))),
             anyhow::Error::from(BlobError::CorruptChain("overlap".into())).context("opening"),
             anyhow::anyhow!("environment variable S3_KEY is not set"),
+            anyhow::Error::from(MirrorError::Source(SourceError::Inconsistent(
+                "a hole".into(),
+            ))),
+            anyhow::Error::from(mirror_restore::RestoreError::Target("another topic".into())),
+            anyhow::Error::from(mirror_kafka::KafkaError::Gone("retention".into()))
+                .context("reading the target's last record"),
         ];
         for e in &fatal {
             assert!(!is_transient(e), "{e:#}");

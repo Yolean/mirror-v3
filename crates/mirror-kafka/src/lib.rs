@@ -48,8 +48,10 @@ pub fn fetch_high_watermark(
 }
 
 /// Read the record at `offset` of `(topic, partition)`: what a resumed
-/// restore compares with the record it would have produced there.
-/// Sync call: wrap in spawn_blocking for async contexts.
+/// restore compares with the record it would have produced there. A
+/// record that retention or compaction removed is [`KafkaError::Gone`]
+/// (`auto.offset.reset=error`, as for the source: never a silent jump to
+/// another offset). Sync call: wrap in spawn_blocking for async contexts.
 pub fn read_record_at(
     bootstrap: &str,
     topic: &str,
@@ -61,6 +63,7 @@ pub fn read_record_at(
         .set("bootstrap.servers", bootstrap)
         .set("group.id", "mirror-v3-read-record-noop")
         .set("enable.auto.commit", "false")
+        .set("auto.offset.reset", "error")
         .create()
         .map_err(|e| KafkaError::Init(e.to_string()))?;
     let mut tpl = TopicPartitionList::new();
@@ -69,12 +72,27 @@ pub fn read_record_at(
     consumer
         .assign(&tpl)
         .map_err(|e| KafkaError::Init(format!("assign: {e}")))?;
+    let gone = || {
+        KafkaError::Gone(format!(
+            "the record at {topic}/{partition} offset {offset} is no longer in the topic \
+             (retention or compaction removed it)"
+        ))
+    };
     let deadline = std::time::Instant::now() + timeout;
     while std::time::Instant::now() < deadline {
         match consumer.poll(Timeout::After(Duration::from_millis(200))) {
             Some(Ok(msg)) if msg.offset() == offset as i64 => return Ok(borrowed_to_record(&msg)),
+            // The next record the partition still has: this one was compacted away.
+            Some(Ok(msg)) if msg.offset() > offset as i64 => return Err(gone()),
             Some(Ok(_)) | None => {}
-            Some(Err(e)) => return Err(KafkaError::Read(format!("reading offset {offset}: {e}"))),
+            Some(Err(e)) => {
+                return Err(match e.rdkafka_error_code() {
+                    Some(
+                        RDKafkaErrorCode::AutoOffsetReset | RDKafkaErrorCode::OffsetOutOfRange,
+                    ) => gone(),
+                    _ => KafkaError::Read(format!("reading offset {offset}: {e}")),
+                })
+            }
         }
     }
     Err(KafkaError::Read(format!(
@@ -769,8 +787,12 @@ fn build_headers(headers: &[Header]) -> OwnedHeaders {
 pub enum KafkaError {
     #[error("kafka client init: {0}")]
     Init(String),
+    /// A read that failed or timed out; trying again can succeed.
     #[error("kafka read: {0}")]
     Read(String),
+    /// What was to be read is no longer in the topic.
+    #[error("kafka read: {0}")]
+    Gone(String),
 }
 
 #[cfg(test)]
