@@ -29,6 +29,31 @@ pub async fn create_topic(bootstrap: &str, topic: &str, partitions: i32) -> Resu
     Ok(())
 }
 
+/// Create a topic with topic configs, such as `max.message.bytes`.
+pub async fn create_topic_with_config(
+    bootstrap: &str,
+    topic: &str,
+    partitions: i32,
+    config: &[(&str, &str)],
+) -> Result<()> {
+    let admin: AdminClient<DefaultClientContext> = ClientConfig::new()
+        .set("bootstrap.servers", bootstrap)
+        .create()
+        .context("admin client")?;
+    let mut new_topic = NewTopic::new(topic, partitions, TopicReplication::Fixed(1));
+    for (k, v) in config {
+        new_topic = new_topic.set(k, v);
+    }
+    let results = admin
+        .create_topics(&[new_topic], &AdminOptions::new())
+        .await
+        .context("create_topics call")?;
+    for result in results {
+        result.map_err(|(t, e)| anyhow!("create topic {t}: {e:?}"))?;
+    }
+    Ok(())
+}
+
 /// Create a topic with the combined `cleanup.policy=compact,delete`.
 ///
 /// This is the operator-intent stand-in for a production compacted

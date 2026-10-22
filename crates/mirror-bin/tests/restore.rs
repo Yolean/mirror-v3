@@ -219,5 +219,11 @@ fn restore_to_an_unreachable_broker_fails_before_producing() {
     );
     assert!(!out.status.success());
     let stderr = text(&out.stderr);
-    assert!(stderr.contains("reading its high watermark"), "{stderr}");
+    // The producer is opened with the topic's max.message.bytes, read
+    // from the broker before anything is produced.
+    assert!(
+        stderr.contains("opening the target topic's producer")
+            && stderr.contains("topic operations's config"),
+        "{stderr}"
+    );
 }

@@ -386,6 +386,7 @@ impl Backup<'_> {
             super::column_type_to_envelope(self.mirror.keys.unwrap_or_default().kind),
             super::column_type_to_envelope(self.mirror.values.unwrap_or_default().kind),
         )
+        .await
         .context("opening the target topic's producer")?;
         tracing::info!(
             topic = %target.topic,
