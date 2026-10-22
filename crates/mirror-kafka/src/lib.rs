@@ -28,7 +28,7 @@ use rdkafka::util::Timeout;
 use rdkafka::TopicPartitionList;
 
 mod restore_producer;
-pub use restore_producer::RestoreProducer;
+pub use restore_producer::{fetch_max_message_bytes, RestoreProducer};
 
 const DEFAULT_POLL_TIMEOUT: Duration = Duration::from_secs(2);
 const DEFAULT_WATERMARK_TIMEOUT: Duration = Duration::from_secs(10);

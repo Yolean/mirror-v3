@@ -14,6 +14,10 @@
 //!   bucket through a read-only store, on kafka-native and VersityGW,
 //!   and, `#[ignore]`d, on the broker and S3 endpoint the environment
 //!   names (see its test).
+//! - max.message.bytes: a backup restored into a topic whose limit is
+//!   far below the producer's default batch size, in batches that fit,
+//!   at the original offsets; a record that alone exceeds the limit
+//!   fails the restore before anything is produced.
 //! - follow: a backup read as a mirror's source while its own mirror
 //!   writes it, into a topic that keeps up; stopped, and resumed at the
 //!   topic's high watermark.
@@ -36,7 +40,7 @@ use mirror_e2e::docker::{
     KafkaNativeToRedpandaStack, KafkaNativeToVersityGWStack, VERSITYGW_ACCESS_KEY,
     VERSITYGW_SECRET_KEY,
 };
-use mirror_e2e::kafka_helpers::create_topic;
+use mirror_e2e::kafka_helpers::{create_topic, create_topic_with_config};
 use mirror_e2e::mirror_runner::{
     spawn_kafka_to_filesystem, spawn_kafka_to_s3, FsMirrorSpec, MirrorHandle, S3MirrorSpec,
 };
@@ -395,7 +399,8 @@ async fn restore_from<S: BlobStore>(
         mirror_core::ColumnType::Utf8,
         mirror_core::ColumnType::Utf8,
     )
-    .expect("producer");
+    .await
+    .map_err(|e| RestoreError::Target(format!("opening its producer: {e}")))?;
     produce(&reader, &chain, &summary, mode, &mut producer).await
 }
 
@@ -480,11 +485,112 @@ async fn preserve_round_trip(brokers: &Brokers) {
     )
     .await
     .unwrap_err();
+    // Apache Kafka describes a topic that does not exist with the
+    // broker defaults, Redpanda refuses: either way the restore fails
+    // before producing.
     assert!(
-        err.to_string().contains("reading its high watermark"),
+        err.to_string().contains("opening its producer")
+            || err.to_string().contains("reading its high watermark"),
         "{err}"
     );
     assert!(!topic_exists(&brokers.target, &missing).unwrap());
+}
+
+/// The broker limits a record batch to the topic's `max.message.bytes`;
+/// the restore sends batches that fit it.
+async fn max_message_bytes(brokers: &Brokers) {
+    install_tracing();
+    let source_topic = unique("restore-limit-src");
+    create_topic(&brokers.source, &source_topic, 1)
+        .await
+        .unwrap();
+    let producer: FutureProducer = ClientConfig::new()
+        .set("bootstrap.servers", &brokers.source)
+        .set("acks", "all")
+        .create()
+        .unwrap();
+    // 2 kB records: 300 of them are 600 kB, which the producer's default
+    // batch size would send in one or a few batches.
+    const N: usize = 300;
+    let pad = "x".repeat(2000);
+    for i in 0..N {
+        let key = format!("k{}", i % 7);
+        let value = format!("{{\"n\":{i},\"pad\":\"{pad}\"}}");
+        producer
+            .send(
+                record(&source_topic, i, &key, Some(&value), OwnedHeaders::new()),
+                Timeout::After(Duration::from_secs(10)),
+            )
+            .await
+            .map_err(|(e, _)| e)
+            .unwrap();
+    }
+    let root = tempfile::tempdir().unwrap();
+    back_up(&brokers.source, &source_topic, root.path(), N)
+        .await
+        .unwrap();
+    let original = consume_all(&brokers.source, &source_topic).unwrap();
+    assert_eq!(original.len(), N);
+
+    // Five records to a batch at most.
+    let target_topic = unique("restore-limit-dst");
+    create_topic_with_config(
+        &brokers.target,
+        &target_topic,
+        1,
+        &[("max.message.bytes", "12000")],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        mirror_kafka::fetch_max_message_bytes(
+            &brokers.target,
+            &target_topic,
+            Duration::from_secs(10)
+        )
+        .await
+        .unwrap(),
+        12000
+    );
+    let report = restore(
+        root.path(),
+        &source_topic,
+        &brokers.target,
+        &target_topic,
+        OffsetMode::Preserve,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        (report.records, report.high_watermark),
+        (N as u64, N as u64)
+    );
+    assert_eq!(
+        consume_all(&brokers.target, &target_topic).unwrap(),
+        original
+    );
+
+    // No record fits: the first is refused before anything is sent.
+    let small = unique("restore-limit-small");
+    create_topic_with_config(&brokers.target, &small, 1, &[("max.message.bytes", "1500")])
+        .await
+        .unwrap();
+    let err = restore(
+        root.path(),
+        &source_topic,
+        &brokers.target,
+        &small,
+        OffsetMode::Renumber,
+    )
+    .await
+    .unwrap_err();
+    let err = err.to_string();
+    assert!(
+        err.contains("the record for offset 0 is a")
+            && err.contains(&format!("topic {small}'s max.message.bytes is 1500")),
+        "{err}"
+    );
+    assert_eq!(high_watermark(&brokers.target, &small).unwrap(), 0);
 }
 
 async fn holes(brokers: &Brokers) {
@@ -809,4 +915,15 @@ async fn external_preserve_restores_every_record_at_its_offset() {
 #[ignore = "needs MIRROR_E2E_EXTERNAL_KAFKA=<bootstrap>"]
 async fn external_holes_refuse_preserve_and_renumber_restores_in_order() {
     holes(&external()).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn batches_fit_the_target_topics_max_message_bytes() {
+    max_message_bytes(&docker().await).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs MIRROR_E2E_EXTERNAL_KAFKA=<bootstrap>"]
+async fn external_batches_fit_the_target_topics_max_message_bytes() {
+    max_message_bytes(&external()).await;
 }
