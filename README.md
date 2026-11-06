@@ -25,9 +25,10 @@ mirror-v3 run --config config.yaml                  # start the configured mirro
 mirror-v3 status --config config.yaml               # one-shot health check, table format
 mirror-v3 status --config config.yaml --format json # same, machine-readable
 mirror-v3 restore --config config.yaml --mirror <name> --offsets preserve|renumber ...  # see Restore
+mirror-v3 trim --config config.yaml                 # expire records past their retention, see Retention
 ```
 
-`status` queries the source Kafka high watermark and the destination's `next-expected-offset` for every mirror in the config and prints the lag. Exits non-zero if any mirror failed to query (unreachable broker, corrupt destination chain, etc.). Useful as a `kubectl exec` health probe before/during/after an appliance backup, without having to ssh to the node.
+`status` queries the source Kafka high watermark and the destination's `next-expected-offset` for every mirror in the config and prints the lag, and for a blob destination with a floor (see [Retention](#retention)) the floor and when it moved; `--format json` adds the oldest record above the floor and the objects below it still in the destination. The destination is read when the broker is out of reach too. Exits non-zero if any mirror failed to query (unreachable broker, corrupt destination chain, etc.). Useful as a `kubectl exec` health probe before/during/after an appliance backup, without having to ssh to the node.
 
 All logs go to **stderr** (heartbeat, flush lines, errors). `stdout` is reserved for command-driven output (`status --format json`, the `validate` success line). Standard `1>` / `2>` redirects work as expected.
 
@@ -45,6 +46,9 @@ Every metric carries `topic="<source-topic>"` and `partition="<n>"` labels so th
 | `mirror_v3_destination_last_flush_timestamp_seconds` | gauge | Unix timestamp (seconds) of the most recent flush. PromQL `time() - mirror_v3_destination_last_flush_timestamp_seconds` gives "seconds since last flush". Filesystem / S3 only. |
 | `mirror_v3_destination_bytes_total` | counter | Cumulative bytes written to the destination by Filesystem / S3 sinks. |
 | `mirror_v3_destination_flushes_total` | counter | Number of flushes by Filesystem / S3 sinks. |
+| `mirror_v3_destination_floor_offset` | gauge | The chain's floor (see [Retention](#retention)): objects that end below it may be missing. Append-mode Filesystem / S3 destinations that have a floor marker; updated by each drift check. |
+| `mirror_v3_destination_floor_moved_timestamp_seconds` | gauge | Unix timestamp (seconds) of when the floor moved to where it is. |
+| `mirror_v3_destination_floor_oldest_record_timestamp_seconds` | gauge | Unix timestamp (seconds) of the oldest record in the first object at or above the floor, as of the last floor marker; `NaN` when unknown. Records above the floor do not change until it moves, so `time() -` this is the age of the oldest record kept, and it grows while expiry is stuck. |
 
 Useful PromQL:
 
@@ -54,6 +58,10 @@ increase(mirror_v3_mirror_restarts_total[10m]) > 0
 
 # Seconds since last flush — alert if > flush.max-time-ms / 1000 × 2
 time() - mirror_v3_destination_last_flush_timestamp_seconds
+
+# Records kept past their retention: the oldest record above the floor is older
+# than max-age-days (400 here) plus a margin (trim's schedule, an object's span)
+time() - mirror_v3_destination_floor_oldest_record_timestamp_seconds > (400 + 2) * 86400
 
 # End-to-end lag (join with kafka_exporter's source watermark on topic+partition):
 kafka_topic_partition_current_offset
@@ -105,17 +113,18 @@ mirror-v3 restore --config mirror-v3.yaml --mirror operations-backup --offsets p
 | `--config`, `--mirror` | The config and mirror that wrote the backup. The backup is that mirror's destination: its directory (`<prefix>/<name>/<partition>/`, or `<root>/<name>/<partition>/`), `format`, `keys`/`values`, encryption `keys-dir` and `credentials.read` are used as they are. The whole config is loaded and validated as for `run`, so its environment variables must be set, and the mirror's `topic` must be the topic the backup was taken of (every record is checked against it). |
 | `--destination` | The destination to read, by `name`; required when the mirror has more than one. A Kafka destination or a `compaction: log` mirror (whose objects are snapshots, not the topic's records) is refused. |
 | `--offsets` | `preserve` or `renumber`, required: see below. |
-| `--chain-start` | The offset the backup starts at, default 0. A chain that starts anywhere else is an error unless this says so, so objects removed from its head are never missed silently. |
+| `--chain-start` | Omitted: the backup starts at its floor (see [Retention](#retention)), or at 0 without one; objects that end below the floor are not read. Given: the backup must start exactly at this offset. Either way a chain that starts anywhere else is an error, so objects removed from its head are never missed silently. |
 | `--verify-only` | Stop after the verify pass. |
 | `--bootstrap-servers`, `--topic` | The target: partition `partition` (the mirror's) of an existing, empty topic (with `--follow`, empty or followed before). |
 | `--follow` | Keep the target restored as the backup grows, until SIGTERM or SIGINT: see [Continuous restore](#continuous-restore). |
 | `--poll-interval-ms` | With `--follow`: how often to list the backup once every object is restored, default 5000, at least 100. |
 
-Every run first lists the backup and validates the chain of object names (sorted, no gap, no overlap, starting at `--chain-start`, every key id it names present in `keys-dir`), then reads every object and checks it against its name (records in increasing offset order inside `<from>-<to>`, the last at `to`) and the mirror's topic and partition. It prints the summary to stdout:
+Every run first lists the backup and validates the chain of object names (sorted, no gap, no overlap, starting at the floor or `--chain-start`, every key id it names present in `keys-dir`), then reads every object and checks it against its name (records in increasing offset order inside `<from>-<to>`, the last at `to`) and the mirror's topic and partition. It prints the summary to stdout:
 
 ```
 backup: s3://<bucket>/sites/<site>/operations/0 (mirror operations-backup, destination operations)
 source: <topic>/0
+floor: 25000 (since 2026-11-06T00:15:02Z; 0 object(s) below it not read)   # with a floor only
 objects: 3
 offsets: 0-24999
 records: 25000
@@ -142,12 +151,57 @@ Restore does not create the target topic (its partitions, `cleanup.policy` and r
 `--follow` reads the backup as a mirror's source: `run_mirror` with the Kafka destination, its per-record gate (the high watermark read before every produce, no retries, the offset the broker reports checked) and its idle drift check, so nothing else may write the target. It starts at the target's high watermark, and after every object listed so far it lists the backup again every `--poll-interval-ms`, producing the objects the backup's mirror has added, so the target trails the source by about the backup mirror's flush interval: a standby, or a topic moved between clusters through the bucket. It runs until SIGTERM or SIGINT (also during its startup) and can be stopped and started again at any time; it is not a replacement for the one-shot restore when the backup is all there is, since the gate makes it slow (about 150 records/s against a local broker), so restore the bulk with the one-shot restore and follow from there.
 
 - **Resume**: a target that is not empty holds the backup's first records, in both offset modes (with `renumber`, the n-th record of the chain is at offset n), so a follower continues at its high watermark without any state of its own. Before it does, it reads the target's last record and requires it to be the backup's record at that position (key, value, headers, and the timestamp unless the target stamps LogAppendTime). Only that record is compared: this refuses a topic that holds another topic's records, not one whose earlier records were changed. A target whose last record retention or compaction has removed cannot be checked and is refused: give a followed topic a retention that keeps its records (see the timestamps above). With `renumber`, finding the position reads the objects before it once at start. A one-shot restore and a follower can therefore hand over: follow a topic that a one-shot restore filled, with the same `--offsets`.
+- **Trimmed backups**: a follower starts at the backup's floor, like the one-shot restore, but a follower opened again after `trim` has moved the floor cannot resume: with `renumber` the target's positions count from the chain's old start, and `preserve` needs a chain that starts at 0. Follow a backup with a `retention` only into a target that is restored again after a trim, or not at all.
 - **Checks**: every object is read and checked as in the verify pass before its records are produced, and new objects must continue the chain. A filesystem backup directory that does not exist is refused, as by the one-shot restore (the mirror creates it when it opens); a directory or S3 prefix that exists and holds no objects yet is waited for, and every listing logs that it is empty and for how long, so a wrong prefix shows in the logs. There is no verify pass of the whole backup up front, so with `preserve` a hole stops the follower when it is reached, with the records before it restored; `--verify-only` checks a backup before following it. A gap, a hole, a target past the backup's end or another topic's records end the follower (exit 1). An unreachable store or broker does not: the follower is opened again in the process after a backoff from 1 s doubling to 60 s, as `run` opens a mirror again, and resumes at the target's high watermark.
 
 What disaster recovery needs besides the bucket:
 
 - An S3 identity that may list **and get** objects under the prefix, in the variables `credentials.read` names. A least-privilege `read` identity that only lists (the mirror needs no more in append mode) cannot restore. Restore opens the store read-only: the `write` identity's variables need not be set.
 - Every Parquet key the objects name (`.k-<key id>.parquet`), in `keys-dir`. A key kept only on the lost machine makes its objects unreadable: keep the keys where the bucket's backups can be restored without that machine.
+
+## Retention
+
+Records that may only be kept for a fixed period (security and audit events, kept 13 months and then deleted) must expire from the backup too. A blob destination in append mode is a chain of `<from>-<to>` objects that must start at 0, so deleting its oldest objects, by a bucket lifecycle rule or by hand, makes the mirror refuse the chain at its next start. Expiry goes through the chain's **floor** instead: the offset below which objects may be missing because they were removed on purpose.
+
+```yaml
+      - type: s3
+        # ...
+        credentials:
+          write: { access-key-id-env: S3_WRITE_ACCESS_KEY_ID, secret-access-key-env: S3_WRITE_SECRET_ACCESS_KEY }
+          read:  { access-key-id-env: S3_READ_ACCESS_KEY_ID,  secret-access-key-env: S3_READ_SECRET_ACCESS_KEY }
+          trim:  { access-key-id-env: S3_TRIM_ACCESS_KEY_ID,  secret-access-key-env: S3_TRIM_SECRET_ACCESS_KEY }
+        retention: { max-age-days: 400 }
+```
+
+`retention` is allowed on filesystem and S3 destinations of append-mode mirrors (a `compaction: log` chain allows gaps already and keeps only its latest snapshot). An S3 destination with `retention` needs `credentials.trim`. See [`examples/s3-retention.yaml`](examples/s3-retention.yaml).
+
+**The floor** is a marker object in the partition directory, `floor-<offset, 20 digits>.at-<unix seconds>[.oldest-<unix ms>].json`. The floor is the highest offset among the markers, so the mirror reads it from the listing alone (its reading identity needs no GET). Moving the floor writes a new marker and old ones stay, as the store's record of when each expiry happened and by which cutoff (the JSON content records how the floor was computed; nothing reads it). A marker lower than the highest changes nothing; deleting the highest marker lowers the floor, and the chain then fails validation once the objects below the old floor are gone. Markers sort after every object, so each drift check of a running mirror sees a floor that moves, logs it and updates the metrics, without a restart.
+
+With a floor, `run`, `restore`, `restore --verify-only` and `status` validate the chain from the floor instead of 0:
+
+- objects that end below the floor are ignored, whether they are there or not, so deletion may lag (an object under a retention lock, a trim that stopped half way);
+- the first object at or above the floor must cover it, and from there the chain must be contiguous as before: a gap above the floor is still a corrupt chain;
+- a floor above the end of the chain is corrupt, unless the directory holds no object at all (every one expired), in which case the mirror resumes at the floor and logs a warning.
+
+**`mirror-v3 trim`** expires records. It is one-shot, for a schedule (a Kubernetes CronJob, daily or more often), and trims every destination that has a `retention` (`--mirror` and `--destination` narrow it; disabled mirrors are trimmed too, since their archives expire as well). For each one it:
+
+1. walks the chain from the floor and reads each object's record times, a HEAD away: every append-mode object carries the lowest and highest record timestamp and the count of records without one as user metadata (`x-amz-meta-mirror-v3-min-timestamp-ms`, `-max-timestamp-ms`, `-records-without-timestamp`), written with it. The trim identity needs no object content and no Parquet key. On a filesystem the objects are read instead (a filesystem destination is in clear);
+2. moves the floor past every object whose records, and the records of every object before it, are older than `max-age-days` by **record timestamp**, not object write time (a backfill writes old records into new objects, and retention is about the records' age). It stops at the first object with a newer record. An object straddling the cutoff is kept until all of its records expire, so a record is deleted between `max-age-days` and `max-age-days` plus one object's time span (`flush.max-time-ms`, or a day with `flush.daily`) plus the trim schedule after its timestamp: set `max-age-days` to the deletion age minus that margin;
+3. writes the new floor's marker, and only then deletes every object that ends below the floor. An object that does not delete (a retention lock) is logged and left: the floor already hides it, and the next trim tries again. A trim writes a marker on its first run too, at the floor it found (0), so that the floor and the age of its oldest record show from then on.
+
+The walk is **blocked** at an object whose age trim cannot tell: one written before mirror-v3 recorded record times (no metadata), one with a record without a timestamp, or one with a timestamp more than an hour in the future (a producer's clock, which would keep the object until then). Trim moves the floor up to that object, prints `BLOCKED at <object>: <reason>` and exits non-zero, so a CronJob's failed runs show it. After a person has checked the records, `mirror-v3 trim --mirror <name> --floor <offset>` moves the floor past it. The same command adopts a chain whose head a lifecycle rule already removed (the mirror's error names the offset to use). A floor lower than the current one, or past the end of the chain, is refused. `--dry-run` prints what a trim would do and changes nothing.
+
+Monitoring: `mirror_v3_destination_floor_oldest_record_timestamp_seconds` is the age of the oldest record kept, from the latest marker, so it shows a trim that is stuck or not running at all ([alert above](#metrics-prometheus)); kube-state-metrics shows a CronJob whose runs fail. `status` shows the floor, when it moved, the oldest record above it and the objects still below it.
+
+Permissions:
+
+- The **trim identity** lists the prefix, HEADs objects (in AWS IAM a HEAD needs `s3:GetObject`; without the Parquet key that does not reveal encrypted records), puts `floor-*` markers and deletes objects. Deny the **writer** `PutObject` on `*/floor-*`: a writer that could write markers could hide objects below a floor that is too high. They would be ignored, not lost, but the floor is the trim role's to set.
+- The delete right is the risk to weigh. For records that must be tamper-proof, a delete right in the same cluster as the writer is acceptable only where the store's retention lock (S3 Object Lock, a GCS bucket retention policy) prevents deletion before the retention period, and then `max-age-days` is the deletion age, at or above the lock's period. Without such a lock, run trim from somewhere the writer's cluster cannot reach.
+- On a **versioned** bucket a DELETE without a version id only adds a delete marker: the data stays as a noncurrent version until a lifecycle rule expires noncurrent versions. Add one, or the records are not deleted.
+
+Record times in object metadata are clear text on an encrypted destination: each object's lowest and highest record timestamp, close to its write time, which the store records anyway.
+
+Upgrade order: a mirror-v3 older than this treats a floor marker as an object it did not write and refuses the chain, so upgrade every `run` and `restore` of a destination before its first trim. Objects written by an older mirror-v3 carry no record times: the first trim blocks at them until they are adopted with `--floor`.
 
 ## Observability
 
@@ -264,7 +318,7 @@ docker run --rm -v "$PWD/examples:/cfg" mirror-v3:dev validate --config /cfg/kaf
     2. **Source-side coordination.** mirror-v3 uses `assign()` instead of `subscribe()` for its Kafka consumer, so there is no consumer-group coordinator deciding which pod owns the partition. Two pods up at once would both consume the same partition and race the consumer-offset commit log.
 - **VersityGW specifically:** `If-None-Match: *` is silently ignored (v1.4.1, POSIX backend, verified in e2e), so the deployment guarantee is the *only* atomicity layer for the cross-process race. AWS S3 honors `If-None-Match: *` and gives API-level atomicity on top of the deployment guarantee.
 - **An unrecoverable error ends the process.** Restart correctness is the recovery mechanism: the orchestrator restarts the process and every position comes from the destination again. The one exception is a destination-only mirror whose source or destination could not be reached: it is reopened in the process after a backoff, which re-derives its position from the destination the same way.
-- **For blob destinations, a `(from, to)` filename/key is the durable "offset"** — atomic rename (FS) or single-shot `PutObject` (S3) makes it visible. The destination listing is the source of truth on startup.
+- **For blob destinations, a `(from, to)` filename/key is the durable "offset"** — atomic rename (FS) or single-shot `PutObject` (S3) makes it visible. The destination listing is the source of truth on startup. The chain starts at 0, or at its floor when `trim` has expired its head (see [Retention](#retention)).
 - **Offset holes.** Kafka leaves holes in a partition's offsets where compaction removed records and at transaction markers. A blob object covers consumer positions: `from` is the previous object's `to` + 1 and `to` is the last record it holds, so the chain of names stays contiguous across holes and each record carries its true offset. A Kafka destination cannot reproduce a hole (its next offset is always its high watermark), so a hole in its source ends the mirror with an error saying so: mirror such topics to blobs. A position the broker no longer has (retention deleted records the mirror never read) is an error, never a jump to the earliest offset.
 
 ## Readiness

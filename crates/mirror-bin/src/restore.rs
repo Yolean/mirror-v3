@@ -24,7 +24,8 @@ use mirror_envelope::Keyring;
 use mirror_fs::blob::BlobStore;
 use mirror_kafka::{KafkaSink, KafkaSinkConfig, RestoreProducer, TimestampMode};
 use mirror_restore::{
-    plan_chain, BackupSource, BackupSummary, ChainSource, ChainSourceConfig, OffsetMode, Reader,
+    check_keys, plan_chain, plan_floor_chain, BackupSource, BackupSummary, ChainObject,
+    ChainSource, ChainSourceConfig, OffsetMode, Reader,
 };
 
 /// `--offsets`: required, so that the choice is written out.
@@ -51,7 +52,8 @@ pub struct RestoreArgs {
     pub mirror: String,
     pub destination: Option<String>,
     pub offsets: OffsetsArg,
-    pub chain_start: u64,
+    /// `None`: from the backup's floor.
+    pub chain_start: Option<u64>,
     /// `None`: verify only.
     pub target: Option<Target>,
     /// `Some(poll interval)`: follow the backup into the target.
@@ -138,7 +140,10 @@ pub async fn run_restore(args: RestoreArgs) -> Result<()> {
 
 /// The blob destination to read: the one named, or the mirror's only
 /// destination.
-fn pick_destination<'a>(mirror: &'a Mirror, name: Option<&str>) -> Result<&'a Destination> {
+pub(crate) fn pick_destination<'a>(
+    mirror: &'a Mirror,
+    name: Option<&str>,
+) -> Result<&'a Destination> {
     let dest = match name {
         Some(name) => mirror
             .destinations
@@ -184,9 +189,15 @@ struct Backup<'a> {
     mirror: &'a Mirror,
     dest_name: &'a str,
     format: mirror_envelope::Format,
-    chain_start: u64,
+    chain_start: Option<u64>,
     mode: OffsetMode,
     source: &'a BackupSource,
+}
+
+/// What a verify says about the backup's floor.
+struct FloorSummary {
+    floor: mirror_fs::floor::Floor,
+    below_floor: usize,
 }
 
 impl Backup<'_> {
@@ -363,7 +374,8 @@ impl Backup<'_> {
             .list()
             .await
             .with_context(|| format!("listing {location}"))?;
-        let chain = plan_chain(&names, self.format, self.chain_start, keyring)
+        let (chain, floor) = self
+            .plan(&names, keyring)
             .with_context(|| location.to_string())?;
         tracing::info!(location, objects = chain.len(), "verifying every object");
         let reader = Reader {
@@ -373,7 +385,7 @@ impl Backup<'_> {
             source: self.source,
         };
         let summary = reader.verify(&chain).await?;
-        self.print_summary(location, &summary);
+        self.print_summary(location, &summary, floor.as_ref());
         self.mode.check(&summary)?;
         let Some(target) = target else {
             println!("verified: the backup can be restored with these offsets");
@@ -410,12 +422,48 @@ impl Backup<'_> {
         Ok(())
     }
 
-    fn print_summary(&self, location: &str, summary: &BackupSummary) {
+    /// The chain to read: from `--chain-start` exactly, or from the
+    /// backup's floor.
+    fn plan(
+        &self,
+        names: &[String],
+        keyring: Option<&Keyring>,
+    ) -> Result<(Vec<ChainObject>, Option<FloorSummary>)> {
+        if let Some(start) = self.chain_start {
+            return Ok((plan_chain(names, self.format, start, keyring)?, None));
+        }
+        let planned = plan_floor_chain(names, self.format, None)?;
+        if planned.objects.is_empty() {
+            bail!(match planned.floor {
+                Some(f) => format!(
+                    "the backup holds no objects at or above its floor, {}: every object expired",
+                    f.offset
+                ),
+                None => "the directory holds no backup objects".to_string(),
+            });
+        }
+        check_keys(&planned.objects, keyring)?;
+        let floor = planned.floor.map(|floor| FloorSummary {
+            floor,
+            below_floor: planned.below_floor.len(),
+        });
+        Ok((planned.objects, floor))
+    }
+
+    fn print_summary(&self, location: &str, summary: &BackupSummary, floor: Option<&FloorSummary>) {
         println!(
             "backup: {location} (mirror {}, destination {})",
             self.mirror.name, self.dest_name
         );
         println!("source: {}/{}", self.source.topic, self.source.partition);
+        if let Some(f) = floor {
+            println!(
+                "floor: {} (since {}; {} object(s) below it not read)",
+                f.floor.offset,
+                mirror_fs::floor::utc_rfc3339(f.floor.moved_at),
+                f.below_floor
+            );
+        }
         println!("objects: {}", summary.objects.len());
         println!("offsets: {}-{}", summary.first_offset, summary.last_offset);
         println!("records: {}", summary.records);

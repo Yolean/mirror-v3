@@ -1,0 +1,41 @@
+# yaml-language-server: $schema=../schemas/mirror-v3.config.schema.json
+#
+# A backup whose records may only be kept for a fixed period: audit
+# events, deleted 400 days after their timestamp.
+#
+# `mirror-v3 run` writes the backup and never deletes. Expiry is
+# `mirror-v3 trim --config <this file>`, run on a schedule (a CronJob)
+# with the `trim` identity: it moves the chain's floor past the objects
+# whose records are all older than `max-age-days` and deletes them. The
+# writer may only PutObject (and should be denied PutObject on
+# `*/floor-*`); the lister may only list keys; `trim` lists, HEADs,
+# writes floor markers and deletes, and needs no Parquet key.
+
+mirrors:
+
+- name: audit-backup
+  source:
+    bootstrap-servers: ${AUDIT_BOOTSTRAP:-kafka:9092}
+    group-id: mirror-v3-audit-backup
+  topic: ${AUDIT_TOPIC:-audit}
+  partition: 0
+  destinations:
+  - type: s3
+    name: audit
+    endpoint: ${MIRROR_S3_ENDPOINT:-http://versitygw.observability-s3:7070}
+    region: ${MIRROR_S3_REGION:-example-region}
+    bucket: ${MIRROR_S3_BUCKET:-mirror-v3}
+    prefix: sites/${SITE:-dev}
+    credentials:
+      write: { access-key-id-env: MIRROR_S3_WRITE_ACCESS_KEY_ID, secret-access-key-env: MIRROR_S3_WRITE_SECRET_ACCESS_KEY }
+      read: { access-key-id-env: MIRROR_S3_READ_ACCESS_KEY_ID, secret-access-key-env: MIRROR_S3_READ_SECRET_ACCESS_KEY }
+      trim: { access-key-id-env: MIRROR_S3_TRIM_ACCESS_KEY_ID, secret-access-key-env: MIRROR_S3_TRIM_SECRET_ACCESS_KEY }
+    encryption: { keys-dir: /etc/mirror-v3/parquet-keys, key-id: "${PARQUET_KEY_ID:-k1}" }
+    retention: { max-age-days: 400 }
+  format: parquet
+  compression: zstd-1
+  flush:
+    max-time-ms: 60000
+    max-bytes: 16777216
+    max-offsets: 10000
+    daily: { at-utc: "00:00" }

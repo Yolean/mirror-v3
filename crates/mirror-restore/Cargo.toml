@@ -9,13 +9,17 @@ description = "Restore a mirror-v3 blob backup (filesystem or S3) into a Kafka t
 
 [dependencies]
 async-trait = { workspace = true }
+futures = { workspace = true }
 mirror-core = { workspace = true }
 mirror-envelope = { workspace = true }
 mirror-fs = { workspace = true }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["time"] }
 tracing = { workspace = true }
 
 [dev-dependencies]
+mirror-s3 = { workspace = true }
+object_store = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "sync"] }

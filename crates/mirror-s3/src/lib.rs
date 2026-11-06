@@ -21,9 +21,12 @@ use bytes::Bytes;
 use futures::StreamExt;
 use mirror_core::{FlushObserver, Record, Sink, SinkError};
 use mirror_envelope::{ColumnType, Format, ParquetCompression};
-use mirror_fs::blob::{self, BlobError, BlobSink, BlobSpec, BlobStore};
+use mirror_fs::blob::{self, BlobError, BlobSink, BlobSpec, BlobStore, RecordTimes};
+use mirror_fs::floor::Floor;
 use object_store::path::Path;
-use object_store::{ObjectStore, PutMode, PutOptions, PutPayload};
+use object_store::{
+    Attribute, Attributes, GetOptions, ObjectStore, PutMode, PutOptions, PutPayload,
+};
 
 pub use mirror_fs::blob::{BlobEncryption, CompactionMode, FlushTriggers, UnixClock};
 
@@ -111,15 +114,25 @@ impl BlobStore for S3Store {
         Ok(names)
     }
 
-    async fn put_new(&self, name: &str, bytes: Vec<u8>) -> Result<(), BlobError> {
+    async fn put_new(
+        &self,
+        name: &str,
+        bytes: Vec<u8>,
+        metadata: &[(&'static str, String)],
+    ) -> Result<(), BlobError> {
         let path = self.path(name);
         let Some(write) = &self.write else {
             return Err(BlobError::Store(format!(
                 "put {path}: this store was opened to read only"
             )));
         };
+        let mut attributes = Attributes::new();
+        for (key, value) in metadata {
+            attributes.insert(Attribute::Metadata((*key).into()), value.clone().into());
+        }
         let opts = PutOptions {
             mode: PutMode::Create,
+            attributes,
             ..Default::default()
         };
         match write
@@ -151,6 +164,43 @@ impl BlobStore for S3Store {
 
     fn location(&self, name: &str) -> String {
         self.path(name).to_string()
+    }
+
+    /// A HEAD, through the reading identity: the object's user metadata.
+    async fn record_times(&self, name: &str) -> Result<Option<RecordTimes>, BlobError> {
+        let path = self.path(name);
+        let head = self
+            .read
+            .get_opts(
+                &path,
+                GetOptions {
+                    head: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(|e| BlobError::Store(format!("head {path}: {e}")))?;
+        let attributes = head.attributes;
+        RecordTimes::from_metadata(|key| {
+            attributes
+                .get(&Attribute::Metadata(key.to_string().into()))
+                .map(|v| v.as_ref().to_string())
+        })
+        .map_err(|e| BlobError::Store(format!("{path}: {e}")))
+    }
+
+    /// Through the writing identity (the trim identity, for `trim`).
+    async fn delete(&self, name: &str) -> Result<(), BlobError> {
+        let path = self.path(name);
+        let Some(write) = &self.write else {
+            return Err(BlobError::Store(format!(
+                "delete {path}: this store was opened to read only"
+            )));
+        };
+        match write.delete(&path).await {
+            Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
+            Err(e) => Err(BlobError::Store(format!("delete {path}: {e}"))),
+        }
     }
 
     async fn list_after(&self, after: Option<&str>) -> Result<Vec<String>, BlobError> {
@@ -229,6 +279,16 @@ impl S3Sink {
     pub fn with_drift_check_interval(self, interval: std::time::Duration) -> Self {
         Self(self.0.with_drift_check_interval(interval))
     }
+
+    /// Append mode: the chain's floor, as last seen.
+    pub fn floor(&self) -> Option<&Floor> {
+        self.0.floor()
+    }
+
+    /// Objects below the floor that were still in the prefix at open.
+    pub fn below_floor_at_open(&self) -> usize {
+        self.0.below_floor_at_open()
+    }
 }
 
 #[async_trait]
@@ -297,13 +357,13 @@ mod tests {
         let dir = partition_prefix(Some(&Path::from("sites/x")), "operations", 0);
         assert_eq!(dir.as_ref(), "sites/x/operations/0");
         S3Store::new(Arc::clone(&mem), Arc::clone(&mem), dir.clone())
-            .put_new("a", b"x".to_vec())
+            .put_new("a", b"x".to_vec(), &[])
             .await
             .unwrap();
         let ro = S3Store::read_only(mem, dir);
         assert_eq!(ro.list().await.unwrap(), ["a"]);
         assert_eq!(ro.get("a").await.unwrap(), b"x");
-        let err = ro.put_new("b", Vec::new()).await.unwrap_err();
+        let err = ro.put_new("b", Vec::new(), &[]).await.unwrap_err();
         assert!(err.to_string().contains("opened to read only"), "{err}");
     }
 

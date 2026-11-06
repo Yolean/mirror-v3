@@ -17,6 +17,7 @@ use async_trait::async_trait;
 use mirror_core::{FlushObserver, FlushTrigger, Record, Sink, SinkError};
 use mirror_envelope::{ColumnType, Format, ParquetCompression};
 
+use crate::floor::{self, Floor, FloorMarker};
 use crate::naming;
 
 /// Unix-seconds clock the sink consults for the daily flush trigger and
@@ -91,8 +92,14 @@ pub trait BlobStore: Send + Sync {
     async fn list(&self) -> Result<Vec<String>, BlobError>;
     /// Write `bytes` as `name`, atomically, and fail with
     /// [`BlobError::AlreadyExists`] if the store can tell that `name`
-    /// exists.
-    async fn put_new(&self, name: &str, bytes: Vec<u8>) -> Result<(), BlobError>;
+    /// exists. `metadata` is the object's user metadata where the store
+    /// keeps metadata (S3: `x-amz-meta-<key>`); a filesystem has none.
+    async fn put_new(
+        &self,
+        name: &str,
+        bytes: Vec<u8>,
+        metadata: &[(&'static str, String)],
+    ) -> Result<(), BlobError>;
     /// Read the object `name`.
     async fn get(&self, name: &str) -> Result<Vec<u8>, BlobError>;
     /// Names sorting after `after` (all names when `None`). S3 serves
@@ -100,6 +107,102 @@ pub trait BlobStore: Send + Sync {
     async fn list_after(&self, after: Option<&str>) -> Result<Vec<String>, BlobError>;
     /// Where `name` lives, for logs and errors.
     fn location(&self, name: &str) -> String;
+    /// The timestamps of the records in `name`: from its metadata where
+    /// the store keeps metadata (a HEAD, so that `trim` needs neither
+    /// the objects' content nor their keys), from its content otherwise.
+    /// `Ok(None)` for an object written without them.
+    async fn record_times(&self, name: &str) -> Result<Option<RecordTimes>, BlobError> {
+        Err(BlobError::Store(format!(
+            "{}: this store does not tell record times",
+            self.location(name)
+        )))
+    }
+    /// Delete `name`; one that does not exist is not an error.
+    async fn delete(&self, name: &str) -> Result<(), BlobError> {
+        Err(BlobError::Store(format!(
+            "delete {}: this store does not delete",
+            self.location(name)
+        )))
+    }
+}
+
+/// The record timestamps an object holds. Each append-mode object
+/// carries them as metadata ([`RecordTimes::to_metadata`]), written
+/// with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RecordTimes {
+    /// Lowest record timestamp, unix milliseconds; `None` when no record
+    /// has one.
+    pub min_ms: Option<u64>,
+    pub max_ms: Option<u64>,
+    /// Records without a timestamp (none, or a negative one).
+    pub without: u64,
+}
+
+/// Metadata keys of [`RecordTimes`].
+pub const META_MIN_TIMESTAMP_MS: &str = "mirror-v3-min-timestamp-ms";
+pub const META_MAX_TIMESTAMP_MS: &str = "mirror-v3-max-timestamp-ms";
+pub const META_RECORDS_WITHOUT_TIMESTAMP: &str = "mirror-v3-records-without-timestamp";
+
+impl RecordTimes {
+    pub fn of(records: &[Record]) -> Self {
+        let mut times = Self::default();
+        for r in records {
+            match r.timestamp_ms.and_then(|t| u64::try_from(t).ok()) {
+                Some(t) => {
+                    times.min_ms = Some(times.min_ms.map_or(t, |m| m.min(t)));
+                    times.max_ms = Some(times.max_ms.map_or(t, |m| m.max(t)));
+                }
+                None => times.without += 1,
+            }
+        }
+        times
+    }
+
+    pub fn to_metadata(&self) -> Vec<(&'static str, String)> {
+        let mut meta = Vec::with_capacity(3);
+        if let Some(ms) = self.min_ms {
+            meta.push((META_MIN_TIMESTAMP_MS, ms.to_string()));
+        }
+        if let Some(ms) = self.max_ms {
+            meta.push((META_MAX_TIMESTAMP_MS, ms.to_string()));
+        }
+        meta.push((META_RECORDS_WITHOUT_TIMESTAMP, self.without.to_string()));
+        meta
+    }
+
+    /// `Ok(None)` when the metadata has none of the keys (an object
+    /// written before they were recorded); an error when it has some and
+    /// they do not parse, or the count of records without a timestamp
+    /// is missing.
+    pub fn from_metadata(get: impl Fn(&str) -> Option<String>) -> Result<Option<Self>, String> {
+        let field = |key: &str| -> Result<Option<u64>, String> {
+            get(key)
+                .map(|v| {
+                    v.trim()
+                        .parse::<u64>()
+                        .map_err(|_| format!("metadata {key}={v:?} is not a number"))
+                })
+                .transpose()
+        };
+        let min_ms = field(META_MIN_TIMESTAMP_MS)?;
+        let max_ms = field(META_MAX_TIMESTAMP_MS)?;
+        let without = field(META_RECORDS_WITHOUT_TIMESTAMP)?;
+        match (min_ms, max_ms, without) {
+            (None, None, None) => Ok(None),
+            (min_ms, max_ms, Some(without)) if min_ms.is_some() == max_ms.is_some() => {
+                Ok(Some(Self {
+                    min_ms,
+                    max_ms,
+                    without,
+                }))
+            }
+            _ => Err(format!(
+                "incomplete record-time metadata: {META_MIN_TIMESTAMP_MS}={min_ms:?} \
+                 {META_MAX_TIMESTAMP_MS}={max_ms:?} {META_RECORDS_WITHOUT_TIMESTAMP}={without:?}"
+            )),
+        }
+    }
 }
 
 /// What a listing says about a destination.
@@ -109,8 +212,16 @@ pub struct Chain {
     pub durable: u64,
     /// Compaction mode: the newest snapshot, which holds the view.
     pub latest: Option<String>,
-    /// The last two objects of the chain (highest `to` last).
+    /// The last two objects of the chain (highest `to` last). Append
+    /// mode: objects at or above the floor only.
     pub tail: Vec<String>,
+    /// Append mode: the floor its markers set (see [`crate::floor`]).
+    pub floor: Option<Floor>,
+    /// Append mode: objects that end below the floor and are still in
+    /// the directory. The chain ignores them; `trim` deletes them.
+    pub below_floor: Vec<String>,
+    /// Append mode: every floor marker in the directory.
+    pub markers: Vec<FloorMarker>,
 }
 
 /// How often an idle blob mirror checks its destination for objects it
@@ -125,20 +236,38 @@ pub struct Chain {
 pub const DRIFT_CHECK_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Validate a listing. Append mode requires a contiguous chain of
-/// `<from>-<to>` names from 0; compaction mode allows gaps (snapshots
-/// may be removed out of band) and forbids overlaps. Every object must
-/// be one of this mirror's blobs: an object with another format's
-/// extension, or a name that does not parse, is an error (skipping it
-/// would hide a misconfiguration, or make the resume position too low
-/// if it was a blob under a name this version does not read).
+/// `<from>-<to>` names from the floor (0 without floor markers): objects
+/// that end below the floor are ignored, present or not, and the first
+/// object at or above it must cover it. A floor above the end of the
+/// chain is an error, except in a directory that holds no objects at all
+/// (every one expired), which resumes at the floor. Compaction mode
+/// allows gaps (snapshots may be removed out of band), forbids overlaps,
+/// and has no floor. Every other object must be one of this mirror's
+/// blobs: an object with another format's extension, or a name that does
+/// not parse, is an error (skipping it would hide a misconfiguration, or
+/// make the resume position too low if it was a blob under a name this
+/// version does not read).
 pub fn validate_chain(
     names: &[String],
     format: Format,
     compaction: Option<CompactionMode>,
 ) -> Result<Chain, BlobError> {
     let expected_ext = format.extension();
+    let (floor, markers) = floor::floor_of(names).map_err(BlobError::CorruptChain)?;
+    if compaction.is_some() {
+        if let Some(m) = markers.first() {
+            return Err(BlobError::CorruptChain(format!(
+                "{} is a floor marker, and a compaction-mode destination has no floor \
+                 (its chain allows gaps)",
+                m.filename()
+            )));
+        }
+    }
     let mut entries: Vec<(u64, u64, &str)> = Vec::new();
     for name in names {
+        if floor::is_marker(name) {
+            continue;
+        }
         if let Some(other_ext) = file_extension(name) {
             if other_ext != expected_ext && naming::parse_blob_name(name, other_ext).is_some() {
                 return Err(BlobError::CorruptChain(format!(
@@ -161,20 +290,57 @@ pub fn validate_chain(
     }
     match compaction {
         None => {
+            let floor_offset = floor.map_or(0, |f| f.offset);
             entries.sort_unstable();
-            let mut expected_next = 0u64;
-            for (from, to, _) in &entries {
-                if *from != expected_next {
+            let (below, above): (Vec<_>, Vec<_>) = entries
+                .into_iter()
+                .partition(|(_, to, _)| *to < floor_offset);
+            let mut expected_next = floor_offset;
+            for (i, (from, to, _)) in above.iter().enumerate() {
+                // The first object may start below the floor (a floor set
+                // inside it); the rest continue the chain exactly.
+                let fits = if i == 0 {
+                    *from <= expected_next
+                } else {
+                    *from == expected_next
+                };
+                if !fits {
+                    let hint = match (i, floor) {
+                        (0, None) => format!(
+                            "; if the objects before it were removed on purpose, set the \
+                             chain's floor: mirror-v3 trim --floor {from}"
+                        ),
+                        (0, Some(_)) => format!(
+                            " (the chain's floor is {floor_offset}: offsets from there on must be \
+                             in the chain)"
+                        ),
+                        _ => String::new(),
+                    };
                     return Err(BlobError::CorruptChain(format!(
-                        "gap or overlap in chain: expected from={expected_next}, found {from}-{to}"
+                        "gap or overlap in chain: expected from={expected_next}, found \
+                         {from}-{to}{hint}"
                     )));
                 }
                 expected_next = to + 1;
             }
+            if above.is_empty() {
+                if let Some(end) = below.iter().map(|(_, to, _)| to + 1).max() {
+                    if end < floor_offset {
+                        return Err(BlobError::CorruptChain(format!(
+                            "the chain's floor {floor_offset} is above the end of the chain, \
+                             {end}: offsets {end}-{} are in no object",
+                            floor_offset - 1
+                        )));
+                    }
+                }
+            }
             Ok(Chain {
                 durable: expected_next,
                 latest: None,
-                tail: tail_of(&entries),
+                tail: tail_of(&above),
+                floor,
+                below_floor: below.iter().map(|(_, _, n)| n.to_string()).collect(),
+                markers,
             })
         }
         Some(CompactionMode::Log) => {
@@ -194,6 +360,9 @@ pub fn validate_chain(
                 durable: prev_to.map(|t| t + 1).unwrap_or(0),
                 latest: entries.last().map(|(_, _, n)| n.to_string()),
                 tail: tail_of(&entries),
+                floor: None,
+                below_floor: Vec::new(),
+                markers: Vec::new(),
             })
         }
     }
@@ -292,6 +461,56 @@ fn record_byte_size(record: &Record) -> u64 {
             .sum::<usize>() as u64
 }
 
+/// The floor gauges. A destination that never had a floor has none; one
+/// whose floor marker went away reports floor 0.
+fn report_floor(floor: Option<&Floor>) {
+    let (topic, partition, mirror) = mirror_core::current_labels();
+    metrics::gauge!(
+        "mirror_v3_destination_floor_offset",
+        "topic" => topic.clone(),
+        "partition" => partition.clone(),
+        "mirror" => mirror.clone(),
+    )
+    .set(floor.map_or(0, |f| f.offset) as f64);
+    metrics::gauge!(
+        "mirror_v3_destination_floor_moved_timestamp_seconds",
+        "topic" => topic.clone(),
+        "partition" => partition.clone(),
+        "mirror" => mirror.clone(),
+    )
+    .set(floor.map_or(0, |f| f.moved_at) as f64);
+    // NaN when unknown: no objects above the floor when its marker was
+    // written, or a marker written by hand.
+    metrics::gauge!(
+        "mirror_v3_destination_floor_oldest_record_timestamp_seconds",
+        "topic" => topic,
+        "partition" => partition,
+        "mirror" => mirror,
+    )
+    .set(
+        floor
+            .and_then(|f| f.oldest_ms)
+            .map_or(f64::NAN, |ms| ms as f64 / 1000.0),
+    );
+}
+
+fn describe_floor(floor: Option<&Floor>) -> String {
+    match floor {
+        None => "none".to_string(),
+        Some(f) => format!(
+            "{} (since {}{})",
+            f.offset,
+            floor::utc_rfc3339(f.moved_at),
+            f.oldest_ms
+                .map(|ms| format!(
+                    ", oldest record above it from {}",
+                    floor::utc_rfc3339(ms / 1000)
+                ))
+                .unwrap_or_default()
+        ),
+    }
+}
+
 fn report_compaction_keys(n: usize) {
     let (topic, partition, mirror) = mirror_core::current_labels();
     metrics::gauge!(
@@ -324,6 +543,12 @@ pub struct BlobSink<S> {
     tail: Vec<String>,
     last_drift_check: Instant,
     drift_check_interval: Duration,
+    /// Append mode: the chain's floor, as found at open and by each
+    /// drift check (the markers sort after every blob, so the drift
+    /// check's listing has them all).
+    floor: Option<Floor>,
+    /// Objects below the floor that were still in the directory at open.
+    below_floor_at_open: usize,
 }
 
 impl<S: BlobStore> BlobSink<S> {
@@ -369,6 +594,22 @@ impl<S: BlobStore> BlobSink<S> {
                 Some(view)
             }
         };
+        if chain.floor.is_some() {
+            report_floor(chain.floor.as_ref());
+            tracing::info!(
+                floor = %describe_floor(chain.floor.as_ref()),
+                below_floor_objects = chain.below_floor.len(),
+                next = chain.durable,
+                "the chain starts at its floor: objects that end below it may be missing"
+            );
+            if chain.tail.is_empty() {
+                tracing::warn!(
+                    floor = %describe_floor(chain.floor.as_ref()),
+                    "the destination holds no object at or above its floor (every object \
+                     expired); resuming at the floor"
+                );
+            }
+        }
         // Naive: the next future occurrence; a mirror down at the
         // boundary misses that day's flush.
         let next_daily_unix = spec
@@ -390,7 +631,19 @@ impl<S: BlobStore> BlobSink<S> {
             tail: chain.tail,
             last_drift_check: Instant::now(),
             drift_check_interval: DRIFT_CHECK_INTERVAL,
+            floor: chain.floor,
+            below_floor_at_open: chain.below_floor.len(),
         })
+    }
+
+    /// Append mode: the chain's floor, as last seen.
+    pub fn floor(&self) -> Option<&Floor> {
+        self.floor.as_ref()
+    }
+
+    /// Objects below the floor that were still in the directory at open.
+    pub fn below_floor_at_open(&self) -> usize {
+        self.below_floor_at_open
     }
 
     /// Check for foreign objects this often instead of every
@@ -497,6 +750,12 @@ impl<S: BlobStore> BlobSink<S> {
         );
         let location = self.store.location(&name);
 
+        // Append mode: the record times go with the object, so that
+        // `trim` can tell its age with a HEAD.
+        let metadata = match self.spec.compaction {
+            None => RecordTimes::of(&self.buffer).to_metadata(),
+            Some(_) => Vec::new(),
+        };
         // Compaction mode snapshots the view (current per record);
         // append mode encodes the buffer.
         let to_encode: Vec<Record> = match (self.spec.compaction, self.view.as_ref()) {
@@ -524,7 +783,7 @@ impl<S: BlobStore> BlobSink<S> {
         .map_err(|e| SinkError::Rejected(format!("encode: {e}")))?;
         let encoded_bytes = bytes.len() as u64;
 
-        match self.store.put_new(&name, bytes).await {
+        match self.store.put_new(&name, bytes, &metadata).await {
             Ok(()) => {}
             Err(BlobError::AlreadyExists(_)) => {
                 return Err(SinkError::Inconsistent(format!(
@@ -601,12 +860,14 @@ impl<S: BlobStore> BlobSink<S> {
 
     /// The destination must hold exactly what this process wrote: what
     /// sorts after the second-to-last object of the chain is the last
-    /// object and nothing else.
+    /// object and nothing else, apart from floor markers (which sort
+    /// after every blob) and, in append mode, objects that end below the
+    /// floor.
     async fn check_drift(&mut self) -> Result<(), SinkError> {
         let (after, expected) = match self.tail.as_slice() {
             [] => (None, None),
-            [last] => (None, Some(last.as_str())),
-            [before, last] => (Some(before.as_str()), Some(last.as_str())),
+            [last] => (None, Some(last.clone())),
+            [before, last] => (Some(before.as_str()), Some(last.clone())),
             _ => unreachable!("the tail holds at most two names"),
         };
         let listed = self
@@ -614,8 +875,29 @@ impl<S: BlobStore> BlobSink<S> {
             .list_after(after)
             .await
             .map_err(|e| SinkError::Transport(e.to_string()))?;
+        let ext = self.spec.format.extension();
+        let floor_offset = match self.spec.compaction {
+            None => self.observe_floor(&listed)?,
+            Some(_) => 0,
+        };
+        let below_floor =
+            |name: &str| naming::parse_blob_name(name, ext).is_some_and(|b| b.to < floor_offset);
+        // Trim removes objects below the floor. When the floor reaches
+        // the end of the chain (every object expired), that is all of
+        // them, the tail included.
+        let expected = expected.filter(|last| !below_floor(last));
+        if expected.is_none() {
+            self.tail.clear();
+        }
+        let expected = expected.as_deref();
+        // A compaction chain has no floor: a marker there is foreign.
+        let append = self.spec.compaction.is_none();
+        let listed: Vec<&String> = listed
+            .iter()
+            .filter(|n| !(append && floor::is_marker(n)) && !below_floor(n))
+            .collect();
         if let Some(last) = expected {
-            if !listed.iter().any(|n| n == last) {
+            if !listed.iter().any(|n| *n == last) {
                 return Err(SinkError::Inconsistent(format!(
                     "destination drift: {} is gone; it is the end of this mirror's chain",
                     self.store.location(last)
@@ -632,6 +914,41 @@ impl<S: BlobStore> BlobSink<S> {
         }
         self.last_drift_check = Instant::now();
         Ok(())
+    }
+
+    /// Take the floor from a listing that holds every marker, log and
+    /// report a change, and return its offset. A floor above the chain's
+    /// end would make this mirror skip offsets: an error.
+    fn observe_floor(&mut self, listed: &[String]) -> Result<u64, SinkError> {
+        let (floor, _) = floor::floor_of(listed)
+            .map_err(|e| SinkError::Inconsistent(format!("destination drift: {e}")))?;
+        let offset = floor.map_or(0, |f| f.offset);
+        if offset > self.durable_position {
+            return Err(SinkError::Inconsistent(format!(
+                "destination drift: a floor marker puts the chain's floor at {offset}, above \
+                 the end of this mirror's chain, {}",
+                self.durable_position
+            )));
+        }
+        if floor != self.floor {
+            let previous = self.floor.map_or(0, |f| f.offset);
+            if offset < previous {
+                tracing::warn!(
+                    previous = %describe_floor(self.floor.as_ref()),
+                    floor = %describe_floor(floor.as_ref()),
+                    "the destination's floor moved back: its highest floor marker was removed"
+                );
+            } else {
+                tracing::info!(
+                    previous = %describe_floor(self.floor.as_ref()),
+                    floor = %describe_floor(floor.as_ref()),
+                    "the destination's floor moved"
+                );
+            }
+            self.floor = floor;
+            report_floor(self.floor.as_ref());
+        }
+        Ok(offset)
     }
 }
 
@@ -762,6 +1079,157 @@ mod tests {
         assert!(gap.to_string().contains("gap or overlap"), "{gap}");
         let overlap = validate_chain(&[n(0, 4), n(4, 9)], Format::Ndjson, None).unwrap_err();
         assert!(overlap.to_string().contains("gap or overlap"), "{overlap}");
+    }
+
+    fn marker(offset: u64) -> String {
+        FloorMarker {
+            offset,
+            at: 1_000 + offset,
+            oldest_ms: None,
+        }
+        .filename()
+    }
+
+    fn append(names: &[String]) -> Result<Chain, String> {
+        validate_chain(names, Format::Ndjson, None).map_err(|e| e.to_string())
+    }
+
+    fn n(a: u64, b: u64) -> String {
+        naming::batch_filename(a, b, "ndjson")
+    }
+
+    #[test]
+    fn a_chain_starts_at_its_floor_and_ignores_objects_below_it() {
+        // The head expired entirely.
+        let c = append(&[marker(10), n(10, 19), n(20, 29)]).unwrap();
+        assert_eq!(c.durable, 30);
+        assert_eq!(c.floor.map(|f| f.offset), Some(10));
+        assert_eq!(c.tail, vec![n(10, 19), n(20, 29)]);
+        assert!(c.below_floor.is_empty());
+        // Objects below the floor are still there (a retention lock, a
+        // deletion that has not run), some or all of them.
+        let c = append(&[n(0, 4), n(5, 9), marker(10), n(10, 19)]).unwrap();
+        assert_eq!(c.durable, 20);
+        assert_eq!(c.below_floor, vec![n(0, 4), n(5, 9)]);
+        let c = append(&[n(5, 9), marker(20), n(20, 29)]).unwrap();
+        assert_eq!(c.durable, 30);
+        assert_eq!(c.below_floor, vec![n(5, 9)]);
+        // Below the floor nothing needs to be a chain.
+        let c = append(&[n(0, 9), n(3, 12), marker(20), n(20, 29)]).unwrap();
+        assert_eq!(c.durable, 30);
+    }
+
+    #[test]
+    fn the_first_object_may_start_below_the_floor() {
+        let c = append(&[marker(15), n(10, 19), n(20, 29)]).unwrap();
+        assert_eq!(c.durable, 30);
+        assert_eq!(c.tail, vec![n(10, 19), n(20, 29)]);
+        assert!(c.below_floor.is_empty());
+    }
+
+    #[test]
+    fn above_the_floor_the_chain_must_be_contiguous() {
+        let gap = append(&[marker(10), n(10, 19), n(25, 29)]).unwrap_err();
+        assert!(
+            gap.contains("gap or overlap in chain: expected from=20"),
+            "{gap}"
+        );
+        let overlap = append(&[marker(10), n(10, 19), n(15, 29)]).unwrap_err();
+        assert!(overlap.contains("gap or overlap"), "{overlap}");
+        let late = append(&[n(0, 9), marker(10), n(12, 19)]).unwrap_err();
+        assert!(late.contains("expected from=10, found 12-19"), "{late}");
+        assert!(late.contains("the chain's floor is 10"), "{late}");
+    }
+
+    #[test]
+    fn without_a_floor_a_missing_head_is_corrupt_and_says_how_to_set_one() {
+        let e = append(&[n(5, 9), n(10, 19)]).unwrap_err();
+        assert!(e.contains("expected from=0, found 5-9"), "{e}");
+        assert!(e.contains("mirror-v3 trim --floor 5"), "{e}");
+    }
+
+    #[test]
+    fn a_floor_above_the_end_of_the_chain_is_corrupt_unless_nothing_is_left() {
+        let e = append(&[n(0, 9), n(10, 19), marker(50)]).unwrap_err();
+        assert!(
+            e.contains("floor 50 is above the end of the chain, 20"),
+            "{e}"
+        );
+        // At the end of the chain: every object expired.
+        let c = append(&[n(0, 9), n(10, 19), marker(20)]).unwrap();
+        assert_eq!(c.durable, 20);
+        assert!(c.tail.is_empty());
+        assert_eq!(c.below_floor.len(), 2);
+        // Nothing left at all: the floor is where the chain ended.
+        let c = append(&[marker(10), marker(20)]).unwrap();
+        assert_eq!(c.durable, 20);
+        assert_eq!(c.markers.len(), 2);
+    }
+
+    #[test]
+    fn the_highest_marker_wins() {
+        let c = append(&[marker(10), marker(5), n(10, 19)]).unwrap();
+        assert_eq!(c.floor.map(|f| f.offset), Some(10));
+        // Without the highest marker the floor is lower, and the chain
+        // must reach down to it.
+        let e = append(&[marker(5), n(10, 19)]).unwrap_err();
+        assert!(e.contains("expected from=5, found 10-19"), "{e}");
+    }
+
+    #[test]
+    fn a_broken_marker_name_is_an_error() {
+        let e = append(&["floor-10.json".to_string(), n(0, 9)]).unwrap_err();
+        assert!(e.contains("is not a floor marker name"), "{e}");
+    }
+
+    #[test]
+    fn a_compaction_chain_has_no_floor() {
+        let e = validate_chain(
+            &[marker(10), naming::batch_filename(10, 19, "parquet")],
+            Format::Parquet,
+            Some(CompactionMode::Log),
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("has no floor"), "{e}");
+    }
+
+    #[test]
+    fn record_times_round_trip_through_metadata() {
+        let rec = |ts: Option<i64>| Record {
+            topic: "t".into(),
+            partition: 0,
+            source_offset: 0,
+            timestamp_ms: ts,
+            timestamp_type: mirror_core::TimestampType::CreateTime,
+            key: None,
+            value: None,
+            headers: vec![],
+        };
+        let times = RecordTimes::of(&[rec(Some(20)), rec(None), rec(Some(10)), rec(Some(-1))]);
+        assert_eq!(
+            times,
+            RecordTimes {
+                min_ms: Some(10),
+                max_ms: Some(20),
+                without: 2
+            }
+        );
+        let meta: std::collections::HashMap<&str, String> =
+            times.to_metadata().into_iter().collect();
+        let back = RecordTimes::from_metadata(|k| meta.get(k).cloned()).unwrap();
+        assert_eq!(back, Some(times));
+        let none = RecordTimes::of(&[rec(None)]);
+        let meta: std::collections::HashMap<&str, String> =
+            none.to_metadata().into_iter().collect();
+        assert_eq!(
+            RecordTimes::from_metadata(|k| meta.get(k).cloned()).unwrap(),
+            Some(none)
+        );
+        assert_eq!(RecordTimes::from_metadata(|_| None).unwrap(), None);
+        let e =
+            RecordTimes::from_metadata(|k| (k == META_MAX_TIMESTAMP_MS).then(|| "5".to_string()))
+                .unwrap_err();
+        assert!(e.contains("incomplete"), "{e}");
     }
 
     #[test]

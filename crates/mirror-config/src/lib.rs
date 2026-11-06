@@ -41,6 +41,9 @@ pub struct Config {
     pub mirrors: Vec<Mirror>,
 }
 
+// Parsed once per process and held by reference: the S3 variant's size
+// costs nothing worth a Box in every match.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum Destination {
@@ -89,9 +92,25 @@ pub struct FilesystemDestination {
     pub name: Option<String>,
     /// Absolute path to the destination root directory.
     pub root: PathBuf,
+    /// How long records are kept; see [`Retention`].
+    #[serde(default)]
+    pub retention: Option<Retention>,
     /// See [`KafkaDestination::affects_readiness`].
     #[serde(default = "default_true")]
     pub affects_readiness: bool,
+}
+
+/// How long a blob destination keeps records, enforced by
+/// `mirror-v3 trim` (run on a schedule), not by the mirror: trim moves
+/// the chain's floor past every object whose records, and the records
+/// of every object before it, are older than `max-age-days` (by record
+/// timestamp), and deletes the objects below the floor. Append mode
+/// only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct Retention {
+    /// Age in days (of 86400 seconds) past which a record is deleted.
+    pub max_age_days: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -119,6 +138,10 @@ pub struct S3Destination {
     /// `none`, or the Parquet key layout of the observability
     /// compactor (`keys-dir`, `key-id`).
     pub encryption: Encryption,
+    /// How long records are kept; see [`Retention`]. Needs
+    /// `credentials.trim`.
+    #[serde(default)]
+    pub retention: Option<Retention>,
     /// See [`KafkaDestination::affects_readiness`].
     #[serde(default = "default_true")]
     pub affects_readiness: bool,
@@ -154,15 +177,19 @@ pub struct ParquetKeys {
     pub key_id: String,
 }
 
-/// Two identities, as a least-privilege bucket setup has them: `write` may
-/// only PutObject; `read` lists the prefix (resume position, drift
-/// check) and, in compaction mode, reads the latest snapshot. They may
-/// name the same variables where one key does both.
+/// The identities, as a least-privilege bucket setup has them: `write`
+/// may only PutObject; `read` lists the prefix (resume position, drift
+/// check) and, in compaction mode, reads the latest snapshot; `trim`,
+/// used by `mirror-v3 trim` only, lists, HEADs (record times are object
+/// metadata, so it needs no Parquet key), puts floor markers and
+/// deletes. They may name the same variables where one key does more.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct S3Credentials {
     pub write: S3Key,
     pub read: S3Key,
+    #[serde(default)]
+    pub trim: Option<S3Key>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -179,6 +206,15 @@ fn default_true() -> bool {
 }
 
 impl Destination {
+    /// A blob destination's retention.
+    pub fn retention(&self) -> Option<&Retention> {
+        match self {
+            Destination::Kafka(_) => None,
+            Destination::Filesystem(fs) => fs.retention.as_ref(),
+            Destination::S3(s3) => s3.retention.as_ref(),
+        }
+    }
+
     /// Effective identifier for this destination, falling back to
     /// the enclosing mirror's `name` when none was set in YAML.
     pub fn effective_name(&self, mirror_name: &str) -> String {
@@ -1094,6 +1130,35 @@ fn validate_destinations(m: &Mirror) -> Result<(), LoadError> {
                 return Err(LoadError::Validation(format!(
                     "mirror {:?}: encryption key-id {:?} is not a key id ([a-z0-9][a-z0-9-]{{0,31}})",
                     m.name, k.key_id
+                )));
+            }
+        }
+    }
+    for d in &m.destinations {
+        let Some(retention) = d.retention() else {
+            continue;
+        };
+        let name = d.effective_name(&m.name);
+        if retention.max_age_days == 0 {
+            return Err(LoadError::Validation(format!(
+                "mirror {:?}: destination {name:?}: `retention.max-age-days` must be at least 1",
+                m.name
+            )));
+        }
+        if m.compaction.is_some() {
+            return Err(LoadError::Validation(format!(
+                "mirror {:?}: destination {name:?}: `retention` needs append mode; a \
+                 `compaction: log` chain keeps only its latest snapshot anyway",
+                m.name
+            )));
+        }
+        if let Destination::S3(s3) = d {
+            if s3.credentials.trim.is_none() {
+                return Err(LoadError::Validation(format!(
+                    "mirror {:?}: destination {name:?}: `retention` needs `credentials.trim`, \
+                     the identity `mirror-v3 trim` lists, HEADs, writes floor markers and \
+                     deletes with",
+                    m.name
                 )));
             }
         }

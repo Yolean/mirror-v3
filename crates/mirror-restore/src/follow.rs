@@ -26,7 +26,10 @@ use mirror_core::{Record, Source, SourceError, TimestampType};
 use mirror_envelope::{Format, Keyring};
 use mirror_fs::blob::BlobStore;
 
-use crate::{plan_chain, BackupSource, ChainObject, OffsetMode, Reader, RestoreError};
+use crate::{
+    check_keys, plan_chain, plan_floor_chain, BackupSource, ChainObject, OffsetMode, Reader,
+    RestoreError,
+};
 
 type PendingRead = Pin<Box<dyn Future<Output = Result<Vec<Record>, RestoreError>> + Send>>;
 
@@ -40,15 +43,18 @@ pub struct ChainSourceConfig<S> {
     pub keyring: Option<Arc<Keyring>>,
     pub source: BackupSource,
     pub mode: OffsetMode,
-    /// The offset the backup starts at; 0 unless objects before it were
-    /// removed on purpose.
-    pub chain_start: u64,
+    /// The offset the backup starts at. `None`: at its floor (see
+    /// [`mirror_fs::floor`]), 0 without one. `Some`: exactly there.
+    pub chain_start: Option<u64>,
     /// How long to wait between listings once every object is read.
     pub poll_interval: Duration,
 }
 
 pub struct ChainSource<S> {
     cfg: ChainSourceConfig<S>,
+    /// The chain's first position: `cfg.chain_start`, or where its floor
+    /// puts it, as of the first listing that found objects.
+    start: u64,
     /// The objects listed so far, a validated chain.
     chain: Vec<ChainObject>,
     /// Records of `chain[i]`, for the objects counted so far
@@ -81,14 +87,8 @@ impl<S: BlobStore + Send + Sync + 'static> ChainSource<S> {
     /// List the backup and validate its chain. An empty backup is not an
     /// error: its first object is waited for.
     pub async fn open(cfg: ChainSourceConfig<S>) -> Result<Self, RestoreError> {
-        if cfg.mode == OffsetMode::Preserve && cfg.chain_start != 0 {
-            return Err(RestoreError::Mode(format!(
-                "--offsets=preserve: the backup starts at offset {}, and a Kafka topic starts \
-                 at 0",
-                cfg.chain_start
-            )));
-        }
         let mut source = Self {
+            start: cfg.chain_start.unwrap_or(0),
             cfg,
             chain: Vec::new(),
             counts: Vec::new(),
@@ -102,6 +102,13 @@ impl<S: BlobStore + Send + Sync + 'static> ChainSource<S> {
             last_read: None,
         };
         source.list_new().await?;
+        if source.cfg.mode == OffsetMode::Preserve && source.start != 0 {
+            return Err(RestoreError::Mode(format!(
+                "--offsets=preserve: the backup starts at offset {}, and a Kafka topic starts \
+                 at 0",
+                source.start
+            )));
+        }
         Ok(source)
     }
 
@@ -187,10 +194,33 @@ impl<S: BlobStore + Send + Sync + 'static> ChainSource<S> {
             .list_after(after.as_deref())
             .await
             .map_err(|e| RestoreError::Store(format!("listing the backup: {e}")))?;
+        // Floor markers sort after every object, so every listing has
+        // them; until the chain has objects its start comes from them.
+        if self.chain.is_empty() && self.cfg.chain_start.is_none() {
+            let planned = plan_floor_chain(&names, self.cfg.format, None)?;
+            check_keys(&planned.objects, self.cfg.keyring.as_deref())?;
+            self.start = planned.start();
+            if planned.objects.is_empty() {
+                return Ok(false);
+            }
+            tracing::info!(
+                objects = planned.objects.len(),
+                start = self.start,
+                floor = planned.floor.map(|f| f.offset),
+                to = planned.objects.last().map(|o| o.to),
+                "new backup objects"
+            );
+            self.chain.extend(planned.objects);
+            return Ok(true);
+        }
+        let names: Vec<String> = names
+            .into_iter()
+            .filter(|n| !mirror_fs::floor::is_marker(n))
+            .collect();
         if names.is_empty() {
             return Ok(false);
         }
-        let start = self.chain.last().map_or(self.cfg.chain_start, |o| o.to + 1);
+        let start = self.chain.last().map_or(self.start, |o| o.to + 1);
         if !self.chain.is_empty() {
             let ext = self.cfg.format.extension();
             let first = names
@@ -260,9 +290,7 @@ impl<S: BlobStore + Send + Sync + 'static> ChainSource<S> {
     /// with renumber an upper bound (the chain's positions, holes
     /// included), so that it costs no reads.
     fn positions_end(&self) -> u64 {
-        self.chain
-            .last()
-            .map_or(0, |o| o.to + 1 - self.cfg.chain_start)
+        self.chain.last().map_or(0, |o| o.to + 1 - self.start)
     }
 
     /// Read `next_object` into the buffer.
