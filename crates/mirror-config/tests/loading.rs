@@ -1122,7 +1122,10 @@ fn retention_parses_on_blob_destinations() {
     let d = &cfg.mirrors[0].destinations[0];
     assert_eq!(
         d.retention(),
-        Some(&mirror_config::Retention { max_age_days: 400 })
+        Some(&mirror_config::Retention {
+            max_age_days: 400,
+            lock_days: None
+        })
     );
     let Destination::S3(s3) = d else { panic!() };
     assert_eq!(
@@ -1139,7 +1142,10 @@ fn retention_parses_on_blob_destinations() {
     .unwrap();
     assert_eq!(
         cfg.mirrors[0].destinations[0].retention(),
-        Some(&mirror_config::Retention { max_age_days: 30 })
+        Some(&mirror_config::Retention {
+            max_age_days: 30,
+            lock_days: None
+        })
     );
 }
 
@@ -1169,4 +1175,63 @@ fn retention_needs_a_trim_identity_append_mode_and_a_positive_age() {
     let kafka = "      - type: kafka\n        bootstrap-servers: k:9092\n        retention: { max-age-days: 1 }";
     let err = load_from_str(&retention_yaml(kafka, "")).unwrap_err();
     assert!(format!("{err}").contains("retention"), "{err}");
+}
+
+#[test]
+fn lock_days_parses_at_or_below_max_age_days() {
+    let locked = S3_WITH_TRIM.replace(
+        "retention: { max-age-days: 400 }",
+        "retention: { max-age-days: 400, lock-days: 396 }",
+    );
+    let cfg = load_from_str(&retention_yaml(&locked, "")).unwrap();
+    assert_eq!(
+        cfg.mirrors[0].destinations[0].retention(),
+        Some(&mirror_config::Retention {
+            max_age_days: 400,
+            lock_days: Some(396)
+        })
+    );
+    let equal = S3_WITH_TRIM.replace(
+        "retention: { max-age-days: 400 }",
+        "retention: { max-age-days: 400, lock-days: 400 }",
+    );
+    load_from_str(&retention_yaml(&equal, "")).unwrap();
+}
+
+#[test]
+fn lock_days_is_refused_past_max_age_days_on_compaction_and_on_a_filesystem() {
+    let longer = S3_WITH_TRIM.replace(
+        "retention: { max-age-days: 400 }",
+        "retention: { max-age-days: 400, lock-days: 401 }",
+    );
+    let err = load_from_str(&retention_yaml(&longer, "")).unwrap_err();
+    assert!(
+        format!("{err}").contains("the lock would outlive the deletion"),
+        "{err}"
+    );
+    let locked = S3_WITH_TRIM.replace(
+        "retention: { max-age-days: 400 }",
+        "retention: { max-age-days: 400, lock-days: 396 }",
+    );
+    let err = load_from_str(&retention_yaml(
+        &locked,
+        "    compaction: log\n    keys: { type: utf8 }",
+    ))
+    .unwrap_err();
+    assert!(
+        format!("{err}").contains("`retention` needs append mode"),
+        "{err}"
+    );
+    let zero = locked.replace("lock-days: 396", "lock-days: 0");
+    let err = load_from_str(&retention_yaml(&zero, "")).unwrap_err();
+    assert!(
+        format!("{err}").contains("`retention.lock-days` must be at least 1"),
+        "{err}"
+    );
+    let fs = "      - type: filesystem\n        root: /data\n        retention: { max-age-days: 30, lock-days: 10 }";
+    let err = load_from_str(&retention_yaml(fs, "")).unwrap_err();
+    assert!(
+        format!("{err}").contains("needs an S3 destination"),
+        "{err}"
+    );
 }

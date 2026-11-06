@@ -7,7 +7,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use mirror_core::{Record, Sink, TimestampType};
 use mirror_envelope::{ColumnType, Format, Keyring, ParquetCompression};
-use mirror_fs::blob::{BlobError, BlobStore, RecordTimes};
+use mirror_fs::blob::{BlobError, BlobStore, NewObject, ObjectVersion, RecordTimes};
 use mirror_fs::floor::FloorMarker;
 use mirror_fs::{naming, FilesystemSink, FilesystemSinkConfig, FlushTriggers, FsStore};
 use mirror_restore::{plan_floor_chain, trim, FloorTarget, Stop, TrimConfig, TrimReport};
@@ -216,9 +216,9 @@ impl BlobStore for Locked {
         &self,
         name: &str,
         bytes: Vec<u8>,
-        metadata: &[(&'static str, String)],
-    ) -> Result<(), BlobError> {
-        self.inner.put_new(name, bytes, metadata).await
+        object: &NewObject,
+    ) -> Result<Option<u64>, BlobError> {
+        self.inner.put_new(name, bytes, object).await
     }
     async fn get(&self, name: &str) -> Result<Vec<u8>, BlobError> {
         self.inner.get(name).await
@@ -396,9 +396,9 @@ impl BlobStore for NoGet {
         &self,
         name: &str,
         bytes: Vec<u8>,
-        metadata: &[(&'static str, String)],
-    ) -> Result<(), BlobError> {
-        self.0.put_new(name, bytes, metadata).await
+        object: &NewObject,
+    ) -> Result<Option<u64>, BlobError> {
+        self.0.put_new(name, bytes, object).await
     }
     async fn get(&self, name: &str) -> Result<Vec<u8>, BlobError> {
         panic!("trim read {name}");
@@ -431,6 +431,7 @@ fn s3_cfg(store: Arc<dyn ObjectStore>, encryption: Option<BlobEncryption>) -> S3
         compaction: None,
         flush: flush(),
         encryption,
+        lock: None,
     }
 }
 
@@ -508,4 +509,179 @@ async fn s3_objects_without_record_time_metadata_block_until_adopted() {
     let planned = plan_floor_chain(&store.list().await.unwrap(), Format::Parquet, None).unwrap();
     assert!(planned.objects.is_empty());
     assert!(planned.below_floor.is_empty());
+}
+
+/// A filesystem backup as a versioned bucket shows it: every object has
+/// one version, `v-<name>`, and `extra` adds versions a DELETE already
+/// hid behind delete markers. Records what trim writes and deletes;
+/// versions in `locked` refuse to delete, as under a retention lock.
+struct Versioned {
+    inner: FsStore,
+    extra: Vec<ObjectVersion>,
+    locked: Vec<String>,
+    puts: Mutex<Vec<(String, NewObject)>>,
+    deleted_versions: Mutex<Vec<(String, String)>>,
+    plain_deletes: Mutex<Vec<String>>,
+}
+
+impl Versioned {
+    fn new(inner: FsStore, extra: Vec<ObjectVersion>, locked: Vec<String>) -> Self {
+        Self {
+            inner,
+            extra,
+            locked,
+            puts: Mutex::new(Vec::new()),
+            deleted_versions: Mutex::new(Vec::new()),
+            plain_deletes: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+#[async_trait]
+impl BlobStore for Versioned {
+    async fn list(&self) -> Result<Vec<String>, BlobError> {
+        self.inner.list().await
+    }
+    async fn put_new(
+        &self,
+        name: &str,
+        bytes: Vec<u8>,
+        object: &NewObject,
+    ) -> Result<Option<u64>, BlobError> {
+        self.puts.lock().unwrap().push((name.to_string(), *object));
+        self.inner.put_new(name, bytes, object).await
+    }
+    async fn get(&self, name: &str) -> Result<Vec<u8>, BlobError> {
+        self.inner.get(name).await
+    }
+    async fn list_after(&self, after: Option<&str>) -> Result<Vec<String>, BlobError> {
+        self.inner.list_after(after).await
+    }
+    fn location(&self, name: &str) -> String {
+        self.inner.location(name)
+    }
+    async fn record_times(&self, name: &str) -> Result<Option<RecordTimes>, BlobError> {
+        self.inner.record_times(name).await
+    }
+    async fn delete(&self, name: &str) -> Result<(), BlobError> {
+        self.plain_deletes.lock().unwrap().push(name.to_string());
+        Ok(())
+    }
+    async fn versions(&self) -> Result<Option<Vec<ObjectVersion>>, BlobError> {
+        let mut versions: Vec<ObjectVersion> = self
+            .inner
+            .list()
+            .await?
+            .into_iter()
+            .map(|name| ObjectVersion {
+                version_id: format!("v-{name}"),
+                name,
+                delete_marker: false,
+            })
+            .collect();
+        versions.extend(self.extra.iter().cloned());
+        Ok(Some(versions))
+    }
+    async fn delete_version(&self, name: &str, version_id: &str) -> Result<(), BlobError> {
+        if self.locked.iter().any(|l| l == version_id) {
+            return Err(BlobError::Store(format!(
+                "{name} {version_id}: AccessDenied"
+            )));
+        }
+        self.deleted_versions
+            .lock()
+            .unwrap()
+            .push((name.to_string(), version_id.to_string()));
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn on_a_versioned_store_trim_deletes_every_version_below_the_floor_by_id() {
+    let tmp = tempfile::tempdir().unwrap();
+    let inner = fs_backup(tmp.path(), (0..10).map(rec).collect()).await;
+    // 0-1 was deleted without a version id before: its data is a
+    // noncurrent version behind a delete marker, and it is not listed.
+    std::fs::remove_file(fs_dir(tmp.path()).join(n(0, 1))).unwrap();
+    let hidden = |id: &str, delete_marker| ObjectVersion {
+        name: n(0, 1),
+        version_id: id.into(),
+        delete_marker,
+    };
+    let foreign = ObjectVersion {
+        name: "notes.txt".into(),
+        version_id: "f1".into(),
+        delete_marker: false,
+    };
+    std::fs::write(
+        fs_dir(tmp.path()).join(
+            FloorMarker {
+                offset: 2,
+                at: NOW - 86_400,
+                oldest_ms: None,
+            }
+            .filename(),
+        ),
+        b"{}",
+    )
+    .unwrap();
+    let store = Versioned::new(
+        inner,
+        vec![hidden("old", false), hidden("dm", true), foreign],
+        vec![format!("v-{}", n(4, 5))],
+    );
+    let report = run(&store, cutoff(6_500)).await.unwrap();
+    assert_eq!(report.floor, 6);
+    assert!(report.versioned);
+    assert!(
+        store.plain_deletes.lock().unwrap().is_empty(),
+        "no DELETE without a version id"
+    );
+    assert_eq!(
+        sorted(
+            store
+                .deleted_versions
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(_, id)| id.clone())
+                .collect()
+        ),
+        vec![
+            "dm".to_string(),
+            "old".to_string(),
+            format!("v-{}", n(2, 3))
+        ],
+        "the hidden object too; not the floor markers, not foreign objects, not above the floor"
+    );
+    assert_eq!(
+        sorted(report.deleted.clone()),
+        vec![
+            format!("{} (delete marker dm)", n(0, 1)),
+            format!("{} (version old)", n(0, 1)),
+            format!("{} (version v-{})", n(2, 3), n(2, 3)),
+        ]
+    );
+    assert_eq!(
+        report
+            .failed
+            .iter()
+            .map(|(label, _)| label.clone())
+            .collect::<Vec<_>>(),
+        vec![format!("{} (version v-{})", n(4, 5), n(4, 5))],
+        "a version still under its lock is left for the next trim"
+    );
+}
+
+#[tokio::test]
+async fn the_floor_marker_is_written_as_a_marker_for_the_store_to_lock() {
+    let tmp = tempfile::tempdir().unwrap();
+    let inner = fs_backup(tmp.path(), (0..10).map(rec).collect()).await;
+    let store = Versioned::new(inner, vec![], vec![]);
+    let report = run(&store, cutoff(4_500)).await.unwrap();
+    let marker = report.marker.expect("a marker");
+    assert_eq!(
+        *store.puts.lock().unwrap(),
+        vec![(marker, NewObject::Marker { written_at: NOW })]
+    );
 }

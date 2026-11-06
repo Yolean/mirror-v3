@@ -45,6 +45,7 @@ fn cfg(store: Arc<dyn ObjectStore>, max_offsets: u64) -> S3SinkConfig {
             max_offsets,
             daily_at_utc_seconds: None,
         },
+        lock: None,
     }
 }
 
@@ -168,6 +169,7 @@ async fn put_mode_create_rejects_overwrite() {
             max_offsets: 100,
             daily_at_utc_seconds: None,
         },
+        lock: None,
     })
     .await
     .unwrap();
@@ -244,6 +246,7 @@ fn cfg_compacted(store: Arc<dyn ObjectStore>, max_offsets: u64) -> S3SinkConfig 
             max_offsets,
             daily_at_utc_seconds: None,
         },
+        lock: None,
     }
 }
 

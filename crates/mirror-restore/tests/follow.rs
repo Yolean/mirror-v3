@@ -13,7 +13,7 @@ use mirror_core::{
     run_mirror_with_heartbeat, MirrorError, Record, Sink, SinkError, Source, TimestampType,
 };
 use mirror_envelope::Format;
-use mirror_fs::blob::{BlobError, BlobStore};
+use mirror_fs::blob::{BlobError, BlobStore, NewObject};
 use mirror_restore::{same_record, ChainSource, ChainSourceConfig, OffsetMode};
 
 /// A partition shared with the test: what it holds is readable while
@@ -405,9 +405,9 @@ impl BlobStore for Counting {
         &self,
         name: &str,
         bytes: Vec<u8>,
-        metadata: &[(&'static str, String)],
-    ) -> Result<(), BlobError> {
-        self.inner.put_new(name, bytes, metadata).await
+        object: &NewObject,
+    ) -> Result<Option<u64>, BlobError> {
+        self.inner.put_new(name, bytes, object).await
     }
     async fn get(&self, name: &str) -> Result<Vec<u8>, BlobError> {
         self.gets.lock().unwrap().push(name.to_string());

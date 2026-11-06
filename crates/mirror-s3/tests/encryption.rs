@@ -63,6 +63,7 @@ fn cfg(
             max_offsets: 2,
             daily_at_utc_seconds: None,
         },
+        lock: None,
     }
 }
 

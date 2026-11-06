@@ -14,6 +14,14 @@
 //!
 //! On open, list every object under the prefix, parse `<from>-<to>.<ext>`
 //! names, and validate the chain (see [`mirror_fs::blob::validate_chain`]).
+//!
+//! ## Retention lock
+//!
+//! A destination with `lock-days` writes each object with a COMPLIANCE
+//! retention lock in the PUT that creates it (see [`lock`]), and reads
+//! the lock back before it counts the object as written. Open refuses a
+//! bucket without object lock. Nothing ever sets the retention of an
+//! object that exists.
 
 use std::sync::Arc;
 
@@ -22,13 +30,19 @@ use bytes::Bytes;
 use futures::StreamExt;
 use mirror_core::{FlushObserver, Record, Sink, SinkError};
 use mirror_envelope::{ColumnType, Format, ParquetCompression};
-use mirror_fs::blob::{self, BlobError, BlobSink, BlobSpec, BlobStore, RecordTimes};
-use mirror_fs::floor::Floor;
+use mirror_fs::blob::{
+    self, BlobError, BlobSink, BlobSpec, BlobStore, NewObject, ObjectVersion, RecordTimes,
+};
+use mirror_fs::floor::{utc_rfc3339, Floor};
 use object_store::path::Path;
 use object_store::{
     Attribute, Attributes, GetOptions, ObjectStore, PutMode, PutOptions, PutPayload,
 };
 
+pub mod api;
+pub mod lock;
+
+pub use api::{ApiError, BucketLock, S3Api};
 pub use mirror_fs::blob::{BlobEncryption, CompactionMode, FlushTriggers, UnixClock};
 
 /// Errors from opening an S3 destination.
@@ -57,6 +71,15 @@ pub struct S3SinkConfig {
     pub flush: FlushTriggers,
     /// Explicit per destination: `None` writes blobs in clear.
     pub encryption: Option<BlobEncryption>,
+    /// `lock-days`: every new object is written with a retention lock.
+    pub lock: Option<SinkLock>,
+}
+
+/// A destination's retention lock.
+pub struct SinkLock {
+    pub days: u32,
+    /// The bucket, reached with the writing identity.
+    pub api: Arc<S3Api>,
 }
 
 /// One partition prefix in an object store, reached with two identities:
@@ -66,6 +89,10 @@ pub struct S3Store {
     read: Arc<dyn ObjectStore>,
     write: Option<Arc<dyn ObjectStore>>,
     partition_prefix: Path,
+    /// Signed requests object_store does not make, with the writing
+    /// identity: locked PUTs and their read-back, and versions.
+    api: Option<Arc<S3Api>>,
+    lock_days: Option<u32>,
 }
 
 impl S3Store {
@@ -78,6 +105,8 @@ impl S3Store {
             read,
             write: Some(write),
             partition_prefix,
+            api: None,
+            lock_days: None,
         }
     }
 
@@ -87,6 +116,72 @@ impl S3Store {
             read,
             write: None,
             partition_prefix,
+            api: None,
+            lock_days: None,
+        }
+    }
+
+    /// Reach the bucket with `api` (the writing identity's) for what
+    /// object_store cannot do: locked PUTs, and versions on a versioned
+    /// bucket. Without it, [`BlobStore::versions`] takes the bucket for
+    /// unversioned.
+    pub fn with_api(mut self, api: Arc<S3Api>) -> Self {
+        self.api = Some(api);
+        self
+    }
+
+    /// Write every new object with a retention lock of `days` (see
+    /// [`lock::retain_until`]). Needs [`S3Store::with_api`].
+    pub fn with_lock(mut self, days: u32) -> Self {
+        self.lock_days = Some(days);
+        self
+    }
+
+    /// Write `bytes` with a COMPLIANCE lock until `retain_until`, then
+    /// read the lock back: an object counts as written only once the
+    /// store shows the lock it was written with.
+    async fn put_locked(
+        &self,
+        path: &Path,
+        bytes: Vec<u8>,
+        metadata: &[(&'static str, String)],
+        retain_until: u64,
+    ) -> Result<(), BlobError> {
+        let Some(api) = &self.api else {
+            return Err(BlobError::Lock(format!(
+                "put {path}: a retention lock is configured, but this store has no S3 API to \
+                 set it with"
+            )));
+        };
+        let key = path.as_ref();
+        if let Err(e) = api
+            .put_object_locked(key, Bytes::from(bytes), metadata, retain_until)
+            .await
+        {
+            return Err(match e.status {
+                Some(412) => BlobError::AlreadyExists(path.to_string()),
+                _ if e.is_transient() => BlobError::Store(format!("locked put {path}: {e}")),
+                _ => BlobError::Lock(format!(
+                    "locked put {path}: {e} (the writing identity needs s3:PutObjectRetention \
+                     besides s3:PutObject)"
+                )),
+            });
+        }
+        let not_locked = |got: String| {
+            BlobError::Lock(format!(
+                "{path} was written, but its retention is {got}, not COMPLIANCE until {}: the \
+                 store did not apply the lock",
+                utc_rfc3339(retain_until)
+            ))
+        };
+        match api.object_retention(key).await {
+            Ok(Some(r)) if r.mode == "COMPLIANCE" && r.retain_until >= retain_until => Ok(()),
+            Ok(Some(r)) => Err(not_locked(r.to_string())),
+            Ok(None) => Err(not_locked("none".into())),
+            Err(e) => Err(BlobError::Lock(format!(
+                "{path} was written with a retention lock, but reading it back failed: {e} \
+                 (the writing identity needs s3:GetObjectRetention)"
+            ))),
         }
     }
 
@@ -119,17 +214,35 @@ impl BlobStore for S3Store {
         &self,
         name: &str,
         bytes: Vec<u8>,
-        metadata: &[(&'static str, String)],
-    ) -> Result<(), BlobError> {
+        object: &NewObject,
+    ) -> Result<Option<u64>, BlobError> {
         let path = self.path(name);
         let Some(write) = &self.write else {
             return Err(BlobError::Store(format!(
                 "put {path}: this store was opened to read only"
             )));
         };
+        let metadata = match object {
+            NewObject::Records { times, .. } => times.to_metadata(),
+            NewObject::Marker { .. } | NewObject::Snapshot => Vec::new(),
+        };
+        if let Some(days) = self.lock_days {
+            match lock::retain_until(object, days) {
+                Some(until) => {
+                    self.put_locked(&path, bytes, &metadata, until).await?;
+                    return Ok(Some(until));
+                }
+                None if matches!(object, NewObject::Records { .. }) => tracing::info!(
+                    object = %path,
+                    lock_days = days,
+                    "writing without a retention lock: its records are older than lock-days"
+                ),
+                None => {}
+            }
+        }
         let mut attributes = Attributes::new();
         for (key, value) in metadata {
-            attributes.insert(Attribute::Metadata((*key).into()), value.clone().into());
+            attributes.insert(Attribute::Metadata(key.into()), value.into());
         }
         let opts = PutOptions {
             mode: PutMode::Create,
@@ -140,7 +253,7 @@ impl BlobStore for S3Store {
             .put_opts(&path, PutPayload::from(Bytes::from(bytes)), opts)
             .await
         {
-            Ok(_) => Ok(()),
+            Ok(_) => Ok(None),
             Err(object_store::Error::AlreadyExists { .. })
             | Err(object_store::Error::Precondition { .. }) => {
                 Err(BlobError::AlreadyExists(path.to_string()))
@@ -204,6 +317,55 @@ impl BlobStore for S3Store {
         }
     }
 
+    /// GetBucketVersioning, then ListObjectVersions of the prefix, with
+    /// the writing identity (the trim identity, for `trim`).
+    async fn versions(&self) -> Result<Option<Vec<ObjectVersion>>, BlobError> {
+        let Some(api) = &self.api else {
+            return Ok(None);
+        };
+        let versioning = api.bucket_versioning().await.map_err(|e| {
+            BlobError::Store(format!(
+                "bucket {}: cannot tell whether it keeps versions: {e} (the identity needs \
+                 s3:GetBucketVersioning)",
+                api.bucket()
+            ))
+        })?;
+        if versioning == api::Versioning::Off {
+            return Ok(None);
+        }
+        let prefix = format!("{}/", self.partition_prefix);
+        let versions = api.list_object_versions(&prefix).await.map_err(|e| {
+            BlobError::Store(format!(
+                "list versions of {prefix}: {e} (the identity needs s3:ListBucketVersions)"
+            ))
+        })?;
+        Ok(Some(
+            versions
+                .into_iter()
+                .filter_map(|v| {
+                    let name = name_in_directory(&self.partition_prefix, &Path::from(v.key))?;
+                    Some(ObjectVersion {
+                        name,
+                        version_id: v.version_id,
+                        delete_marker: v.delete_marker,
+                    })
+                })
+                .collect(),
+        ))
+    }
+
+    async fn delete_version(&self, name: &str, version_id: &str) -> Result<(), BlobError> {
+        let path = self.path(name);
+        let Some(api) = &self.api else {
+            return Err(BlobError::Store(format!(
+                "delete {path} version {version_id}: this store has no S3 API"
+            )));
+        };
+        api.delete_object_version(path.as_ref(), version_id)
+            .await
+            .map_err(|e| BlobError::Store(format!("delete {path} version {version_id}: {e}")))
+    }
+
     async fn list_after(&self, after: Option<&str>) -> Result<Vec<String>, BlobError> {
         let mut stream = match after {
             Some(name) => self
@@ -247,6 +409,53 @@ fn name_in_directory(dir: &Path, location: &Path) -> Option<String> {
     }
 }
 
+/// At each open of a destination with `lock-days`: the bucket must have
+/// object lock, or every locked PUT would fail. The result is logged
+/// either way, so the run log shows what the lock rested on.
+async fn check_bucket_lock(api: &S3Api, days: u32) -> Result<(), BlobError> {
+    let bucket = api.bucket();
+    match api.bucket_object_lock().await {
+        Ok(BucketLock::Enabled { default: None }) => {
+            tracing::info!(
+                bucket,
+                lock_days = days,
+                default_retention = "none",
+                "object lock: enabled; each new object is locked COMPLIANCE from its record time"
+            );
+            Ok(())
+        }
+        Ok(BucketLock::Enabled {
+            default: Some(default),
+        }) => {
+            tracing::warn!(
+                bucket,
+                lock_days = days,
+                default_retention = %default,
+                "object lock: enabled, with a default retention: objects written without a lock \
+                 of their own (records older than lock-days) are held by it from their write time"
+            );
+            Ok(())
+        }
+        Ok(BucketLock::NotEnabled { reason }) => {
+            tracing::error!(bucket, lock_days = days, reason = %reason, "object lock: not enabled");
+            Err(BlobError::Lock(format!(
+                "lock-days is set, but bucket {bucket} has no object lock ({reason}): create the \
+                 bucket with object lock enabled, or remove lock-days"
+            )))
+        }
+        Err(e) if e.is_transient() => Err(BlobError::Store(format!(
+            "bucket {bucket}: reading its object lock configuration: {e}"
+        ))),
+        Err(e) => {
+            tracing::error!(bucket, lock_days = days, error = %e, "object lock: cannot tell");
+            Err(BlobError::Lock(format!(
+                "lock-days is set, but whether bucket {bucket} has object lock cannot be told: \
+                 {e} (the writing identity needs s3:GetBucketObjectLockConfiguration)"
+            )))
+        }
+    }
+}
+
 /// The S3 destination.
 pub struct S3Sink(BlobSink<S3Store>);
 
@@ -268,7 +477,11 @@ impl S3Sink {
             flush: cfg.flush,
             encryption: cfg.encryption,
         };
-        let store = S3Store::new(cfg.read_store, cfg.write_store, partition_prefix);
+        let mut store = S3Store::new(cfg.read_store, cfg.write_store, partition_prefix);
+        if let Some(lock) = cfg.lock {
+            check_bucket_lock(&lock.api, lock.days).await?;
+            store = store.with_api(lock.api).with_lock(lock.days);
+        }
         Ok(Self(BlobSink::open_store(store, spec, clock).await?))
     }
 
@@ -345,7 +558,7 @@ pub fn partition_prefix(root: Option<&Path>, destination_name: &str, partition: 
 mod tests {
     use std::sync::Arc;
 
-    use mirror_fs::blob::BlobStore;
+    use mirror_fs::blob::{BlobStore, NewObject};
     use object_store::memory::InMemory;
     use object_store::path::Path;
     use object_store::ObjectStore;
@@ -358,13 +571,16 @@ mod tests {
         let dir = partition_prefix(Some(&Path::from("sites/x")), "operations", 0);
         assert_eq!(dir.as_ref(), "sites/x/operations/0");
         S3Store::new(Arc::clone(&mem), Arc::clone(&mem), dir.clone())
-            .put_new("a", b"x".to_vec(), &[])
+            .put_new("a", b"x".to_vec(), &NewObject::Snapshot)
             .await
             .unwrap();
         let ro = S3Store::read_only(mem, dir);
         assert_eq!(ro.list().await.unwrap(), ["a"]);
         assert_eq!(ro.get("a").await.unwrap(), b"x");
-        let err = ro.put_new("b", Vec::new(), &[]).await.unwrap_err();
+        let err = ro
+            .put_new("b", Vec::new(), &NewObject::Snapshot)
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("opened to read only"), "{err}");
     }
 

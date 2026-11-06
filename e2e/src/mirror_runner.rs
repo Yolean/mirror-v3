@@ -288,6 +288,7 @@ pub async fn spawn_kafka_to_tee(spec: TeeMirrorSpec) -> Result<MirrorHandle> {
                     compaction: s3.compaction,
                     encryption: None,
                     flush: s3.flush,
+                    lock: None,
                 };
                 let sink = S3Sink::open(cfg).await.context("open S3Sink")?;
                 inners.push((s3.name, Box::new(sink)));
@@ -352,6 +353,7 @@ pub async fn spawn_kafka_to_s3(spec: S3MirrorSpec) -> Result<MirrorHandle> {
         compaction: spec.compaction,
         encryption: spec.encryption,
         flush: spec.flush,
+        lock: None,
     };
     let sink = S3Sink::open(sink_cfg).await.context("open S3Sink")?;
     let (shutdown, signal) = shutdown_pair();

@@ -111,6 +111,16 @@ pub struct FilesystemDestination {
 pub struct Retention {
     /// Age in days (of 86400 seconds) past which a record is deleted.
     pub max_age_days: u32,
+    /// S3 only: the mirror writes each new object with a COMPLIANCE
+    /// retention lock, in the PUT that creates it, until its newest
+    /// record timestamp plus this many days (its write time when its
+    /// record times cannot be trusted), so that nobody, the writer and
+    /// trim included, can delete or overwrite it before then. At most
+    /// `max-age-days`: the lock must lapse before trim deletes. The
+    /// bucket must have object lock enabled; `run` refuses to start on
+    /// one without.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lock_days: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -1159,6 +1169,28 @@ fn validate_destinations(m: &Mirror) -> Result<(), LoadError> {
                      the identity `mirror-v3 trim` lists, HEADs, writes floor markers and \
                      deletes with",
                     m.name
+                )));
+            }
+        }
+        if let Some(lock_days) = retention.lock_days {
+            if !matches!(d, Destination::S3(_)) {
+                return Err(LoadError::Validation(format!(
+                    "mirror {:?}: destination {name:?}: `retention.lock-days` needs an S3 \
+                     destination: a filesystem has no retention lock",
+                    m.name
+                )));
+            }
+            if lock_days == 0 {
+                return Err(LoadError::Validation(format!(
+                    "mirror {:?}: destination {name:?}: `retention.lock-days` must be at least 1",
+                    m.name
+                )));
+            }
+            if lock_days > retention.max_age_days {
+                return Err(LoadError::Validation(format!(
+                    "mirror {:?}: destination {name:?}: `retention.lock-days` ({lock_days}) is \
+                     greater than `max-age-days` ({}): the lock would outlive the deletion",
+                    m.name, retention.max_age_days
                 )));
             }
         }

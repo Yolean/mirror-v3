@@ -1,7 +1,11 @@
 # yaml-language-server: $schema=../schemas/mirror-v3.config.schema.json
 #
 # A backup whose records may only be kept for a fixed period: audit
-# events, deleted 400 days after their timestamp.
+# events, deleted 400 days after their timestamp, and locked against
+# deletion and overwrite for 396 days from it (a COMPLIANCE retention
+# lock, set in the PUT that creates each object; the bucket must have
+# object lock enabled, and the writer needs s3:PutObjectRetention,
+# s3:GetObjectRetention and s3:GetBucketObjectLockConfiguration).
 #
 # `mirror-v3 run` writes the backup and never deletes. Expiry is
 # `mirror-v3 trim --config <this file>`, run on a schedule (a CronJob)
@@ -32,7 +36,7 @@ mirrors:
       read: { access-key-id-env: MIRROR_S3_READ_ACCESS_KEY_ID, secret-access-key-env: MIRROR_S3_READ_SECRET_ACCESS_KEY }
       trim: { access-key-id-env: MIRROR_S3_TRIM_ACCESS_KEY_ID, secret-access-key-env: MIRROR_S3_TRIM_SECRET_ACCESS_KEY }
     encryption: { keys-dir: /etc/mirror-v3/parquet-keys, key-id: "${PARQUET_KEY_ID:-k1}" }
-    retention: { max-age-days: 400 }
+    retention: { max-age-days: 400, lock-days: 396 }
   format: parquet
   compression: zstd-1
   flush:

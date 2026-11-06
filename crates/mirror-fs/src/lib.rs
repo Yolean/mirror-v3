@@ -29,7 +29,7 @@ pub mod naming;
 
 pub use blob::{
     BlobEncryption, BlobError, BlobSink, BlobSpec, BlobStore, CompactionMode, FlushTriggers,
-    RecordTimes, UnixClock,
+    NewObject, ObjectVersion, RecordTimes, UnixClock,
 };
 
 /// Errors from opening or reading a filesystem destination.
@@ -122,14 +122,14 @@ impl BlobStore for FsStore {
         self.list_sync()
     }
 
-    /// A filesystem keeps no object metadata: `metadata` is dropped, and
+    /// A filesystem keeps no object metadata and has no retention lock:
     /// [`BlobStore::record_times`] reads the file instead.
     async fn put_new(
         &self,
         name: &str,
         bytes: Vec<u8>,
-        _metadata: &[(&'static str, String)],
-    ) -> Result<(), BlobError> {
+        _object: &NewObject,
+    ) -> Result<Option<u64>, BlobError> {
         let final_path = self.dir.join(name);
         let tmp_path = self
             .dir
@@ -151,7 +151,7 @@ impl BlobStore for FsStore {
                 final_path.display()
             )));
         }
-        Ok(())
+        Ok(None)
     }
 
     async fn get(&self, name: &str) -> Result<Vec<u8>, BlobError> {

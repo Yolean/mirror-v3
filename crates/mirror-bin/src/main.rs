@@ -476,6 +476,17 @@ struct StatusRow {
     /// yet, or under a retention lock).
     #[serde(skip_serializing_if = "Option::is_none")]
     below_floor_objects: Option<usize>,
+    /// `retention.lock-days`, on a destination with a retention lock.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lock_days: Option<u32>,
+    /// Whether the bucket has object lock, as the reading identity sees
+    /// it: `enabled`, `not enabled` or `unknown`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bucket_object_lock: Option<&'static str>,
+    /// The bucket's default retention, which objects written without a
+    /// lock of their own get from their write time.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bucket_default_retention: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
 }
@@ -530,6 +541,9 @@ async fn compute_status_row(mirror: &Mirror, destination: &Destination) -> Statu
         floor_moved_at: None,
         oldest_record_above_floor: None,
         below_floor_objects: None,
+        lock_days: None,
+        bucket_object_lock: None,
+        bucket_default_retention: None,
         error: None,
     };
     let bootstrap = mirror.source.bootstrap_servers.clone();
@@ -565,6 +579,36 @@ async fn compute_status_row(mirror: &Mirror, destination: &Destination) -> Statu
             }
         }
         Err(e) => errors.push(format!("destination: {e}")),
+    }
+    if let Destination::S3(s3) = destination {
+        if let Some(days) = s3.retention.as_ref().and_then(|r| r.lock_days) {
+            row.lock_days = Some(days);
+            let lock = match s3_api(s3, &s3.credentials.read) {
+                Ok(api) => api.bucket_object_lock().await.map_err(|e| e.to_string()),
+                Err(e) => Err(format!("{e:#}")),
+            };
+            match lock {
+                Ok(mirror_s3::BucketLock::Enabled { default }) => {
+                    row.bucket_object_lock = Some("enabled");
+                    row.bucket_default_retention = default.map(|d| d.to_string());
+                }
+                Ok(mirror_s3::BucketLock::NotEnabled { reason }) => {
+                    row.bucket_object_lock = Some("not enabled");
+                    errors.push(format!(
+                        "lock-days is set, but bucket {} has no object lock ({reason}): run \
+                         refuses to start",
+                        s3.bucket
+                    ));
+                }
+                // The reading identity may not be allowed to ask
+                // (s3:GetBucketObjectLockConfiguration); run asks with the
+                // writing identity.
+                Err(e) => {
+                    row.bucket_object_lock = Some("unknown");
+                    tracing::warn!(bucket = %s3.bucket, error = %e, "object lock: cannot tell");
+                }
+            }
+        }
     }
     if !errors.is_empty() {
         row.error = Some(errors.join("; "));
@@ -615,7 +659,12 @@ async fn query_destination(mirror: &Mirror, destination: &Destination) -> Result
             })
         }
         Destination::S3(s3) => {
-            let cfg = s3_sink_config(s3, mirror, &dest_name)?;
+            // The bucket's object lock is asked with the reading identity
+            // (compute_status_row), not checked as `run` does.
+            let cfg = S3SinkConfig {
+                lock: None,
+                ..s3_sink_config(s3, mirror, &dest_name)?
+            };
             let mut sink = S3Sink::open(cfg)
                 .await
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -634,13 +683,14 @@ async fn query_destination(mirror: &Mirror, destination: &Destination) -> Result
 fn print_status_table(rows: &[StatusRow]) {
     let name_width = rows.iter().map(|r| r.name.len()).max().unwrap_or(6).max(6);
     println!(
-        "{:<width$}  {:>14}  {:>14}  {:>10}  {:>14}  {:<20}",
+        "{:<width$}  {:>14}  {:>14}  {:>10}  {:>14}  {:<20}  {:<8}",
         "MIRROR",
         "SOURCE-HIGH",
         "DEST-NEXT",
         "LAG",
         "FLOOR",
         "FLOOR-MOVED",
+        "LOCK",
         width = name_width
     );
     for r in rows {
@@ -648,14 +698,20 @@ fn print_status_table(rows: &[StatusRow]) {
             println!("{:<width$}  error: {}", r.name, e, width = name_width);
             continue;
         }
+        let lock = match (r.lock_days, r.bucket_object_lock) {
+            (Some(days), Some("enabled") | None) => format!("{days}d"),
+            (Some(days), Some(state)) => format!("{days}d (bucket lock {state})"),
+            (None, _) => String::new(),
+        };
         println!(
-            "{:<width$}  {:>14}  {:>14}  {:>10}  {:>14}  {:<20}",
+            "{:<width$}  {:>14}  {:>14}  {:>10}  {:>14}  {:<20}  {:<8}",
             r.name,
             r.source_high.map(|v| v.to_string()).unwrap_or_default(),
             r.dest_next.map(|v| v.to_string()).unwrap_or_default(),
             r.lag().map(|v| v.to_string()).unwrap_or_default(),
             r.floor.map(|v| v.to_string()).unwrap_or_default(),
             r.floor_moved_at.as_deref().unwrap_or_default(),
+            lock,
             width = name_width
         );
     }
@@ -1609,14 +1665,7 @@ fn s3_store(
     s3: &mirror_config::S3Destination,
     key: &mirror_config::S3Key,
 ) -> Result<Arc<dyn object_store::ObjectStore>> {
-    let env = |name: &str| {
-        std::env::var(name).with_context(|| {
-            format!(
-                "S3 destination bucket {}: environment variable {name} (named in its credentials) is not set",
-                s3.bucket
-            )
-        })
-    };
+    let env = |name: &str| s3_key_env(s3, name);
     let mut builder = object_store::aws::AmazonS3Builder::new()
         .with_region(&s3.region)
         .with_bucket_name(&s3.bucket)
@@ -1632,6 +1681,32 @@ fn s3_store(
         .build()
         .with_context(|| format!("building the S3 client for bucket {}", s3.bucket))?;
     Ok(Arc::new(store))
+}
+
+fn s3_key_env(s3: &mirror_config::S3Destination, name: &str) -> Result<String> {
+    std::env::var(name).with_context(|| {
+        format!(
+            "S3 destination bucket {}: environment variable {name} (named in its credentials) is not set",
+            s3.bucket
+        )
+    })
+}
+
+/// The same bucket and identity as [`s3_store`], for the signed requests
+/// object_store does not make (object lock, versions).
+fn s3_api(
+    s3: &mirror_config::S3Destination,
+    key: &mirror_config::S3Key,
+) -> Result<Arc<mirror_s3::S3Api>> {
+    let api = mirror_s3::S3Api::new(
+        s3.endpoint.as_deref(),
+        &s3.region,
+        &s3.bucket,
+        s3_key_env(s3, &key.access_key_id_env)?,
+        s3_key_env(s3, &key.secret_access_key_env)?,
+    )
+    .map_err(|e| anyhow::anyhow!("bucket {}: {e}", s3.bucket))?;
+    Ok(Arc::new(api))
 }
 
 fn s3_sink_config(
@@ -1670,6 +1745,13 @@ fn s3_sink_config(
                     keyring: Arc::new(keyring),
                 })
             }
+        },
+        lock: match s3.retention.as_ref().and_then(|r| r.lock_days) {
+            Some(days) => Some(mirror_s3::SinkLock {
+                days,
+                api: s3_api(s3, &s3.credentials.write)?,
+            }),
+            None => None,
         },
     })
 }
