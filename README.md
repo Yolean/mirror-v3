@@ -195,11 +195,11 @@ Monitoring: `mirror_v3_destination_floor_oldest_record_timestamp_seconds` is the
 
 Permissions:
 
-- The **trim identity** lists the prefix, HEADs objects (in AWS IAM a HEAD needs `s3:GetObject`; without the Parquet key that does not reveal encrypted records), puts `floor-*` markers and deletes objects. Deny the **writer** `PutObject` on `*/floor-*`: a writer that could write markers could hide objects below a floor that is too high. They would be ignored, not lost, but the floor is the trim role's to set.
+- The **trim identity** lists the prefix, HEADs objects, puts `floor-*` markers and deletes objects. It needs no Parquet key: the trim job mounts no `keys-dir`, and a config shared with `run` may name one that is absent or empty. In AWS IAM a HEAD needs `s3:GetObject`, which also lets the identity download objects: ciphertext on an encrypted destination, harmless without the key, but the records themselves on one with `encryption: none`. Deny the **writer** `PutObject` on `*/floor-*`: a writer that could write markers could hide objects below a floor that is too high. They would be ignored, not lost, but the floor is the trim role's to set.
 - The delete right is the risk to weigh. For records that must be tamper-proof, a delete right in the same cluster as the writer is acceptable only where the store's retention lock (S3 Object Lock, a GCS bucket retention policy) prevents deletion before the retention period, and then `max-age-days` is the deletion age, at or above the lock's period. Without such a lock, run trim from somewhere the writer's cluster cannot reach.
 - On a **versioned** bucket a DELETE without a version id only adds a delete marker: the data stays as a noncurrent version until a lifecycle rule expires noncurrent versions. Add one, or the records are not deleted.
 
-Record times in object metadata are clear text on an encrypted destination: each object's lowest and highest record timestamp, close to its write time, which the store records anyway.
+Object metadata is not encrypted, on an encrypted destination either: anyone who may HEAD an object sees its lowest and highest record timestamp and its count of records without one. That shows when activity happened, not what it was.
 
 Upgrade order: a mirror-v3 older than this treats a floor marker as an object it did not write and refuses the chain, so upgrade every `run` and `restore` of a destination before its first trim. Objects written by an older mirror-v3 carry no record times: the first trim blocks at them until they are adopted with `--floor`.
 

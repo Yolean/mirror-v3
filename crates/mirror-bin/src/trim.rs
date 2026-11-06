@@ -168,18 +168,7 @@ async fn trim_one(
             Ok(run(location)(report))
         }
         Destination::S3(s3) => {
-            let key = s3.credentials.trim.as_ref().ok_or_else(|| {
-                anyhow!(
-                    "S3 destination bucket {} has no `credentials.trim`, the identity that \
-                     lists, HEADs, writes floor markers and deletes",
-                    s3.bucket
-                )
-            })?;
-            let identity = super::s3_store(s3, key)?;
-            let root = s3.prefix.as_deref().map(object_store::path::Path::from);
-            let prefix = mirror_s3::partition_prefix(root.as_ref(), dest_name, mirror.partition);
-            let location = format!("s3://{}/{prefix}", s3.bucket);
-            let store = mirror_s3::S3Store::new(identity.clone(), identity, prefix);
+            let (location, store) = s3_trim_store(s3, dest_name, mirror.partition)?;
             let report = trim(TrimConfig {
                 store: &store,
                 format,
@@ -193,6 +182,31 @@ async fn trim_one(
         }
         Destination::Kafka(_) => unreachable!("trim reads blob destinations"),
     }
+}
+
+/// The partition prefix, reached with the trim identity. Nothing here or
+/// in [`trim`] reads the `encryption` block: record times are object
+/// metadata, so the trim job needs no Parquet key and mounts none.
+fn s3_trim_store(
+    s3: &mirror_config::S3Destination,
+    dest_name: &str,
+    partition: u32,
+) -> Result<(String, mirror_s3::S3Store)> {
+    let key = s3.credentials.trim.as_ref().ok_or_else(|| {
+        anyhow!(
+            "S3 destination bucket {} has no `credentials.trim`, the identity that lists, \
+             HEADs, writes floor markers and deletes",
+            s3.bucket
+        )
+    })?;
+    let identity = super::s3_store(s3, key)?;
+    let root = s3.prefix.as_deref().map(object_store::path::Path::from);
+    let prefix = mirror_s3::partition_prefix(root.as_ref(), dest_name, partition);
+    let location = format!("s3://{}/{prefix}", s3.bucket);
+    Ok((
+        location,
+        mirror_s3::S3Store::new(identity.clone(), identity, prefix),
+    ))
 }
 
 fn print_report(
@@ -246,5 +260,70 @@ fn print_report(
             println!("  stopped: {object} holds records newer than the cutoff")
         }
         Stop::Blocked { object, reason } => println!("  BLOCKED at {object}: {reason}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The config `run` uses, keys-dir and all, on a trim job's pod,
+    /// where no key is mounted.
+    fn encrypted_with_keys_dir(keys_dir: &std::path::Path) -> mirror_config::Config {
+        mirror_config::load_from_str(&format!(
+            r#"
+mirrors:
+  - name: audit-backup
+    source: {{ bootstrap-servers: "localhost:1" }}
+    topic: audit
+    partition: 0
+    destinations:
+      - type: s3
+        name: audit
+        region: example-region
+        bucket: b
+        prefix: sites/x
+        credentials:
+          write: {{ access-key-id-env: TRIM_TEST_W_ID, secret-access-key-env: TRIM_TEST_W_SECRET }}
+          read: {{ access-key-id-env: TRIM_TEST_R_ID, secret-access-key-env: TRIM_TEST_R_SECRET }}
+          trim: {{ access-key-id-env: TRIM_TEST_T_ID, secret-access-key-env: TRIM_TEST_T_SECRET }}
+        encryption: {{ keys-dir: {}, key-id: k1 }}
+        retention: {{ max-age-days: 400 }}
+    format: parquet
+    flush: {{ max-time-ms: 60000, max-bytes: 1048576, max-offsets: 10 }}
+"#,
+            keys_dir.display()
+        ))
+        .expect("the config loads without its keys")
+    }
+
+    #[test]
+    fn trim_needs_no_parquet_key() {
+        // Only the trim identity's variables are set: run's are not
+        // needed either.
+        std::env::set_var("TRIM_TEST_T_ID", "id");
+        std::env::set_var("TRIM_TEST_T_SECRET", "secret");
+        let empty = tempfile::tempdir().unwrap();
+        let absent = empty.path().join("not-mounted");
+        for keys_dir in [absent.as_path(), empty.path()] {
+            let cfg = encrypted_with_keys_dir(keys_dir);
+            let mirror = &cfg.mirrors[0];
+            let args = TrimArgs {
+                config: "mirror-v3.yaml".into(),
+                mirror: None,
+                destination: None,
+                floor: None,
+                dry_run: false,
+            };
+            let targets = pick_targets(&cfg.mirrors, &args).unwrap();
+            assert_eq!(targets.len(), 1);
+            let Destination::S3(s3) = targets[0].1 else {
+                panic!("an S3 destination")
+            };
+            let (location, _store) = s3_trim_store(s3, "audit", mirror.partition)
+                .unwrap_or_else(|e| panic!("keys-dir {}: {e:#}", keys_dir.display()));
+            assert_eq!(location, "s3://b/sites/x/audit/0");
+            super::super::resolve_blob_params(mirror).unwrap();
+        }
     }
 }

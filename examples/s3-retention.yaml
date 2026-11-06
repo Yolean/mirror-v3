@@ -9,7 +9,8 @@
 # whose records are all older than `max-age-days` and deletes them. The
 # writer may only PutObject (and should be denied PutObject on
 # `*/floor-*`); the lister may only list keys; `trim` lists, HEADs,
-# writes floor markers and deletes, and needs no Parquet key.
+# writes floor markers and deletes, and needs no Parquet key: the trim
+# CronJob mounts no keys, and the keys-dir below is for `run` only.
 
 mirrors:
 
