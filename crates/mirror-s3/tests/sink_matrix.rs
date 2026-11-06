@@ -57,6 +57,7 @@ fn cfg(store: Arc<dyn ObjectStore>, compaction: Option<CompactionMode>) -> S3Sin
             max_offsets: u64::MAX,
             daily_at_utc_seconds: None,
         },
+        lock: None,
     }
 }
 

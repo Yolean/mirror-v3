@@ -82,6 +82,42 @@ pub enum BlobError {
     CorruptChain(String),
     #[error("object {0} already exists (a second writer, or a write that landed after it was reported failed)")]
     AlreadyExists(String),
+    /// A retention lock that the store does not support, or did not
+    /// apply to an object written with it. Trying again cannot fix it.
+    #[error("{0}")]
+    Lock(String),
+}
+
+/// How far ahead of the clock a record timestamp may be before it is
+/// taken for a wrong clock (a producer's) rather than skew: trim blocks
+/// at such an object, and a retention lock counts from the write time
+/// instead.
+pub const FUTURE_SKEW_MS: u64 = 3_600_000;
+
+/// What a new object is, for the metadata and retention lock a store
+/// gives it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NewObject {
+    /// An append-mode object, written at `written_at` (unix seconds). Its
+    /// record times go in its metadata, and a store with a retention
+    /// lock locks it from its record time.
+    Records { times: RecordTimes, written_at: u64 },
+    /// A floor marker, written at `written_at`: no records, and a store
+    /// with a retention lock locks it from then.
+    Marker { written_at: u64 },
+    /// A compaction snapshot: no metadata, no lock.
+    Snapshot,
+}
+
+/// One version of an object, on a store that keeps versions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectVersion {
+    /// The object's name in the directory.
+    pub name: String,
+    pub version_id: String,
+    /// A delete marker rather than data: what a DELETE without a version
+    /// id leaves on a versioned bucket.
+    pub delete_marker: bool,
 }
 
 /// One partition directory of a blob destination.
@@ -92,14 +128,17 @@ pub trait BlobStore: Send + Sync {
     async fn list(&self) -> Result<Vec<String>, BlobError>;
     /// Write `bytes` as `name`, atomically, and fail with
     /// [`BlobError::AlreadyExists`] if the store can tell that `name`
-    /// exists. `metadata` is the object's user metadata where the store
-    /// keeps metadata (S3: `x-amz-meta-<key>`); a filesystem has none.
+    /// exists. Where the store keeps metadata (S3: `x-amz-meta-<key>`),
+    /// the record times of [`NewObject::Records`] go in it; a filesystem
+    /// has none. Returns the retain-until time (unix seconds) of the
+    /// retention lock the object was written with, if any: only a store
+    /// configured with one locks, and then in the same request.
     async fn put_new(
         &self,
         name: &str,
         bytes: Vec<u8>,
-        metadata: &[(&'static str, String)],
-    ) -> Result<(), BlobError>;
+        object: &NewObject,
+    ) -> Result<Option<u64>, BlobError>;
     /// Read the object `name`.
     async fn get(&self, name: &str) -> Result<Vec<u8>, BlobError>;
     /// Names sorting after `after` (all names when `None`). S3 serves
@@ -117,10 +156,26 @@ pub trait BlobStore: Send + Sync {
             self.location(name)
         )))
     }
-    /// Delete `name`; one that does not exist is not an error.
+    /// Delete `name`; one that does not exist is not an error. On a
+    /// store that keeps versions this leaves the data (see
+    /// [`BlobStore::versions`]).
     async fn delete(&self, name: &str) -> Result<(), BlobError> {
         Err(BlobError::Store(format!(
             "delete {}: this store does not delete",
+            self.location(name)
+        )))
+    }
+    /// Every version and delete marker in the directory, where the store
+    /// keeps versions (S3 on a bucket with versioning enabled or
+    /// suspended); `Ok(None)` where it does not, and a DELETE removes the
+    /// data.
+    async fn versions(&self) -> Result<Option<Vec<ObjectVersion>>, BlobError> {
+        Ok(None)
+    }
+    /// Delete one version (or delete marker) of `name` for good.
+    async fn delete_version(&self, name: &str, version_id: &str) -> Result<(), BlobError> {
+        Err(BlobError::Store(format!(
+            "delete {} version {version_id}: this store keeps no versions",
             self.location(name)
         )))
     }
@@ -751,10 +806,14 @@ impl<S: BlobStore> BlobSink<S> {
         let location = self.store.location(&name);
 
         // Append mode: the record times go with the object, so that
-        // `trim` can tell its age with a HEAD.
-        let metadata = match self.spec.compaction {
-            None => RecordTimes::of(&self.buffer).to_metadata(),
-            Some(_) => Vec::new(),
+        // `trim` can tell its age with a HEAD, and a retention lock
+        // counts from them.
+        let object = match self.spec.compaction {
+            None => NewObject::Records {
+                times: RecordTimes::of(&self.buffer),
+                written_at: (self.clock)(),
+            },
+            Some(_) => NewObject::Snapshot,
         };
         // Compaction mode snapshots the view (current per record);
         // append mode encodes the buffer.
@@ -783,16 +842,17 @@ impl<S: BlobStore> BlobSink<S> {
         .map_err(|e| SinkError::Rejected(format!("encode: {e}")))?;
         let encoded_bytes = bytes.len() as u64;
 
-        match self.store.put_new(&name, bytes, &metadata).await {
-            Ok(()) => {}
+        let retain_until = match self.store.put_new(&name, bytes, &object).await {
+            Ok(until) => until,
             Err(BlobError::AlreadyExists(_)) => {
                 return Err(SinkError::Inconsistent(format!(
                     "{location} already exists (a second writer, or a write that landed after \
                      it was reported failed)"
                 )));
             }
+            Err(e @ BlobError::Lock(_)) => return Err(SinkError::Inconsistent(e.to_string())),
             Err(e) => return Err(SinkError::Transport(format!("write {location}: {e}"))),
-        }
+        };
 
         self.durable_position = to + 1;
         self.tail.push(name);
@@ -849,6 +909,7 @@ impl<S: BlobStore> BlobSink<S> {
             elapsed_ms,
             interval_ms,
             trigger = trigger.as_str(),
+            retain_until = retain_until.map(floor::utc_rfc3339).as_deref(),
             "flushed batch"
         );
         // The observer does something cheap (queue the event).

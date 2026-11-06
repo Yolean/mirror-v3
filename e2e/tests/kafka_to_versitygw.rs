@@ -149,6 +149,7 @@ async fn mirrors_to_versitygw_with_offset_named_objects() {
         compaction: None,
         encryption: None,
         flush,
+        lock: None,
     })
     .await
     .expect("reopen");
@@ -252,6 +253,7 @@ async fn versitygw_keeps_record_times_and_trim_moves_the_floor() {
             daily_at_utc_seconds: None,
         },
         encryption: None,
+        lock: None,
     };
     let t0: i64 = 1_700_000_000_000;
     let mut sink = S3Sink::open(cfg()).await.expect("open");

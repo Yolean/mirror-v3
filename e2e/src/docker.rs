@@ -199,7 +199,7 @@ impl KafkaNativeToVersityGWStack {
         let data_dir = tempfile::tempdir().context("data dir")?;
         std::fs::create_dir_all(data_dir.path().join("data").join(bucket)).context("bucket dir")?;
         std::fs::create_dir(data_dir.path().join("meta")).context("metadata dir")?;
-        let target = start_versitygw(s3_port, data_dir.path()).await?;
+        let target = start_versitygw(s3_port, data_dir.path(), &[]).await?;
         wait_for_metadata(&format!("localhost:{source_port}")).await?;
         wait_for_s3_listing(s3_port, bucket).await?;
         Ok(Self {
@@ -227,9 +227,85 @@ impl ProvisionedStack for KafkaNativeToVersityGWStack {
     }
 }
 
+/// A VersityGW that keeps versions (`--versioning-dir`), with no broker:
+/// `lock_bucket` is created through the API with object lock enabled
+/// (and so versioned, as on AWS), `plain_bucket` without object lock.
+pub struct VersityGWObjectLockStack {
+    _target: ContainerAsync<GenericImage>,
+    _data_dir: tempfile::TempDir,
+    s3_port: u16,
+}
+
+impl VersityGWObjectLockStack {
+    pub async fn start(lock_bucket: &str, plain_bucket: &str) -> Result<Self> {
+        let s3_port = portpicker::pick_unused_port().context("no free port for s3")?;
+        let data_dir = tempfile::tempdir().context("data dir")?;
+        std::fs::create_dir_all(data_dir.path().join("data").join(plain_bucket))
+            .context("bucket dir")?;
+        std::fs::create_dir(data_dir.path().join("meta")).context("metadata dir")?;
+        std::fs::create_dir(data_dir.path().join("versions")).context("versions dir")?;
+        let target = start_versitygw(
+            s3_port,
+            data_dir.path(),
+            &["--versioning-dir", "/gw/versions"],
+        )
+        .await?;
+        create_bucket_with_object_lock(s3_port, lock_bucket).await?;
+        wait_for_s3_listing(s3_port, lock_bucket).await?;
+        wait_for_s3_listing(s3_port, plain_bucket).await?;
+        Ok(Self {
+            _target: target,
+            _data_dir: data_dir,
+            s3_port,
+        })
+    }
+
+    pub fn s3_endpoint(&self) -> String {
+        format!("http://localhost:{}", self.s3_port)
+    }
+}
+
+/// CreateBucket with `x-amz-bucket-object-lock-enabled: true`, which
+/// object_store does not make: signed with its SigV4 and sent through its
+/// HTTP client.
+async fn create_bucket_with_object_lock(host_port: u16, bucket: &str) -> Result<()> {
+    use object_store::aws::{AwsAuthorizer, AwsCredential};
+    use object_store::client::{HttpConnector, HttpRequestBody, ReqwestConnector};
+
+    let client = ReqwestConnector::default()
+        .connect(&object_store::ClientOptions::new().with_allow_http(true))
+        .context("http client")?;
+    let credential = AwsCredential {
+        key_id: VERSITYGW_ACCESS_KEY.into(),
+        secret_key: VERSITYGW_SECRET_KEY.into(),
+        token: None,
+    };
+    let mut request = http::Request::builder()
+        .method(http::Method::PUT)
+        .uri(format!("http://localhost:{host_port}/{bucket}"))
+        .header("x-amz-bucket-object-lock-enabled", "true")
+        .body(HttpRequestBody::empty())
+        .context("request")?;
+    AwsAuthorizer::new(&credential, "s3", "us-east-1").authorize(&mut request, None);
+    let response = client
+        .execute(request)
+        .await
+        .context("CreateBucket with object lock")?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.into_body().bytes().await.unwrap_or_default();
+        anyhow::bail!(
+            "CreateBucket {bucket} with object lock: {status}: {}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+    Ok(())
+}
+
 async fn start_versitygw(
     host_port: u16,
     data_dir: &std::path::Path,
+    posix_args: &[&str],
 ) -> Result<ContainerAsync<GenericImage>> {
     use testcontainers::core::Mount;
 
@@ -249,12 +325,13 @@ async fn start_versitygw(
         // --sidecar keeps it in files instead, on any filesystem.
         // Metadata must survive: trim reads each object's record
         // times from its `x-amz-meta-*` headers.
-        .with_cmd([
-            "posix".to_string(),
-            "--sidecar".to_string(),
-            "/gw/meta".to_string(),
-            "/gw/data".to_string(),
-        ])
+        .with_cmd(
+            ["posix", "--sidecar", "/gw/meta"]
+                .into_iter()
+                .chain(posix_args.iter().copied())
+                .chain(["/gw/data"])
+                .map(String::from),
+        )
         .start()
         .await
         .context("starting versitygw container")

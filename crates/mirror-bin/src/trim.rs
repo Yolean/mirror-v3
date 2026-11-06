@@ -203,10 +203,14 @@ fn s3_trim_store(
     let root = s3.prefix.as_deref().map(object_store::path::Path::from);
     let prefix = mirror_s3::partition_prefix(root.as_ref(), dest_name, partition);
     let location = format!("s3://{}/{prefix}", s3.bucket);
-    Ok((
-        location,
-        mirror_s3::S3Store::new(identity.clone(), identity, prefix),
-    ))
+    // The API finds the versions to delete on a versioned bucket, and
+    // writes floor markers with the destination's retention lock.
+    let mut store = mirror_s3::S3Store::new(identity.clone(), identity, prefix)
+        .with_api(super::s3_api(s3, key)?);
+    if let Some(days) = s3.retention.as_ref().and_then(|r| r.lock_days) {
+        store = store.with_lock(days);
+    }
+    Ok((location, store))
 }
 
 fn print_report(
@@ -243,10 +247,18 @@ fn print_report(
             utc_rfc3339(ms / 1000)
         );
     }
-    println!("  {deleted}: {} object(s)", report.deleted.len());
+    if let Some(until) = report.marker_retain_until {
+        println!("  marker locked until: {}", utc_rfc3339(until));
+    }
+    let what = if report.versioned {
+        "version(s), by version id: the bucket keeps versions"
+    } else {
+        "object(s)"
+    };
+    println!("  {deleted}: {} {what}", report.deleted.len());
     if !report.failed.is_empty() {
         println!(
-            "  not deleted: {} object(s), below the floor and ignored; the next trim tries again",
+            "  not deleted: {} {what}, below the floor and ignored; the next trim tries again",
             report.failed.len()
         );
         for (name, error) in &report.failed {

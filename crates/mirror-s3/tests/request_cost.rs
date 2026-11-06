@@ -48,6 +48,7 @@ fn cfg(store: Arc<dyn ObjectStore>, max_offsets: u64) -> S3SinkConfig {
             max_offsets,
             daily_at_utc_seconds: None,
         },
+        lock: None,
     }
 }
 

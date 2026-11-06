@@ -166,9 +166,74 @@ pub fn utc_rfc3339(unix_secs: u64) -> String {
     )
 }
 
+/// Unix seconds for a UTC RFC 3339 time as S3 writes one
+/// (`2026-11-06T10:15:00Z`, `2026-11-06T10:15:00.000Z`): a fraction is
+/// dropped. `None` for anything else, an offset other than `Z` included.
+pub fn parse_utc_rfc3339(s: &str) -> Option<u64> {
+    let s = s.trim().strip_suffix('Z')?;
+    let (date, time) = s.split_once('T')?;
+    let time = match time.split_once('.') {
+        Some((whole, fraction)) if fraction.bytes().all(|b| b.is_ascii_digit()) => whole,
+        Some(_) => return None,
+        None => time,
+    };
+    let num = |part: &str, len: usize| -> Option<i64> {
+        if part.len() == len && part.bytes().all(|b| b.is_ascii_digit()) {
+            part.parse().ok()
+        } else {
+            None
+        }
+    };
+    let mut d = date.split('-');
+    let (year, month, day) = (num(d.next()?, 4)?, num(d.next()?, 2)?, num(d.next()?, 2)?);
+    let mut t = time.split(':');
+    let (hour, minute, second) = (num(t.next()?, 2)?, num(t.next()?, 2)?, num(t.next()?, 2)?);
+    if d.next().is_some()
+        || t.next().is_some()
+        || !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 60
+    {
+        return None;
+    }
+    // A proleptic Gregorian date to days since 1970-01-01 (Howard
+    // Hinnant's days_from_civil).
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = y.rem_euclid(400);
+    let mp = (month + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    u64::try_from(days * 86_400 + hour * 3600 + minute * 60 + second).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rfc3339_round_trips() {
+        for secs in [0, 951_782_400, 1_762_423_200, 1_800_000_000, 4_102_444_799] {
+            assert_eq!(parse_utc_rfc3339(&utc_rfc3339(secs)), Some(secs));
+        }
+        assert_eq!(
+            parse_utc_rfc3339("2026-11-08T14:45:47.000Z"),
+            parse_utc_rfc3339("2026-11-08T14:45:47Z")
+        );
+        for bad in [
+            "2026-11-08T14:45:47+01:00",
+            "2026-11-08 14:45:47Z",
+            "2026-13-08T14:45:47Z",
+            "2026-11-08T14:45Z",
+            "2026-11-08T14:45:47.x0Z",
+            "",
+        ] {
+            assert_eq!(parse_utc_rfc3339(bad), None, "{bad}");
+        }
+    }
 
     fn m(offset: u64, at: u64, oldest_ms: Option<u64>) -> FloorMarker {
         FloorMarker {

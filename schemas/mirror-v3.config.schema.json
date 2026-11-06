@@ -347,6 +347,15 @@
           "type": "integer",
           "format": "uint32",
           "minimum": 0
+        },
+        "lock-days": {
+          "description": "S3 only: the mirror writes each new object with a COMPLIANCE\nretention lock, in the PUT that creates it, until its newest\nrecord timestamp plus this many days (its write time when its\nrecord times cannot be trusted), so that nobody, the writer and\ntrim included, can delete or overwrite it before then. At most\n`max-age-days`: the lock must lapse before trim deletes. The\nbucket must have object lock enabled; `run` refuses to start on\none without.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
         }
       },
       "additionalProperties": false,

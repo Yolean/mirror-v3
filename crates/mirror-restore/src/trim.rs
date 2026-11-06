@@ -13,19 +13,28 @@
 //! The marker is written before anything is deleted, so a trim that
 //! stops half way leaves a chain that validates. Objects below the floor
 //! that fail to delete (a retention lock) are retried by the next trim.
-//! Old markers stay: they are the store's record of each expiry.
+//! Old markers stay: they are the store's record of each expiry. On a
+//! destination with a retention lock the marker is locked too, from its
+//! write time.
+//!
+//! On a store that keeps versions (an S3 bucket with versioning, as every
+//! bucket with object lock on AWS), a DELETE only hides an object behind
+//! a delete marker. There trim deletes every version, and delete marker,
+//! of every object below the floor by its version id, so that the
+//! records are gone when trim says so.
 
 use futures::StreamExt;
 use mirror_envelope::Format;
-use mirror_fs::blob::{BlobError, BlobStore, RecordTimes};
+use mirror_fs::blob::{BlobError, BlobStore, NewObject, ObjectVersion, RecordTimes};
 use mirror_fs::floor::{self, Floor, FloorMarker};
 use mirror_fs::naming;
 
 use crate::{plan_floor_chain, ChainObject, RestoreError};
 
 /// How far ahead of the trim's clock a record timestamp may be before
-/// trim takes it for a wrong clock rather than skew.
-pub const FUTURE_SKEW_MS: u64 = 3_600_000;
+/// trim takes it for a wrong clock rather than skew (a retention lock
+/// uses the same bound).
+pub use mirror_fs::blob::FUTURE_SKEW_MS;
 
 /// HEADs and DELETEs in flight at once.
 const CONCURRENCY: usize = 16;
@@ -81,10 +90,16 @@ pub struct TrimReport {
     /// The oldest record of the first object at or above the new floor,
     /// unix milliseconds, where its metadata tells.
     pub oldest_ms: Option<u64>,
+    /// The retain-until time (unix seconds) of the marker's retention
+    /// lock, on a destination with one.
+    pub marker_retain_until: Option<u64>,
+    /// Whether the store keeps versions: then [`TrimReport::deleted`]
+    /// names versions (`<object> (version <id>)`) rather than objects.
+    pub versioned: bool,
     /// Objects deleted (to be deleted, with `dry_run`): every object that
-    /// ends below the floor.
+    /// ends below the floor, or on a versioned store each of its versions.
     pub deleted: Vec<String>,
-    /// Objects below the floor that did not delete, and why.
+    /// Objects (or versions) below the floor that did not delete, and why.
     pub failed: Vec<(String, String)>,
 }
 
@@ -219,11 +234,18 @@ pub async fn trim<S: BlobStore>(cfg: TrimConfig<'_, S>) -> Result<TrimReport, Re
         at: cfg.now,
         oldest_ms,
     });
+    let mut marker_retain_until = None;
     if let (Some(m), false) = (marker, cfg.dry_run) {
         let content = marker_content(&m, previous, chain_end, cfg.target, &stop);
         let name = m.filename();
-        store
-            .put_new(&name, content.into_bytes(), &[])
+        marker_retain_until = store
+            .put_new(
+                &name,
+                content.into_bytes(),
+                &NewObject::Marker {
+                    written_at: cfg.now,
+                },
+            )
             .await
             .map_err(|e| match e {
                 BlobError::AlreadyExists(_) => RestoreError::Store(format!(
@@ -237,6 +259,7 @@ pub async fn trim<S: BlobStore>(cfg: TrimConfig<'_, S>) -> Result<TrimReport, Re
             previous = previous_offset,
             floor = floor_offset,
             chain_end,
+            retain_until = marker_retain_until.map(floor::utc_rfc3339).as_deref(),
             "wrote the chain's floor"
         );
     }
@@ -246,27 +269,52 @@ pub async fn trim<S: BlobStore>(cfg: TrimConfig<'_, S>) -> Result<TrimReport, Re
         .iter()
         .filter(|o| o.to < floor_offset)
         .map(|o: &ChainObject| o.name.clone());
-    let deleted: Vec<String> = planned.below_floor.iter().cloned().chain(expired).collect();
+    let below: Vec<String> = planned.below_floor.iter().cloned().chain(expired).collect();
+    let versions = store
+        .versions()
+        .await
+        .map_err(store_error("listing versions"))?;
+    let versioned = versions.is_some();
+    let ext = cfg.format.extension();
+    let targets: Vec<Target> = match versions {
+        None => below.into_iter().map(Target::Object).collect(),
+        // Every version of every object that ends below the floor, those
+        // a DELETE already hid behind a delete marker included. Markers
+        // and foreign objects are not blob names, and stay.
+        Some(versions) => versions
+            .into_iter()
+            .filter(|v| naming::parse_blob_name(&v.name, ext).is_some_and(|b| b.to < floor_offset))
+            .map(Target::Version)
+            .collect(),
+    };
     let mut failed = Vec::new();
     if !cfg.dry_run {
-        let mut deletes = futures::stream::iter(deleted.iter())
-            .map(|name| async move { (name, store.delete(name).await) })
+        let mut deletes = futures::stream::iter(targets.iter())
+            .map(|t| async move {
+                let result = match t {
+                    Target::Object(name) => store.delete(name).await,
+                    Target::Version(v) => store.delete_version(&v.name, &v.version_id).await,
+                };
+                (t, result)
+            })
             .buffer_unordered(CONCURRENCY);
-        while let Some((name, result)) = deletes.next().await {
+        while let Some((target, result)) = deletes.next().await {
             if let Err(e) = result {
                 tracing::warn!(
-                    object = %store.location(name),
+                    object = %store.location(target.name()),
+                    version = target.version(),
                     error = %e,
                     "an object below the floor did not delete; the next trim tries again"
                 );
-                failed.push((name.clone(), e.to_string()));
+                failed.push((target.label(), e.to_string()));
             }
         }
         failed.sort();
     }
-    let deleted = deleted
-        .into_iter()
-        .filter(|n| !failed.iter().any(|(f, _)| f == n))
+    let deleted = targets
+        .iter()
+        .map(Target::label)
+        .filter(|label| !failed.iter().any(|(f, _)| f == label))
         .collect();
     Ok(TrimReport {
         previous,
@@ -275,9 +323,44 @@ pub async fn trim<S: BlobStore>(cfg: TrimConfig<'_, S>) -> Result<TrimReport, Re
         chain_end,
         stop,
         oldest_ms,
+        marker_retain_until,
+        versioned,
         deleted,
         failed,
     })
+}
+
+/// What trim deletes below the floor.
+enum Target {
+    Object(String),
+    Version(ObjectVersion),
+}
+
+impl Target {
+    fn name(&self) -> &str {
+        match self {
+            Target::Object(name) => name,
+            Target::Version(v) => &v.name,
+        }
+    }
+
+    fn version(&self) -> Option<&str> {
+        match self {
+            Target::Object(_) => None,
+            Target::Version(v) => Some(&v.version_id),
+        }
+    }
+
+    /// The object's name, and on a versioned store which version.
+    fn label(&self) -> String {
+        match self {
+            Target::Object(name) => name.clone(),
+            Target::Version(v) if v.delete_marker => {
+                format!("{} (delete marker {})", v.name, v.version_id)
+            }
+            Target::Version(v) => format!("{} (version {})", v.name, v.version_id),
+        }
+    }
 }
 
 fn store_error(what: &'static str) -> impl Fn(BlobError) -> RestoreError {
