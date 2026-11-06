@@ -9,18 +9,21 @@
 //! [`produce`] writes the records to a [`RestoreTarget`] (in production
 //! a Kafka producer with many records in flight, each checked to land
 //! at its offset). [`follow`] reads a backup as a mirror's source, for
-//! a restore that keeps up with the backup.
+//! a restore that keeps up with the backup. [`trim`] expires a backup's
+//! head: it moves the chain's floor and deletes the objects below it.
 
 pub mod chain;
 pub mod follow;
 pub mod produce;
 pub mod read;
+pub mod trim;
 
-pub use chain::{plan_chain, ChainObject};
+pub use chain::{check_keys, plan_chain, plan_floor_chain, ChainObject, FloorChain};
 pub use follow::{same_record, ChainSource, ChainSourceConfig};
 pub use mirror_core::RestoreTarget;
 pub use produce::{produce, OffsetMode, RestoreReport};
 pub use read::{BackupSource, BackupSummary, ObjectSummary, Reader};
+pub use trim::{trim, FloorTarget, Stop, TrimConfig, TrimReport};
 
 #[derive(Debug, thiserror::Error)]
 pub enum RestoreError {

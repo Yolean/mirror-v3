@@ -122,6 +122,7 @@ mirrors:
         Destination::Filesystem(FilesystemDestination {
             name: None,
             root: PathBuf::from("/var/mirror-v3"),
+            retention: None,
             affects_readiness: true,
         })
     );
@@ -183,8 +184,10 @@ mirrors:
                     access_key_id_env: "S3_READ_ACCESS_KEY_ID".into(),
                     secret_access_key_env: "S3_READ_SECRET_ACCESS_KEY".into(),
                 },
+                trim: None,
             },
             encryption: Encryption::None(EncryptionNone::None),
+            retention: None,
             affects_readiness: true,
         })
     );
@@ -1084,4 +1087,86 @@ fn s3_encryption_needs_explicit_parquet_and_a_key_id() {
     ))
     .expect_err("bad key id");
     assert!(format!("{err}").contains("not a key id"), "{err}");
+}
+
+fn retention_yaml(destination: &str, compaction: &str) -> String {
+    format!(
+        r#"
+mirrors:
+  - name: audit
+    source: {{ bootstrap-servers: k:9092 }}
+    topic: audit
+    partition: 0
+    destinations:
+{destination}
+    format: parquet
+{compaction}
+    flush: {{ max-time-ms: 1000, max-bytes: 1000, max-offsets: 10 }}
+"#
+    )
+}
+
+const S3_WITH_TRIM: &str = r#"      - type: s3
+        region: example-region
+        bucket: b
+        credentials:
+          write: { access-key-id-env: W_ID, secret-access-key-env: W_SECRET }
+          read: { access-key-id-env: R_ID, secret-access-key-env: R_SECRET }
+          trim: { access-key-id-env: T_ID, secret-access-key-env: T_SECRET }
+        encryption: none
+        retention: { max-age-days: 400 }"#;
+
+#[test]
+fn retention_parses_on_blob_destinations() {
+    let cfg = load_from_str(&retention_yaml(S3_WITH_TRIM, "")).unwrap();
+    let d = &cfg.mirrors[0].destinations[0];
+    assert_eq!(
+        d.retention(),
+        Some(&mirror_config::Retention { max_age_days: 400 })
+    );
+    let Destination::S3(s3) = d else { panic!() };
+    assert_eq!(
+        s3.credentials.trim,
+        Some(S3Key {
+            access_key_id_env: "T_ID".into(),
+            secret_access_key_env: "T_SECRET".into(),
+        })
+    );
+    let cfg = load_from_str(&retention_yaml(
+        "      - type: filesystem\n        root: /data\n        retention: { max-age-days: 30 }",
+        "",
+    ))
+    .unwrap();
+    assert_eq!(
+        cfg.mirrors[0].destinations[0].retention(),
+        Some(&mirror_config::Retention { max_age_days: 30 })
+    );
+}
+
+#[test]
+fn retention_needs_a_trim_identity_append_mode_and_a_positive_age() {
+    let no_trim = S3_WITH_TRIM.replace(
+        "          trim: { access-key-id-env: T_ID, secret-access-key-env: T_SECRET }\n",
+        "",
+    );
+    let err = load_from_str(&retention_yaml(&no_trim, "")).unwrap_err();
+    assert!(
+        format!("{err}").contains("needs `credentials.trim`"),
+        "{err}"
+    );
+    let err = load_from_str(&retention_yaml(
+        S3_WITH_TRIM,
+        "    compaction: log\n    keys: { type: utf8 }",
+    ))
+    .unwrap_err();
+    assert!(
+        format!("{err}").contains("`retention` needs append mode"),
+        "{err}"
+    );
+    let zero = S3_WITH_TRIM.replace("max-age-days: 400", "max-age-days: 0");
+    let err = load_from_str(&retention_yaml(&zero, "")).unwrap_err();
+    assert!(format!("{err}").contains("at least 1"), "{err}");
+    let kafka = "      - type: kafka\n        bootstrap-servers: k:9092\n        retention: { max-age-days: 1 }";
+    let err = load_from_str(&retention_yaml(kafka, "")).unwrap_err();
+    assert!(format!("{err}").contains("retention"), "{err}");
 }

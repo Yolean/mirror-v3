@@ -236,6 +236,18 @@
               "description": "Absolute path to the destination root directory.",
               "type": "string"
             },
+            "retention": {
+              "description": "How long records are kept; see [`Retention`].",
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Retention"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null
+            },
             "affects-readiness": {
               "description": "See [`KafkaDestination::affects_readiness`].",
               "type": "boolean",
@@ -293,6 +305,18 @@
               "description": "Required, so that clear-text blobs are a written decision:\n`none`, or the Parquet key layout of the observability\ncompactor (`keys-dir`, `key-id`).",
               "$ref": "#/$defs/Encryption"
             },
+            "retention": {
+              "description": "How long records are kept; see [`Retention`]. Needs\n`credentials.trim`.",
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Retention"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null
+            },
             "affects-readiness": {
               "description": "See [`KafkaDestination::affects_readiness`].",
               "type": "boolean",
@@ -314,8 +338,24 @@
         }
       ]
     },
+    "Retention": {
+      "description": "How long a blob destination keeps records, enforced by\n`mirror-v3 trim` (run on a schedule), not by the mirror: trim moves\nthe chain's floor past every object whose records, and the records\nof every object before it, are older than `max-age-days` (by record\ntimestamp), and deletes the objects below the floor. Append mode\nonly.",
+      "type": "object",
+      "properties": {
+        "max-age-days": {
+          "description": "Age in days (of 86400 seconds) past which a record is deleted.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "max-age-days"
+      ]
+    },
     "S3Credentials": {
-      "description": "Two identities, as a least-privilege bucket setup has them: `write` may\nonly PutObject; `read` lists the prefix (resume position, drift\ncheck) and, in compaction mode, reads the latest snapshot. They may\nname the same variables where one key does both.",
+      "description": "The identities, as a least-privilege bucket setup has them: `write`\nmay only PutObject; `read` lists the prefix (resume position, drift\ncheck) and, in compaction mode, reads the latest snapshot; `trim`,\nused by `mirror-v3 trim` only, lists, HEADs (record times are object\nmetadata, so it needs no Parquet key), puts floor markers and\ndeletes. They may name the same variables where one key does more.",
       "type": "object",
       "properties": {
         "write": {
@@ -323,6 +363,17 @@
         },
         "read": {
           "$ref": "#/$defs/S3Key"
+        },
+        "trim": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/S3Key"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         }
       },
       "additionalProperties": false,

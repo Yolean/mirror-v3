@@ -220,3 +220,85 @@ async fn versitygw_conditional_put_spike() {
     // This test is informational; it does not fail. mirror-s3's
     // scan-validate layer is the universal correctness backstop.
 }
+
+/// Trim tells an object's age from the record times the mirror writes as
+/// user metadata (`x-amz-meta-*`), with a HEAD: VersityGW must keep
+/// them, and the floor marker and deletes must work through its API.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn versitygw_keeps_record_times_and_trim_moves_the_floor() {
+    use mirror_core::{Record, TimestampType};
+    use mirror_fs::blob::BlobStore;
+    use mirror_restore::{trim, FloorTarget, TrimConfig};
+
+    let stack = KafkaNativeToVersityGWStack::start(BUCKET)
+        .await
+        .expect("provision stack");
+    let s3 = store(&stack.s3_endpoint());
+    let cfg = || S3SinkConfig {
+        read_store: Arc::clone(&s3),
+        write_store: Arc::clone(&s3),
+        prefix: Some(Path::from("trim")),
+        destination_name: "audit".into(),
+        partition: 0,
+        format: Format::Parquet,
+        compression: mirror_envelope::ParquetCompression::Zstd1,
+        keys: mirror_envelope::ColumnType::Utf8,
+        values: mirror_envelope::ColumnType::Utf8,
+        compaction: None,
+        flush: FlushTriggers {
+            max_time: Duration::from_secs(3600),
+            max_bytes: u64::MAX,
+            max_offsets: 2,
+            daily_at_utc_seconds: None,
+        },
+        encryption: None,
+    };
+    let t0: i64 = 1_700_000_000_000;
+    let mut sink = S3Sink::open(cfg()).await.expect("open");
+    for o in 0..6u64 {
+        sink.write(Record {
+            topic: "audit".into(),
+            partition: 0,
+            source_offset: o,
+            timestamp_ms: Some(t0 + o as i64 * 1000),
+            timestamp_type: TimestampType::CreateTime,
+            key: Some(format!("k{o}").into_bytes()),
+            value: Some(b"v".to_vec()),
+            headers: vec![],
+        })
+        .await
+        .expect("write");
+    }
+    drop(sink);
+
+    let dir = mirror_s3::partition_prefix(Some(&Path::from("trim")), "audit", 0);
+    let store = mirror_s3::S3Store::new(Arc::clone(&s3), Arc::clone(&s3), dir);
+    let times = store
+        .record_times(&mirror_fs::naming::batch_filename(2, 3, "parquet"))
+        .await
+        .expect("head");
+    assert_eq!(
+        times.and_then(|t| t.max_ms),
+        Some((t0 + 3000) as u64),
+        "VersityGW dropped the record-time metadata: {times:?}"
+    );
+
+    let report = trim(TrimConfig {
+        store: &store,
+        format: Format::Parquet,
+        target: FloorTarget::Cutoff {
+            cutoff_ms: (t0 + 3500) as u64,
+        },
+        now: 1_800_000_000,
+        dry_run: false,
+    })
+    .await
+    .expect("trim");
+    assert_eq!(report.floor, 4);
+    assert_eq!(report.deleted.len(), 2);
+    assert!(report.failed.is_empty(), "{:?}", report.failed);
+
+    let mut reopened = S3Sink::open(cfg()).await.expect("reopen after trim");
+    assert_eq!(reopened.next_expected_offset().await.unwrap(), 6);
+    assert_eq!(reopened.floor().map(|f| f.offset), Some(4));
+}

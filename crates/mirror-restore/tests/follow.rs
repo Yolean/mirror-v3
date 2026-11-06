@@ -77,7 +77,7 @@ impl Follow {
             keyring: None,
             source: source(),
             mode,
-            chain_start: 0,
+            chain_start: None,
             poll_interval,
         })
         .await
@@ -261,7 +261,7 @@ async fn record_at_is_the_record_a_restored_target_holds() {
             keyring: None,
             source: source(),
             mode,
-            chain_start: 0,
+            chain_start: None,
             poll_interval: Duration::from_millis(20),
         })
     };
@@ -287,7 +287,7 @@ async fn preserve_of_a_chain_that_starts_after_zero_is_refused() {
         keyring: None,
         source: source(),
         mode: OffsetMode::Preserve,
-        chain_start: 5,
+        chain_start: Some(5),
         poll_interval: Duration::from_millis(20),
     })
     .await
@@ -339,7 +339,7 @@ async fn a_target_is_resumed_only_if_it_ends_with_the_backups_record() {
             keyring: None,
             source: source(),
             mode,
-            chain_start: 0,
+            chain_start: None,
             poll_interval: Duration::from_millis(20),
         })
     };
@@ -401,8 +401,13 @@ impl BlobStore for Counting {
     async fn list(&self) -> Result<Vec<String>, BlobError> {
         self.inner.list().await
     }
-    async fn put_new(&self, name: &str, bytes: Vec<u8>) -> Result<(), BlobError> {
-        self.inner.put_new(name, bytes).await
+    async fn put_new(
+        &self,
+        name: &str,
+        bytes: Vec<u8>,
+        metadata: &[(&'static str, String)],
+    ) -> Result<(), BlobError> {
+        self.inner.put_new(name, bytes, metadata).await
     }
     async fn get(&self, name: &str) -> Result<Vec<u8>, BlobError> {
         self.gets.lock().unwrap().push(name.to_string());
@@ -431,7 +436,7 @@ async fn counting(
         keyring: None,
         source: source(),
         mode,
-        chain_start: 0,
+        chain_start: None,
         poll_interval: Duration::from_millis(20),
     })
     .await

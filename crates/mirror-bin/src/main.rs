@@ -10,6 +10,7 @@ mod ack_tracker;
 mod knobs;
 mod readiness_poller;
 mod restore;
+mod trim;
 use ack_tracker::{
     final_commit, spawn_periodic_commit_task, AckTracker, DestAckSlot, FlushAckShim, WriteAckShim,
 };
@@ -83,10 +84,12 @@ enum Cmd {
         /// have no holes). `renumber`: 0, 1, 2, ... in original order.
         #[arg(long, value_enum)]
         offsets: restore::OffsetsArg,
-        /// The offset the backup starts at, when objects before it were
-        /// removed on purpose.
-        #[arg(long, default_value_t = 0)]
-        chain_start: u64,
+        /// The offset the backup starts at. Omitted: at the backup's
+        /// floor, where `trim` expired the objects before it (0 without
+        /// one), and objects that end below the floor are not read.
+        /// Given: the backup must start exactly there.
+        #[arg(long)]
+        chain_start: Option<u64>,
         /// Verify the backup and print its summary; produce nothing.
         #[arg(long)]
         verify_only: bool,
@@ -120,6 +123,35 @@ enum Cmd {
             value_parser = clap::value_parser!(u64).range(100..)
         )]
         poll_interval_ms: u64,
+    },
+    /// Expire the head of every blob destination that has a
+    /// `retention`: move the chain's floor past the objects whose
+    /// records, and the records of every object before them, are older
+    /// than `max-age-days` (from the record times each object carries
+    /// as metadata), then delete the objects below the floor. With
+    /// --floor, move one destination's floor to an offset instead.
+    /// Exits non-zero if a destination failed, or its expiry is blocked
+    /// (an object whose age trim cannot tell); an object that does not
+    /// delete only warns, and the next trim tries again.
+    Trim {
+        #[arg(short, long)]
+        config: PathBuf,
+        /// Only this mirror's destinations.
+        #[arg(long)]
+        mirror: Option<String>,
+        /// Only this destination, by name.
+        #[arg(long)]
+        destination: Option<String>,
+        /// Move the floor of the --mirror's destination to this offset:
+        /// for a head removed by other means, or objects written before
+        /// they carried record times, once a person has checked them.
+        /// A floor lower than the current one, or past the end of the
+        /// chain, is refused.
+        #[arg(long, requires = "mirror")]
+        floor: Option<u64>,
+        /// Print what would change; write and delete nothing.
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -214,6 +246,39 @@ fn main() -> ExitCode {
             rt.shutdown_background();
             match result {
                 Ok(()) => ExitCode::SUCCESS,
+                Err(err) => {
+                    eprintln!("error: {err:?}");
+                    ExitCode::from(1)
+                }
+            }
+        }
+        Cmd::Trim {
+            config,
+            mirror,
+            destination,
+            floor,
+            dry_run,
+        } => {
+            let rt = match tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(err) => {
+                    eprintln!("error: tokio init: {err}");
+                    return ExitCode::from(1);
+                }
+            };
+            let args = trim::TrimArgs {
+                config,
+                mirror,
+                destination,
+                floor,
+                dry_run,
+            };
+            match rt.block_on(trim::run_trim(args)) {
+                Ok(true) => ExitCode::SUCCESS,
+                Ok(false) => ExitCode::from(1),
                 Err(err) => {
                     eprintln!("error: {err:?}");
                     ExitCode::from(1)
@@ -396,8 +461,30 @@ struct StatusRow {
     name: String,
     source_high: Option<u64>,
     dest_next: Option<u64>,
+    /// Append-mode blob destinations with a floor (see `trim`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    floor: Option<u64>,
+    /// When the floor moved to where it is, RFC 3339.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    floor_moved_at: Option<String>,
+    /// The oldest record of the first object at or above the floor, as
+    /// of the last floor marker, RFC 3339: its age is how far behind the
+    /// expiry is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    oldest_record_above_floor: Option<String>,
+    /// Objects below the floor still in the destination (not deleted
+    /// yet, or under a retention lock).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    below_floor_objects: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+}
+
+/// What a destination says at open.
+struct DestinationState {
+    next: u64,
+    floor: Option<mirror_fs::floor::Floor>,
+    below_floor: usize,
 }
 
 impl StatusRow {
@@ -439,6 +526,10 @@ async fn compute_status_row(mirror: &Mirror, destination: &Destination) -> Statu
         name: row_name,
         source_high: None,
         dest_next: None,
+        floor: None,
+        floor_moved_at: None,
+        oldest_record_above_floor: None,
+        below_floor_objects: None,
         error: None,
     };
     let bootstrap = mirror.source.bootstrap_servers.clone();
@@ -453,25 +544,40 @@ async fn compute_status_row(mirror: &Mirror, destination: &Destination) -> Statu
         )
     })
     .await;
+    let mut errors = Vec::new();
     match source_result {
         Ok(Ok(high)) => row.source_high = Some(high),
-        Ok(Err(e)) => {
-            row.error = Some(format!("source watermark: {e}"));
-            return row;
-        }
-        Err(e) => {
-            row.error = Some(format!("source watermark task: {e}"));
-            return row;
-        }
+        Ok(Err(e)) => errors.push(format!("source watermark: {e}")),
+        Err(e) => errors.push(format!("source watermark task: {e}")),
     }
-    match query_destination_next(mirror, destination).await {
-        Ok(next) => row.dest_next = Some(next),
-        Err(e) => row.error = Some(format!("destination: {e}")),
+    // The destination is read whatever the source says: its floor is
+    // worth seeing when the broker is out of reach.
+    match query_destination(mirror, destination).await {
+        Ok(state) => {
+            row.dest_next = Some(state.next);
+            if let Some(f) = state.floor {
+                row.floor = Some(f.offset);
+                row.floor_moved_at = Some(mirror_fs::floor::utc_rfc3339(f.moved_at));
+                row.oldest_record_above_floor = f
+                    .oldest_ms
+                    .map(|ms| mirror_fs::floor::utc_rfc3339(ms / 1000));
+                row.below_floor_objects = Some(state.below_floor);
+            }
+        }
+        Err(e) => errors.push(format!("destination: {e}")),
+    }
+    if !errors.is_empty() {
+        row.error = Some(errors.join("; "));
     }
     row
 }
 
-async fn query_destination_next(mirror: &Mirror, destination: &Destination) -> Result<u64> {
+async fn query_destination(mirror: &Mirror, destination: &Destination) -> Result<DestinationState> {
+    let next = |next| DestinationState {
+        next,
+        floor: None,
+        below_floor: 0,
+    };
     use mirror_core::Sink;
     let dest_name = destination.effective_name(&mirror.name);
     match destination {
@@ -482,6 +588,7 @@ async fn query_destination_next(mirror: &Mirror, destination: &Destination) -> R
             let mut sink = KafkaSink::open(cfg).map_err(|e| anyhow::anyhow!("{e}"))?;
             sink.next_expected_offset()
                 .await
+                .map(next)
                 .map_err(|e| anyhow::anyhow!("{e}"))
         }
         Destination::Filesystem(fs) => {
@@ -498,18 +605,28 @@ async fn query_destination_next(mirror: &Mirror, destination: &Destination) -> R
                 flush: params.flush,
             };
             let mut sink = FilesystemSink::open(cfg).map_err(|e| anyhow::anyhow!("{e}"))?;
-            sink.next_expected_offset()
-                .await
-                .map_err(|e| anyhow::anyhow!("{e}"))
+            Ok(DestinationState {
+                next: sink
+                    .next_expected_offset()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))?,
+                floor: sink.floor().copied(),
+                below_floor: sink.below_floor_at_open(),
+            })
         }
         Destination::S3(s3) => {
             let cfg = s3_sink_config(s3, mirror, &dest_name)?;
             let mut sink = S3Sink::open(cfg)
                 .await
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
-            sink.next_expected_offset()
-                .await
-                .map_err(|e| anyhow::anyhow!("{e}"))
+            Ok(DestinationState {
+                next: sink
+                    .next_expected_offset()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))?,
+                floor: sink.floor().copied(),
+                below_floor: sink.below_floor_at_open(),
+            })
         }
     }
 }
@@ -517,11 +634,13 @@ async fn query_destination_next(mirror: &Mirror, destination: &Destination) -> R
 fn print_status_table(rows: &[StatusRow]) {
     let name_width = rows.iter().map(|r| r.name.len()).max().unwrap_or(6).max(6);
     println!(
-        "{:<width$}  {:>14}  {:>14}  {:>10}",
+        "{:<width$}  {:>14}  {:>14}  {:>10}  {:>14}  {:<20}",
         "MIRROR",
         "SOURCE-HIGH",
         "DEST-NEXT",
         "LAG",
+        "FLOOR",
+        "FLOOR-MOVED",
         width = name_width
     );
     for r in rows {
@@ -530,11 +649,13 @@ fn print_status_table(rows: &[StatusRow]) {
             continue;
         }
         println!(
-            "{:<width$}  {:>14}  {:>14}  {:>10}",
+            "{:<width$}  {:>14}  {:>14}  {:>10}  {:>14}  {:<20}",
             r.name,
             r.source_high.map(|v| v.to_string()).unwrap_or_default(),
             r.dest_next.map(|v| v.to_string()).unwrap_or_default(),
             r.lag().map(|v| v.to_string()).unwrap_or_default(),
+            r.floor.map(|v| v.to_string()).unwrap_or_default(),
+            r.floor_moved_at.as_deref().unwrap_or_default(),
             width = name_width
         );
     }

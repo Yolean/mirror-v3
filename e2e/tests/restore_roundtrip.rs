@@ -280,7 +280,7 @@ async fn chain_source(root: &Path, source_topic: &str) -> ChainSource<FsStore> {
             partition: 0,
         },
         mode: OffsetMode::Preserve,
-        chain_start: 0,
+        chain_start: None,
         poll_interval: Duration::from_millis(100),
     })
     .await

@@ -24,11 +24,12 @@ use mirror_envelope::{ColumnType, Format, ParquetCompression};
 use tokio::io::AsyncWriteExt;
 
 pub mod blob;
+pub mod floor;
 pub mod naming;
 
 pub use blob::{
     BlobEncryption, BlobError, BlobSink, BlobSpec, BlobStore, CompactionMode, FlushTriggers,
-    UnixClock,
+    RecordTimes, UnixClock,
 };
 
 /// Errors from opening or reading a filesystem destination.
@@ -121,7 +122,14 @@ impl BlobStore for FsStore {
         self.list_sync()
     }
 
-    async fn put_new(&self, name: &str, bytes: Vec<u8>) -> Result<(), BlobError> {
+    /// A filesystem keeps no object metadata: `metadata` is dropped, and
+    /// [`BlobStore::record_times`] reads the file instead.
+    async fn put_new(
+        &self,
+        name: &str,
+        bytes: Vec<u8>,
+        _metadata: &[(&'static str, String)],
+    ) -> Result<(), BlobError> {
         let final_path = self.dir.join(name);
         let tmp_path = self
             .dir
@@ -160,6 +168,26 @@ impl BlobStore for FsStore {
 
     fn location(&self, name: &str) -> String {
         self.dir.join(name).display().to_string()
+    }
+
+    /// From the file's records: a filesystem destination is in clear.
+    async fn record_times(&self, name: &str) -> Result<Option<RecordTimes>, BlobError> {
+        let format = [Format::Parquet, Format::Ndjson]
+            .into_iter()
+            .find(|f| naming::parse_blob_name(name, f.extension()).is_some())
+            .ok_or_else(|| BlobError::Store(format!("{} is not a blob", self.location(name))))?;
+        let bytes = self.get_sync(name)?;
+        let records = blob::decode_blob(name, &self.location(name), &bytes, format, None)?;
+        Ok(Some(RecordTimes::of(&records)))
+    }
+
+    async fn delete(&self, name: &str) -> Result<(), BlobError> {
+        let path = self.dir.join(name);
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(io_error(&path, e)),
+        }
     }
 }
 
