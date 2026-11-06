@@ -193,10 +193,12 @@ impl KafkaNativeToVersityGWStack {
         let s3_port = portpicker::pick_unused_port().context("no free port for s3")?;
         let source = start_kafka_native(source_port).await?;
         // Pre-create the bucket directory on the host and bind-mount
-        // it as VersityGW's data dir. The POSIX backend treats every
-        // top-level directory under `/data` as a bucket.
+        // its parent as VersityGW's data dir. The POSIX backend treats
+        // every top-level directory under `data/` as a bucket, so the
+        // metadata sidecar is a sibling of `data/`, not a child.
         let data_dir = tempfile::tempdir().context("data dir")?;
-        std::fs::create_dir(data_dir.path().join(bucket)).context("bucket dir")?;
+        std::fs::create_dir_all(data_dir.path().join("data").join(bucket)).context("bucket dir")?;
+        std::fs::create_dir(data_dir.path().join("meta")).context("metadata dir")?;
         let target = start_versitygw(s3_port, data_dir.path()).await?;
         wait_for_metadata(&format!("localhost:{source_port}")).await?;
         wait_for_s3_listing(s3_port, bucket).await?;
@@ -239,18 +241,19 @@ async fn start_versitygw(
         .with_exposed_port(ContainerPort::Tcp(7070))
         .with_wait_for(WaitFor::message_on_stdout("Admin/S3 service listening on"))
         .with_mapped_port(host_port, ContainerPort::Tcp(7070))
-        .with_mount(Mount::bind_mount(host_path, "/data"))
+        .with_mount(Mount::bind_mount(host_path, "/gw"))
         .with_env_var("ROOT_ACCESS_KEY_ID", VERSITYGW_ACCESS_KEY)
         .with_env_var("ROOT_SECRET_ACCESS_KEY", VERSITYGW_SECRET_KEY)
         // The POSIX backend stores object metadata in xattrs by
-        // default. macOS bind mounts don't support xattrs; --nometa
-        // disables xattr-backed metadata entirely. This is a
-        // dev-loop concession; production POSIX mounts (Linux
-        // ext4/xfs) keep the default.
+        // default, and macOS bind mounts don't support xattrs.
+        // --sidecar keeps it in files instead, on any filesystem.
+        // Metadata must survive: trim reads each object's record
+        // times from its `x-amz-meta-*` headers.
         .with_cmd([
             "posix".to_string(),
-            "--nometa".to_string(),
-            "/data".to_string(),
+            "--sidecar".to_string(),
+            "/gw/meta".to_string(),
+            "/gw/data".to_string(),
         ])
         .start()
         .await

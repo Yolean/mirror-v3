@@ -108,8 +108,9 @@ enum Verdict {
 fn verdict(times: Option<RecordTimes>, cutoff_ms: u64, now_ms: u64) -> Verdict {
     let Some(times) = times else {
         return Verdict::Blocked(
-            "no record-time metadata (written by a mirror-v3 that did not record it): check \
-             the age of its records, then move the floor past it with `trim --floor`"
+            "no record-time metadata (written by a mirror-v3 that did not record it, or a \
+             store that drops user metadata): check the age of its records, then move the \
+             floor past it with `trim --floor`"
                 .into(),
         );
     };

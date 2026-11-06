@@ -5,9 +5,10 @@
 //! 1. **Preferred**: `PutMode::Create` (`If-None-Match: *`). On AWS S3
 //!    this fails a second writer of the *same name* with 412.
 //! 2. **Always**: single-writer-per-(topic,partition) by deployment +
-//!    chain validation on startup. VersityGW ignores `PutMode::Create`,
-//!    and writers with different flush boundaries write different
-//!    names; both leave a chain that the next open refuses.
+//!    chain validation on startup. VersityGW run with `--nometa` ignores
+//!    `PutMode::Create`, and writers with different flush boundaries
+//!    write different names; both leave a chain that the next open
+//!    refuses.
 //!
 //! ## Restart correctness
 //!
