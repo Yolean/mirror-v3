@@ -420,6 +420,7 @@ impl S3Api {
                 .await?;
             expect_success(status, &body)?;
             let doc: ListVersionsDoc = parse_xml(&body, "ListObjectVersions")?;
+            let next = next_versions_page(&doc)?;
             for (entries, delete_marker) in [(doc.versions, false), (doc.delete_markers, true)] {
                 out.extend(entries.into_iter().map(|v| KeyVersion {
                     key: v.key,
@@ -427,13 +428,9 @@ impl S3Api {
                     delete_marker,
                 }));
             }
-            let next = (
-                doc.next_key_marker.unwrap_or_default(),
-                doc.next_version_id_marker.unwrap_or_default(),
-            );
-            if !doc.is_truncated.unwrap_or(false) || next.0.is_empty() {
+            let Some(next) = next else {
                 return Ok(out);
-            }
+            };
             if markers.as_ref() == Some(&next) {
                 return Err(ApiError::other(format!(
                     "ListObjectVersions repeated the page after key {:?}",
@@ -605,6 +602,25 @@ struct ListVersionsDoc {
     delete_markers: Vec<VersionDoc>,
 }
 
+/// The key and version id markers that ask for the page after `doc`,
+/// or `None` when `doc` is the last page. A truncated page without a
+/// next key marker cannot be continued, and is an error rather than
+/// the end of the listing.
+fn next_versions_page(doc: &ListVersionsDoc) -> Result<Option<(String, String)>, ApiError> {
+    if !doc.is_truncated.unwrap_or(false) {
+        return Ok(None);
+    }
+    match doc.next_key_marker.as_deref() {
+        None | Some("") => Err(ApiError::other(
+            "ListObjectVersions answered IsTruncated without NextKeyMarker".to_string(),
+        )),
+        Some(key) => Ok(Some((
+            key.to_string(),
+            doc.next_version_id_marker.clone().unwrap_or_default(),
+        ))),
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 struct VersionDoc {
@@ -642,6 +658,38 @@ mod tests {
         let e = expect_success(StatusCode::FORBIDDEN, err).unwrap_err();
         assert_eq!(e.to_string(), "HTTP 403 AccessDenied: Access Denied.");
         assert!(!e.is_transient());
+    }
+
+    #[test]
+    fn a_truncated_version_listing_needs_a_next_key_marker() {
+        let page = |xml: &str| -> ListVersionsDoc {
+            parse_xml(
+                format!("<ListVersionsResult>{xml}</ListVersionsResult>").as_bytes(),
+                "t",
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            next_versions_page(&page("<IsTruncated>false</IsTruncated>")).unwrap(),
+            None
+        );
+        assert_eq!(next_versions_page(&page("")).unwrap(), None);
+        assert_eq!(
+            next_versions_page(&page(
+                "<IsTruncated>true</IsTruncated><NextKeyMarker>p/o</NextKeyMarker>\
+                 <NextVersionIdMarker>v1</NextVersionIdMarker>"
+            ))
+            .unwrap(),
+            Some(("p/o".to_string(), "v1".to_string()))
+        );
+        for cut_short in [
+            "<IsTruncated>true</IsTruncated>",
+            "<IsTruncated>true</IsTruncated><NextKeyMarker></NextKeyMarker>",
+        ] {
+            let e = next_versions_page(&page(cut_short)).unwrap_err();
+            assert!(e.to_string().contains("without NextKeyMarker"), "{e}");
+            assert!(!e.is_transient());
+        }
     }
 
     #[test]
