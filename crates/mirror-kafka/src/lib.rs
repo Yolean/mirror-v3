@@ -191,7 +191,8 @@ fn fetch_watermarks(
 }
 
 /// A long-lived client for the high watermark of a partition, for callers
-/// that ask often: the readiness poller asks every 2 s.
+/// that ask often: the readiness poller asks every 2 s, and the Kafka sink
+/// before every write.
 ///
 /// [`fetch_high_watermark`] creates and destroys a librdkafka client per
 /// call. Each create/destroy cycle leaves a few hundred bytes of heap
@@ -211,8 +212,8 @@ pub struct WatermarkClient {
 }
 
 /// How often a busy client drains its queue. A drain takes about
-/// [`WATERMARK_CLIENT_DRAIN_POLL`], which a caller pays at most this
-/// often.
+/// [`WATERMARK_CLIENT_DRAIN_POLL`], which the sink's write path pays at
+/// most this often.
 const WATERMARK_CLIENT_DRAIN_EVERY: Duration = Duration::from_secs(1);
 
 /// One drain polls for at most this long per error event it meets.
@@ -716,7 +717,7 @@ fn producer_config(bootstrap_servers: &str) -> ClientConfig {
 
 pub struct KafkaSink {
     producer: FutureProducer,
-    watermark_consumer: Arc<BaseConsumer>,
+    watermark_client: Arc<WatermarkClient>,
     topic: String,
     partition: i32,
     watermark_timeout: Duration,
@@ -735,15 +736,10 @@ impl KafkaSink {
         let producer: FutureProducer = producer_config(&cfg.bootstrap_servers)
             .create()
             .map_err(|e| KafkaError::Init(e.to_string()))?;
-        let watermark_consumer: BaseConsumer = ClientConfig::new()
-            .set("bootstrap.servers", &cfg.bootstrap_servers)
-            .set("group.id", "mirror-v3-watermark-noop")
-            .set("enable.auto.commit", "false")
-            .create()
-            .map_err(|e| KafkaError::Init(e.to_string()))?;
+        let watermark_client = WatermarkClient::new(&cfg.bootstrap_servers)?;
         Ok(Self {
             producer,
-            watermark_consumer: Arc::new(watermark_consumer),
+            watermark_client: Arc::new(watermark_client),
             topic: cfg.topic,
             partition: cfg.partition,
             watermark_timeout: cfg.watermark_timeout,
@@ -755,22 +751,14 @@ impl KafkaSink {
     }
 
     async fn fetch_high_watermark(&self) -> Result<u64, SinkError> {
-        let consumer = Arc::clone(&self.watermark_consumer);
+        let client = Arc::clone(&self.watermark_client);
         let topic = self.topic.clone();
         let partition = self.partition;
         let timeout = self.watermark_timeout;
-        let (_low, high) = tokio::task::spawn_blocking(move || {
-            consumer.fetch_watermarks(&topic, partition, Timeout::After(timeout))
-        })
-        .await
-        .map_err(|e| SinkError::Transport(format!("join: {e}")))?
-        .map_err(|e| SinkError::Transport(e.to_string()))?;
-        u64::try_from(high).map_err(|_| {
-            SinkError::Transport(format!(
-                "the destination broker reported high watermark {high} for {}/{} (unknown)",
-                self.topic, self.partition
-            ))
-        })
+        tokio::task::spawn_blocking(move || client.high_watermark(&topic, partition, timeout))
+            .await
+            .map_err(|e| SinkError::Transport(format!("join: {e}")))?
+            .map_err(|e| SinkError::Transport(format!("destination high watermark: {e}")))
     }
 }
 
