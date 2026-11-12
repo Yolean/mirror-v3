@@ -190,6 +190,98 @@ fn fetch_watermarks(
     ))
 }
 
+/// A long-lived client for the high watermark of a partition, for callers
+/// that ask often: the readiness poller asks every 2 s.
+///
+/// [`fetch_high_watermark`] creates and destroys a librdkafka client per
+/// call. Each create/destroy cycle leaves a few hundred bytes of heap
+/// behind, so a caller on a clock grows without bound; this client is
+/// created once and asked many times.
+///
+/// rdkafka sends librdkafka's log and error events to the client's main
+/// queue (`log.queue=true`), and only a poll serves them. Nothing else
+/// polls this client, so [`WatermarkClient::high_watermark`] drains the
+/// queue, at most once per [`WATERMARK_CLIENT_DRAIN_EVERY`]; otherwise
+/// the events of a broker that comes and goes would pile up for the
+/// client's life. It has no `group.id`: it
+/// never joins a group, and its events stay on the main queue it polls.
+pub struct WatermarkClient {
+    consumer: BaseConsumer,
+    last_drain: std::sync::Mutex<Option<std::time::Instant>>,
+}
+
+/// How often a busy client drains its queue. A drain takes about
+/// [`WATERMARK_CLIENT_DRAIN_POLL`], which a caller pays at most this
+/// often.
+const WATERMARK_CLIENT_DRAIN_EVERY: Duration = Duration::from_secs(1);
+
+/// One drain polls for at most this long per error event it meets.
+/// rdkafka's poll serves log events until its timeout runs out and
+/// returns early only with an error event, so a drain takes about this
+/// long, plus the error events it logs.
+const WATERMARK_CLIENT_DRAIN_POLL: Duration = Duration::from_millis(1);
+
+/// A drain stops after this many error events; the rest wait for the
+/// next call.
+const WATERMARK_CLIENT_MAX_ERRORS_PER_DRAIN: usize = 100;
+
+impl WatermarkClient {
+    /// Creating the client does not connect: librdkafka connects in the
+    /// background, and the first query waits for it.
+    pub fn new(bootstrap: &str) -> Result<Self, KafkaError> {
+        let consumer: BaseConsumer = ClientConfig::new()
+            .set("bootstrap.servers", bootstrap)
+            .set("enable.auto.commit", "false")
+            .create()
+            .map_err(|e| KafkaError::Init(e.to_string()))?;
+        Ok(Self {
+            consumer,
+            last_drain: std::sync::Mutex::new(None),
+        })
+    }
+
+    /// The high watermark of `(topic, partition)`, asked of the broker on
+    /// every call. Sync call: wrap in spawn_blocking for async contexts.
+    pub fn high_watermark(
+        &self,
+        topic: &str,
+        partition: i32,
+        timeout: Duration,
+    ) -> Result<u64, KafkaError> {
+        self.drain_events_when_due();
+        let (_low, high) = self
+            .consumer
+            .fetch_watermarks(topic, partition, Timeout::After(timeout))
+            .map_err(|e| KafkaError::Init(format!("fetch_watermarks: {e}")))?;
+        watermark(high, topic, partition)
+    }
+
+    fn drain_events_when_due(&self) {
+        {
+            let mut last = self.last_drain.lock().unwrap_or_else(|p| p.into_inner());
+            if last.is_some_and(|t| t.elapsed() < WATERMARK_CLIENT_DRAIN_EVERY) {
+                return;
+            }
+            *last = Some(std::time::Instant::now());
+        }
+        self.drain_events();
+    }
+
+    /// Serve the events librdkafka queued since the last call. rdkafka
+    /// logs the log events and passes each error event back; those are
+    /// logged at debug, since a failed query reports the same cause. The
+    /// client assigns nothing, so no message can arrive.
+    fn drain_events(&self) {
+        for _ in 0..WATERMARK_CLIENT_MAX_ERRORS_PER_DRAIN {
+            match self.consumer.poll(WATERMARK_CLIENT_DRAIN_POLL) {
+                None => return,
+                Some(Err(e)) => tracing::debug!(error = %e, "watermark client event"),
+                Some(Ok(_)) => {}
+            }
+        }
+    }
+}
+
 /// librdkafka reports an unknown watermark as -1; that is an error, not
 /// offset 0 (which `.max(0)` used to make of it).
 fn watermark(w: i64, topic: &str, partition: i32) -> Result<u64, KafkaError> {
@@ -839,6 +931,34 @@ mod tests {
         assert_eq!(get("enable.idempotence"), "false");
         assert_eq!(get("acks"), "-1", "acks=all");
         assert_eq!(get("max.in.flight.requests.per.connection"), "1");
+    }
+
+    /// A broker out of reach queues error events in the watermark client.
+    /// They must reach the queue the client drains: nobody else polls
+    /// it, and a queue that is never served grows for as long as the
+    /// broker stays away.
+    #[test]
+    fn the_watermark_client_drains_the_events_of_a_failed_query() {
+        use rdkafka::consumer::Consumer;
+        let queued = |client: &super::WatermarkClient| unsafe {
+            use rdkafka::bindings as rd;
+            let queue = rd::rd_kafka_queue_get_main(client.consumer.client().native_ptr());
+            let n = rd::rd_kafka_queue_length(queue);
+            rd::rd_kafka_queue_destroy(queue);
+            n
+        };
+        // Port 1 on loopback refuses connections.
+        let client = super::WatermarkClient::new("127.0.0.1:1").expect("client");
+        let err = client
+            .high_watermark("t", 0, std::time::Duration::from_millis(500))
+            .expect_err("no broker listens on 127.0.0.1:1");
+        assert!(err.to_string().contains("fetch_watermarks"), "{err}");
+        assert!(
+            queued(&client) > 0,
+            "the refused connections queued no event"
+        );
+        client.drain_events();
+        assert_eq!(queued(&client), 0, "the drain left events in the queue");
     }
 
     /// Producers on the topics we mirror compress batches with gzip or
